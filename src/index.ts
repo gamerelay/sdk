@@ -901,7 +901,7 @@ export class Room extends Emitter<RoomEvents> {
   send(data: Json, options: SendOptions = {}): void {
     const h = this.#timers.firing ? true : undefined; // a timer's effects: dropped if we're no longer the host
     if (looksPositional(data) && this.#sendRate.hit(this.#relay.now())) {
-      this.#relay.warn('send_positions', 'send_positions', "room.send() of x/y more than 20×/s: you're hand-writing sync; use room.define + room.spawn and the SDK smooths it, sends it to late joiners and cleans up after players who leave");
+      this.#relay.warn('send_positions', 'send_positions', "room.send() of x/y more than 20×/s: you're hand-writing sync; use entities (room.define(kind, fields), then its .spawn()) and the SDK smooths it, sends it to late joiners and cleans up after players who leave");
     }
     this.#relay.queue({ t: 'send', d: data, to: options.to, r: options.reliable === false ? false : undefined, h });
   }
@@ -925,7 +925,7 @@ export class Room extends Emitter<RoomEvents> {
 
   #countState(): void {
     if (this.#stateRate.hit(this.#relay.now())) {
-      this.#relay.warn('set_state', 'set_state', 'room.setState() more than 10×/s: state is for facts (score, round, phase); for things that move use room.define + room.spawn');
+      this.#relay.warn('set_state', 'set_state', 'room.setState() more than 10×/s: state is for facts (score, round, phase); for things that move use entities (room.define(kind, fields), then its .spawn())');
     }
   }
 

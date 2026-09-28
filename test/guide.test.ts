@@ -7,7 +7,9 @@ import { GameRelay, Room, seededRandom } from '../src/index';
 import { makeKind, type KindHost } from '../src/sync/kind';
 
 const guide = await Bun.file(new URL('../llms.txt', import.meta.url)).text();
-const code = [...guide.matchAll(/```(?:js|html)\n([\s\S]*?)```/g)].map((m) => m[1]!).join('\n');
+// The README is the package's page on npm and GitHub: its snippets are held to the same rule.
+const readme = await Bun.file(new URL('../README.md', import.meta.url)).text();
+const codeOf = (doc: string) => [...doc.matchAll(/```(?:js|ts|html)\n([\s\S]*?)```/g)].map((m) => m[1]!).join('\n');
 
 /** Methods and getters up the prototype chain (on / off come from a shared base), plus instance fields. */
 function members(proto: object, fields: string[]): Set<string> {
@@ -22,30 +24,37 @@ const RELAY = members(GameRelay.prototype, ['playerId', 'room', 'party', 'featur
 /** A real handle's members, so the list can't drift from the SDK. */
 const KIND = new Set(Object.keys(makeKind('x', {} as KindHost)));
 
-function used(name: string): Set<string> {
+function usedIn(code: string, name: string): Set<string> {
   return new Set([...code.matchAll(new RegExp(`\\b${name}\\.([A-Za-z_$][\\w$]*)`, 'g'))].map((m) => m[1]!));
 }
 
-describe('llms.txt only names real API', () => {
-  test('room.* exists on Room', () => {
-    expect([...used('room')].filter((k) => !ROOM.has(k))).toEqual([]);
-  });
+for (const [file, doc, minHandles] of [['llms.txt', guide, 5], ['README.md', readme, 1]] as const) {
+  const code = codeOf(doc);
+  const used = (name: string) => usedIn(code, name);
+  describe(`${file} only names real API`, () => {
+    test('room.* exists on Room', () => {
+      expect([...used('room')].filter((k) => !ROOM.has(k))).toEqual([]);
+    });
 
-  test('relay.* exists on GameRelay', () => {
-    expect([...used('relay')].filter((k) => !RELAY.has(k))).toEqual([]);
-  });
+    test('relay.* exists on GameRelay', () => {
+      expect([...used('relay')].filter((k) => !RELAY.has(k))).toEqual([]);
+    });
 
-  test('GameRelay.* statics exist', () => {
-    // global.ts adds seededRandom to the script-tag GameRelay.
-    const statics = new Set([...Object.getOwnPropertyNames(GameRelay), ...(typeof seededRandom === 'function' ? ['seededRandom'] : [])]);
-    expect([...used('GameRelay')].filter((k) => !statics.has(k))).toEqual([]);
-  });
+    test('GameRelay.* statics exist', () => {
+      // global.ts adds seededRandom to the script-tag GameRelay.
+      const statics = new Set([...Object.getOwnPropertyNames(GameRelay), ...(typeof seededRandom === 'function' ? ['seededRandom'] : [])]);
+      expect([...used('GameRelay')].filter((k) => !statics.has(k))).toEqual([]);
+    });
 
-  test('every kind handle (const x = room.define(…)) uses only Kind methods', () => {
-    const handles = [...code.matchAll(/const (\w+) = room\.define\(/g)].map((m) => m[1]!);
-    expect(handles.length).toBeGreaterThanOrEqual(5);
-    for (const h of handles) expect({ [h]: [...used(h)].filter((k) => !KIND.has(k)) }).toEqual({ [h]: [] });
+    test('every kind handle (const x = room.define(…)) uses only Kind methods', () => {
+      const handles = [...code.matchAll(/const (\w+) = room\.define\(/g)].map((m) => m[1]!);
+      expect(handles.length).toBeGreaterThanOrEqual(minHandles);
+      for (const h of handles) expect({ [h]: [...used(h)].filter((k) => !KIND.has(k)) }).toEqual({ [h]: [] });
+    });
   });
+}
+
+describe('llms.txt starters', () => {
 
   test('the three starters are there, each a complete page', () => {
     for (const title of ['players own avatars', 'host simulates', 'mixed']) {
@@ -79,4 +88,22 @@ test('the Debugging section lists every warning in the catalog', () => {
   ]) {
     expect(debugging).toContain(phrase);
   }
+});
+
+describe('README.md', () => {
+  test('the quick start syncs positions with entities, not room.send', () => {
+    // room.send of x/y is what the send_positions warning flags; the first thing people copy can't be it.
+    expect(codeOf(readme)).not.toMatch(/room\.send\(\{[^}]*\bx\b/);
+    expect(codeOf(readme)).toContain('.spawn(');
+  });
+
+  test('its size claim matches the minified, gzipped build (±2 KB)', async () => {
+    const claim = Number(readme.match(/about (\d+) KB gzipped/)?.[1]);
+    // A separate process: Bun.build inside the whole suite's run trips over other tests' module state.
+    const cwd = new URL('..', import.meta.url).pathname;
+    const out = Bun.spawnSync(['bun', 'build', 'src/index.ts', '--minify', '--target', 'browser', '--format', 'esm'], { cwd });
+    expect(out.exitCode).toBe(0);
+    const kb = Bun.gzipSync(out.stdout).length / 1024;
+    expect(Math.abs(kb - claim)).toBeLessThanOrEqual(2);
+  });
 });

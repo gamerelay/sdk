@@ -527,9 +527,9 @@ and bytes per second, entities per kind, host). Warnings print to the console ei
 each, and each one says the fix and names the llms.txt section to read. The full list:
 
 - `room.on('playerJoined') is a custom event …; the built-in for a player arriving is room.on('player_joined')` (see Room reference)
-- `room.send() of x/y more than 20×/s: you're hand-writing sync; use room.define + room.spawn`
-- `room.setState() more than 10×/s: state is for facts (score, round, phase); for things that move use room.define + room.spawn`
-- `room.emit('hit') more than 30×/s: events are for moments; for things that change every frame use room.define + room.spawn`
+- `room.send() of x/y more than 20×/s: you're hand-writing sync; use entities (room.define(kind, fields), then its .spawn())`
+- `room.setState() more than 10×/s: state is for facts (score, round, phase); for things that move use entities (room.define(kind, fields), then its .spawn())`
+- `room.emit('hit') more than 30×/s: events are for moments; for things that change every frame use entities (room.define(kind, fields), then its .spawn())`
 - `room.all('shp'): no kind 'shp' is defined; did you mean 'ship'?`
 - `ship jumped across the map without teleport(): call entity.teleport() when respawning`
 - `ship fields differ between players: are they on different builds?`
