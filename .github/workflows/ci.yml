@@ -1,0 +1,104 @@
+# Every pull request and every push runs the typecheck, tests and pack. A merge to the default
+# branch (a release PR opened by `bun run release:sdk` in the private repo) also publishes to npm
+# with provenance, when its version isn't on npm yet, then tags it `v<version>` and posts the
+# result to the ops channel. Pushes that don't change the version publish nothing.
+#
+# Publishing uses npm trusted publishing (OIDC), so no npm secret is needed. The NPM_TOKEN secret is
+# only a fallback for the first release, before the package exists on npm to trust this workflow.
+# OPS_WEBHOOK_URL is a Discord webhook; without it the report is skipped.
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun test
+      - run: bun run pack:npm
+
+  publish:
+    needs: test
+    if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to push the version tag
+      id-token: write # npm provenance and trusted publishing
+    outputs:
+      new: ${{ steps.version.outputs.new }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Is this version new?
+        id: version
+        run: |
+          name=$(node -p 'require("./package.json").name')
+          version=$(node -p 'require("./package.json").version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if npm view "$name@$version" version > /dev/null 2>&1; then
+            echo "$name@$version is already on npm: nothing to publish"
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.version.outputs.new == 'true'
+        run: bun install --frozen-lockfile
+      - if: steps.version.outputs.new == 'true'
+        run: bun run pack:npm
+      - name: Publish to npm
+        if: steps.version.outputs.new == 'true'
+        working-directory: npm
+        # A prerelease (0.1.0-alpha.0) goes out under its label, never as latest (scripts/dist-tag.ts).
+        run: npm publish --provenance --tag "$(bun ../scripts/dist-tag.ts)"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Tag the release
+        if: steps.version.outputs.new == 'true'
+        run: |
+          git tag "v${{ steps.version.outputs.version }}"
+          git push origin "v${{ steps.version.outputs.version }}"
+
+  report:
+    needs: [test, publish]
+    # Only for a merge that tried to release (a new version), or whose tests failed.
+    if: >-
+      always() && github.event_name == 'push' && github.ref_name == github.event.repository.default_branch &&
+      (needs.publish.outputs.new == 'true' || needs.test.result != 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post to the ops channel
+        env:
+          WEBHOOK: ${{ secrets.OPS_WEBHOOK_URL }}
+          TESTS: ${{ needs.test.result }}
+          PUBLISH: ${{ needs.publish.result }}
+          VERSION: ${{ needs.publish.outputs.version }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -n "$WEBHOOK" ] || { echo "OPS_WEBHOOK_URL isn't set; skipping"; exit 0; }
+          if [ "$PUBLISH" = success ]; then
+            text="[sdk] ✅ Published @gamerelay/sdk ${VERSION}: https://www.npmjs.com/package/@gamerelay/sdk/v/${VERSION}"
+          elif [ "$TESTS" != success ]; then
+            text="[sdk] ❌ Tests didn't pass on ${GITHUB_REF_NAME} (${TESTS}), nothing published. ${RUN}"
+          else
+            text="[sdk] ❌ Release ${VERSION}: tests passed, but the npm publish didn't (${PUBLISH}). ${RUN}"
+          fi
+          jq -n --arg t "$text" '{content: $t}' | curl -fsS -X POST -H 'content-type: application/json' --data @- "$WEBHOOK"

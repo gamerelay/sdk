@@ -1,0 +1,855 @@
+# gamerelay — add multiplayer to a browser game
+
+> gamerelay makes a single-file JS/canvas game multiplayer with no server code: rooms, lobbies,
+> parties, invite links, host migration, chat, leaderboards, saved player data and webhooks. The
+> SDK owns the netcode: you declare what exists in the game and who owns it, and it sends,
+> smooths, hands over and cleans up. One player's browser is the **host**; if it leaves, freezes,
+> or can't keep up (a hidden tab on some browsers), another player takes over without losing anything.
+
+Start with **Pick your shape**, then copy the matching **Starter**. Everything below is what the
+starters use, then the rest of the platform, then the low-level API.
+
+Human-readable docs (SDK and REST API reference): https://gamerelay.io/docs
+
+MCP servers (Streamable HTTP):
+
+- `https://gamerelay.io/mcp`: docs, no account (`get_integration_guide`, `get_starter_game`
+  with `shape: 'avatars' | 'host' | 'mixed'`, `check_public_key`).
+  `claude mcp add --transport http gamerelay https://gamerelay.io/mcp`
+- `https://gamerelay.io/mcp/admin`: everything in the dashboard, as you. The first call opens
+  your browser to sign in and approve the agent (OAuth). Tools: `whoami`, `list_instances`,
+  `get_instance`, `create_instance`, `update_instance` (chat, parties, saves, logs, room size, allowed origins),
+  `delete_instance`, `rotate_key`, `list_rooms`, `get_room`, `kick_player`, `close_room`,
+  `search_logs`, `get_usage`,
+  `list_leaderboards`, `get_leaderboard`, `set_leaderboard_rules`, `list_webhooks`, `create_webhook`, `update_webhook`,
+  `delete_webhook`, `rotate_webhook_secret`, `test_webhook`, `list_webhook_deliveries`.
+  Destructive ones require `confirm: true`. Disconnect agents in the dashboard.
+  `claude mcp add --transport http gamerelay-account https://gamerelay.io/mcp/admin`
+
+## Install
+
+Script tag (exposes `window.GameRelay`):
+
+```html
+<script src="https://gamerelay.io/sdk/gamerelay.js"></script>
+```
+
+Or npm: `npm i @gamerelay/sdk`, then `import { GameRelay } from '@gamerelay/sdk'`.
+
+You need a public key (`gr_pub_…`): sign in at https://gamerelay.io/app and create an instance
+for your game (or ask an agent with the account MCP to `create_instance`). It is safe to ship in
+the page. Until it's filled in, `connect()` rejects with `unauthorized`.
+
+## Connect and get into a room
+
+```js
+const relay = await GameRelay.connect({ publicKey: 'gr_pub_…', playerName: 'ada', playerAvatar: 'fox' });
+
+const room = await relay.quickMatch({ maxPlayers: 2 }); // join any open public room, or make one
+// or: const room = await relay.createRoom({ maxPlayers: 4 });  share room.code with friends
+// or: const room = await relay.joinRoom('K7QM');
+// or: const room = await relay.joinInvite();  the room in this page's ?room=CODE link, or null (see Invite links)
+```
+
+A player is in at most one room at a time. `relay.playerId` stays the same across reloads of
+the same tab, so a refresh resumes your seat. Anonymous players are per tab, which makes
+testing with two tabs easy. Signed-in players (see below) are one player across tabs: a second
+connection takes over and the first one gets `relay.on('replaced')` and stops.
+
+Add `debug: true` while developing (see Debugging).
+
+```js
+relay.playerId   // your id
+relay.room       // the Room you're in, or null
+relay.party      // your party, or null
+relay.connected  // false while reconnecting
+relay.features   // what this game's plan includes: { voice, unreliable }. Flags for upcoming paid features; nothing uses them yet
+relay.close()    // disconnect and stop reconnecting
+```
+
+## Pick your shape
+
+Every multiplayer game is some mix of three things: what each player owns, what the host runs,
+and moments everyone should see. Pick the row closest to your game and start from its starter.
+
+| Shape | When | You use | Starter |
+| --- | --- | --- | --- |
+| **Players own avatars** | Each player moves their own thing and trusts their own hits: shooters, racers, co-op, drawing | entities, events | Starter: players own avatars |
+| **Host simulates** | Physics or rules must be fair and shared: ball games, one world everyone pushes on | inputs, host entities, `relay.tick` | Starter: host simulates |
+| **Mixed** (most games) | Players move themselves; the host owns the world: pickups, enemies, rounds | entities, host entities, claims, timers | Starter: mixed |
+
+- **Entities** are things that move or persist (ships, balls, coins). Each has one owner, who
+  writes it; everyone else sees it smoothed. Positions always go in entities, never in messages.
+- **Events** are moments (a shot, a chat emote, a hit). **Requests** ask the host to decide
+  something and wait for the answer. **Claims** let exactly one player take something.
+- **State** holds facts (score, phase, timers): one small shared document, written by the host.
+- Turn-based games: use requests (a move) plus state (the board) plus timers (turn clocks).
+
+## Starter: players own avatars
+
+Everyone moves their own square; space sends a wave everyone sees. Open it in two tabs.
+
+```html
+<!doctype html>
+<meta charset="utf-8">
+<title>Squares</title>
+<canvas id="c" width="640" height="400" style="background:#111"></canvas>
+<p id="status">Connecting…</p>
+<script src="https://gamerelay.io/sdk/gamerelay.js"></script>
+<script type="module">
+  const W = 640, H = 400, SPEED = 220;
+  const status = document.getElementById('status');
+  const relay = await GameRelay.connect({ publicKey: 'gr_pub_…' }).catch((err) => {
+    status.textContent = `Can't connect: ${err.message}`; // e.g. the public key is still 'gr_pub_…'
+    throw err;
+  });
+  // Friends who open an invite link join that room; everyone else is matched with anyone.
+  const room = (await relay.joinInvite().catch(() => null)) ?? (await relay.quickMatch({ maxPlayers: 4 }));
+  history.replaceState(null, '', room.inviteUrl()); // the address bar is now the invite link
+  status.textContent = `Room ${room.code}: share this page's address. Arrows move, space waves.`;
+
+  // Each player owns one square: you write yours, everyone draws everyone's.
+  const squares = room.define('square', { x: 'number', y: 'number', hue: 'number' });
+  const slot = room.players.find((p) => p.id === room.me)?.slot ?? 0;
+  const me = squares.spawn({ x: 80 + (slot % 5) * 120, y: H / 2, hue: (slot * 70) % 360 });
+
+  const keys = new Set();
+  addEventListener('keydown', (e) => {
+    keys.add(e.key);
+    if (e.key === ' ' && !e.repeat) room.emit('wave', { x: me.x, y: me.y }); // a moment: everyone, you included
+  });
+  addEventListener('keyup', (e) => keys.delete(e.key));
+  addEventListener('blur', () => keys.clear()); // no stuck keys after switching windows
+
+  relay.tick(60, (dt) => {
+    const dx = (keys.has('ArrowRight') ? 1 : 0) - (keys.has('ArrowLeft') ? 1 : 0);
+    const dy = (keys.has('ArrowDown') ? 1 : 0) - (keys.has('ArrowUp') ? 1 : 0);
+    me.x = Math.max(10, Math.min(W - 10, me.x + dx * SPEED * dt));
+    me.y = Math.max(10, Math.min(H - 10, me.y + dy * SPEED * dt));
+  });
+
+  const waves = [];
+  room.on('wave', ({ x, y }) => waves.push({ x, y, r: 10 }));
+
+  const ctx = document.getElementById('c').getContext('2d');
+  (function draw() {
+    ctx.clearRect(0, 0, W, H);
+    for (const s of squares.all()) {
+      ctx.fillStyle = `hsl(${s.hue} 90% 60%)`;
+      ctx.fillRect(s.x - 10, s.y - 10, 20, 20);
+      if (s.mine) { ctx.strokeStyle = '#fff'; ctx.strokeRect(s.x - 13, s.y - 13, 26, 26); }
+    }
+    for (const w of waves) {
+      w.r += 3;
+      ctx.strokeStyle = `rgb(255 255 255 / ${Math.max(0, 1 - w.r / 80)})`;
+      ctx.beginPath(); ctx.arc(w.x, w.y, w.r, 0, Math.PI * 2); ctx.stroke();
+    }
+    while (waves.length && waves[0].r > 80) waves.shift();
+    requestAnimationFrame(draw);
+  })();
+</script>
+```
+
+## Starter: host simulates
+
+Everyone sends inputs; the host moves every block and the ball, in two teams, and keeps the score. If the host leaves, another player carries on with the same ball and score.
+
+```html
+<!doctype html>
+<meta charset="utf-8">
+<title>Ball</title>
+<canvas id="c" width="640" height="400" style="background:#111"></canvas>
+<p id="status">Connecting…</p>
+<script src="https://gamerelay.io/sdk/gamerelay.js"></script>
+<script type="module">
+  const W = 640, H = 400, R = 14, BALL = 8, SPEED = 240, GOAL = 200;
+  const status = document.getElementById('status');
+  const relay = await GameRelay.connect({ publicKey: 'gr_pub_…' }).catch((err) => {
+    status.textContent = `Can't connect: ${err.message}`;
+    throw err;
+  });
+  const room = (await relay.joinInvite().catch(() => null)) ?? (await relay.quickMatch({ maxPlayers: 4 }));
+  history.replaceState(null, '', room.inviteUrl());
+  status.textContent = `Room ${room.code}: share this page's address. Arrows move; push the ball into the other goal.`;
+
+  // The host runs the whole game: every player's block and the ball are host entities.
+  const blocks = room.define('block', { x: 'number', y: 'number', pid: 'text', team: 'value' });
+  const balls = room.define('ball', { x: 'number', y: 'number', vx: 'number', vy: 'number' });
+
+  // Everyone: send your controls every frame.
+  const keys = new Set();
+  addEventListener('keydown', (e) => keys.add(e.key));
+  addEventListener('keyup', (e) => keys.delete(e.key));
+  addEventListener('blur', () => keys.clear());
+  const axis = (a, b) => (keys.has(b) ? 1 : 0) - (keys.has(a) ? 1 : 0);
+
+  // The host: simulate 60 times a second from everyone's inputs (a new host carries on).
+  relay.tick(60, (dt) => {
+    if (!room.isHost) return;
+    if (room.teamOf(room.me) === undefined) room.assignTeams(Math.min(2, room.maxPlayers));
+    const mine = new Map(blocks.mine().map((b) => [b.pid, b]));
+    for (const p of room.players) {
+      if (mine.has(p.id)) continue;
+      const team = room.teamOf(p.id) ?? 0;
+      mine.set(p.id, blocks.spawn({ x: team ? W - 80 : 80, y: 80 + (p.slot % 4) * 80, pid: p.id, team }, { owner: 'host' }));
+    }
+    for (const [pid, b] of mine) {
+      if (room.players.some((p) => p.id === pid)) continue;
+      b.remove(); // they left for good
+      mine.delete(pid);
+    }
+    const ball = balls.mine()[0] ?? balls.spawn({ x: W / 2, y: H / 2, vx: 0, vy: 0 }, { owner: 'host' });
+    for (const b of mine.values()) {
+      const inp = room.inputs.get(b.pid);
+      b.x = Math.max(R, Math.min(W - R, b.x + (inp.dx ?? 0) * SPEED * dt));
+      b.y = Math.max(R, Math.min(H - R, b.y + (inp.dy ?? 0) * SPEED * dt));
+      const dx = ball.x - b.x, dy = ball.y - b.y, d = Math.hypot(dx, dy) || 1;
+      if (d < R + BALL) { ball.vx = (dx / d) * 300; ball.vy = (dy / d) * 300; }
+    }
+    ball.vx *= 0.99; ball.vy *= 0.99;
+    ball.x += ball.vx * dt; ball.y += ball.vy * dt;
+    if ((ball.y < BALL && ball.vy < 0) || (ball.y > H - BALL && ball.vy > 0)) ball.vy *= -1; // only when heading into the wall
+    const inGoal = Math.abs(ball.y - H / 2) < GOAL / 2;
+    if ((ball.x < 0 || ball.x > W) && inGoal) {
+      const score = [...(room.state.score ?? [0, 0])];
+      score[ball.x < 0 ? 1 : 0]++;
+      room.setState({ score });
+      Object.assign(ball, { x: W / 2, y: H / 2, vx: 0, vy: 0 });
+      ball.teleport();
+    } else if (!inGoal && ((ball.x < BALL && ball.vx < 0) || (ball.x > W - BALL && ball.vx > 0))) ball.vx *= -1; // the goal mouth is open
+  });
+
+  const ctx = document.getElementById('c').getContext('2d');
+  (function draw() {
+    room.input({ dx: axis('ArrowLeft', 'ArrowRight'), dy: axis('ArrowUp', 'ArrowDown') });
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = '#333';
+    ctx.fillRect(0, H / 2 - GOAL / 2, 4, GOAL);
+    ctx.fillRect(W - 4, H / 2 - GOAL / 2, 4, GOAL);
+    for (const b of blocks.all()) {
+      ctx.fillStyle = b.team ? '#52aaff' : '#ff6b1a';
+      ctx.fillRect(b.x - R, b.y - R, R * 2, R * 2);
+      if (b.pid === room.me) { ctx.strokeStyle = '#fff'; ctx.strokeRect(b.x - R - 3, b.y - R - 3, R * 2 + 6, R * 2 + 6); }
+    }
+    ctx.fillStyle = '#fff';
+    for (const b of balls.all()) { ctx.beginPath(); ctx.arc(b.x, b.y, BALL, 0, Math.PI * 2); ctx.fill(); }
+    const [a, b] = room.state.score ?? [0, 0];
+    ctx.font = '24px monospace';
+    ctx.fillText(`${a} : ${b}`, W / 2 - 30, 30);
+    requestAnimationFrame(draw);
+  })();
+</script>
+```
+
+## Starter: mixed
+
+Everyone moves their own ship; the host drops coins on a timer; touching a coin claims it, so only one player scores it; 60 s rounds.
+
+```html
+<!doctype html>
+<meta charset="utf-8">
+<title>Coins</title>
+<canvas id="c" width="640" height="400" style="background:#111"></canvas>
+<p id="status">Connecting…</p>
+<script src="https://gamerelay.io/sdk/gamerelay.js"></script>
+<script type="module">
+  const W = 640, H = 400, SPEED = 220, ROUND = 60_000;
+  const status = document.getElementById('status');
+  const relay = await GameRelay.connect({ publicKey: 'gr_pub_…' }).catch((err) => {
+    status.textContent = `Can't connect: ${err.message}`;
+    throw err;
+  });
+  const room = (await relay.joinInvite().catch(() => null)) ?? (await relay.quickMatch({ maxPlayers: 4 }));
+  history.replaceState(null, '', room.inviteUrl());
+  status.textContent = `Room ${room.code}: share this page's address. Arrows move; grab the coins.`;
+
+  const ships = room.define('ship', { x: 'number', y: 'number' }); // each player owns theirs
+  const coins = room.define('coin', { x: 'number', y: 'number' }); // the host owns the world
+  const slot = room.players.find((p) => p.id === room.me)?.slot ?? 0;
+  const me = ships.spawn({ x: 80 + (slot % 5) * 120, y: H / 2 });
+
+  // The host drops a coin every 2 s and runs 60 s rounds. Timers fire once, on whoever is host.
+  const start = () => {
+    if (room.timeLeft('coin') === null) room.timer('coin', 2000);
+    if (room.timeLeft('round') === null) room.timer('round', ROUND);
+  };
+  if (room.isHost) start();
+  room.on('host', start); // you became host: make sure the timers run (they usually carry over)
+  const taken = []; // [key, time] of every claim, on every player, so any host can release them
+  room.on('timer', 'coin', () => {
+    // A claim that reached a host just as it stopped being host was never scored: do it now.
+    for (const c of coins.all()) if (room.claimed(c.id)) score(c.id, room.claimed(c.id));
+    if (coins.all().length < 5) coins.spawn({ x: 30 + Math.random() * (W - 60), y: 30 + Math.random() * (H - 60) }, { owner: 'host' });
+    // Release claims once their coin is long gone (a claim still on its way can't take a new coin).
+    while (taken.length && relay.now() - taken[0][1] > 5000) {
+      const [key] = taken.shift();
+      if (!coins.get(key) && room.claimed(key)) room.release(key);
+    }
+    room.timer('coin', 2000);
+  });
+  room.on('timer', 'round', () => {
+    room.setState({ scores: {} });
+    room.timer('round', ROUND);
+  });
+
+  // Touching a coin claims it: exactly one player gets it, even if two touch at once.
+  function score(key, playerId) {
+    const coin = coins.get(key);
+    if (!coin?.mine) return; // not a coin, or already gone
+    coin.remove();
+    room.setState({ scores: { ...room.state.scores, [playerId]: (room.state.scores?.[playerId] ?? 0) + 1 } });
+  }
+  room.on('claimed', (key, playerId) => {
+    taken.push([key, relay.now()]);
+    if (room.isHost) score(key, playerId);
+  });
+  const asked = new Set();
+
+  const keys = new Set();
+  addEventListener('keydown', (e) => keys.add(e.key));
+  addEventListener('keyup', (e) => keys.delete(e.key));
+  addEventListener('blur', () => keys.clear());
+  relay.tick(60, (dt) => {
+    me.x = Math.max(10, Math.min(W - 10, me.x + ((keys.has('ArrowRight') ? 1 : 0) - (keys.has('ArrowLeft') ? 1 : 0)) * SPEED * dt));
+    me.y = Math.max(10, Math.min(H - 10, me.y + ((keys.has('ArrowDown') ? 1 : 0) - (keys.has('ArrowUp') ? 1 : 0)) * SPEED * dt));
+    for (const c of coins.all()) {
+      if (Math.hypot(c.x - me.x, c.y - me.y) < 20 && !asked.has(c.id)) {
+        asked.add(c.id);
+        room.claim(c.id);
+      }
+    }
+  });
+
+  const COLOURS = ['#ff6b1a', '#52aaff', '#6bff8a', '#ffd84a'];
+  const ctx = document.getElementById('c').getContext('2d');
+  (function draw() {
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = '#ffd84a';
+    for (const c of coins.all()) if (!room.claimed(c.id)) { ctx.beginPath(); ctx.arc(c.x, c.y, 7, 0, Math.PI * 2); ctx.fill(); }
+    for (const s of ships.all()) {
+      ctx.fillStyle = COLOURS[Math.max(0, s.owner.slot) % COLOURS.length];
+      ctx.fillRect(s.x - 10, s.y - 10, 20, 20);
+    }
+    ctx.fillStyle = '#fff';
+    ctx.font = '14px monospace';
+    room.players.forEach((p, i) => ctx.fillText(`${p.name || 'player'}: ${room.state.scores?.[p.id] ?? 0}`, 10, 20 + i * 18));
+    ctx.fillText(`round ${Math.ceil((room.timeLeft('round') ?? 0) / 1000)}s`, W - 110, 20);
+    requestAnimationFrame(draw);
+  })();
+</script>
+```
+
+## Entities
+
+Anything that moves or lasts (a ship, a ball, a coin) is an entity. Declare each kind once, in
+every player's game, before using it. `room.define` returns the kind's handle:
+
+```js
+const ships = room.define('ship', { x: 'number', y: 'number', h: 'angle', alive: 'flag', name: 'text' });
+
+const me = ships.spawn({ x: 100, y: 100, h: 0, alive: true, name: 'ada' }); // you own it
+me.x += 5;                    // just write fields, every frame if you like; the SDK sends changes (~20/s)
+
+for (const s of ships.mine()) s.x += speed * dt;             // update: only the ones you write
+for (const s of ships.all()) drawShip(s.x, s.y, s.h, s.mine); // draw: every one (yours live, others smoothed)
+ships.get(id);                // one, or undefined
+ships.on('spawn', (s) => addEffects(s));             // appears (not replayed for ones already here)
+ships.on('remove', (s, reason) => explode(s.x, s.y)); // 'removed' | 'left' | 'expired'
+me.remove();
+```
+
+- **Field types**: `'number'` and `'angle'` (radians) are smoothed between updates; `'flag'`
+  (boolean), `'text'` (up to 256 characters) and `'value'` (any JSON, up to 4 KB) change at their
+  moment. Long form: `x: { type: 'number', precision: 1 }` (default precision 0.01). Up to 32 fields.
+- `room.define(kind, fields, { rate: 30 })` sends that kind 1–60 times a second (default 20).
+- Every entity has `id`, `kind`, `owner` (a player: `{ id, name, slot, … }`), `mine` (you write
+  it). Key your own game data by `e.id`, or by `e.owner.id` for "that player's ship". Ids are made
+  by the SDK; never make your own.
+- **Only write what you own.** Only the owner changes an entity. Writing someone else's does
+  nothing: the write is skipped and the console warns once. So update in a loop over `kind.mine()`
+  (yours, plus host entities while you're the host), and keep `kind.all()` for drawing and reading.
+  To change someone else's, send the owner an event (or the host a request).
+- **Declared fields only.** Writing a field you didn't declare, the wrong type, or an entity you
+  already removed is skipped with a warning too (never thrown, so one mistake can't stop your game
+  loop; in TypeScript an undeclared field doesn't compile). Keep
+  local-only values (cooldowns, input, animation timers) in your own variables or a `Map` keyed by
+  `e.id`, not on the entity: only what others need to see goes in `room.define`.
+- **Others are drawn about 100 ms in the past** (`room.renderTime`), so motion is smooth on real
+  networks. Don't add your own smoothing.
+- **Respawns and portals**: set the new position and call `e.teleport()` in the same frame, so
+  everyone snaps instead of sliding across the map.
+- **Lifetime**: when a player disconnects, their entities freeze where they were until they
+  reconnect (up to 30 s). When they leave for good, their entities go (`'left'`), unless spawned
+  with `{ onLeave: 'host' }`: then the host keeps them (a carried flag stays in the world).
+- **Host entities**: `ships.spawn(…, { owner: 'host' })`, only on the host. They belong to the
+  host role, so when the host changes the next host writes them, carrying on from where they were.
+  Use them for the world: enemies, balls, pickups.
+- Entities are live objects (Proxies): copy one with `{ ...e }` (not `structuredClone`).
+- Late joiners get every entity automatically. Limits: 256 entities per player, 1,024 per room.
+- A handle belongs to its room: after `room.leave()` or moving rooms, define again in the new
+  room (old handles throw and say so).
+
+## Events
+
+Moments everyone should see: a shot, a hit, an emote.
+
+```js
+room.emit('fire', { x, y, a });                  // to everyone, you included
+room.emit('hit', { dmg: 10 }, { to: victimId }); // to one player ('host' for the host)
+room.on('fire', ({ x, y, a }, from, meta) => spawnBullet(from, x, y, a)); // meta.at: server time
+```
+
+- **Echo**: an event to everyone runs your own handler right away too (`{ echo: false }` skips
+  it; an event `to` one other player doesn't echo). So handle an action in exactly one place: if
+  the shooter also spawns its bullet before emitting, it gets two.
+- Events are for moments; facts go in entities or state. Nothing is kept for players who join
+  later, and `room.on` doesn't replay earlier events.
+- Data is any JSON up to about 15 KB. Built-in names (`player_joined`, `spawn`, `host`, `timer`,
+  `claimed`, `state`, `chat`, …) are reserved.
+
+## Requests to the host
+
+Ask the host to decide something and wait for the answer: buy an item, pick a seat, make a move.
+
+```js
+// On every player (whoever is host answers):
+room.onRequest('buy', ({ item }, from) => {
+  const gold = room.state.gold?.[from] ?? 0;
+  if (gold < PRICE[item]) throw room.reject('Not enough gold');
+  room.setState({ gold: { ...room.state.gold, [from]: gold - PRICE[item] } }); // in state: a new host has it
+  return { item, gold: gold - PRICE[item] };
+});
+
+try {
+  const { gold } = await room.request('buy', { item: 'sword' });
+} catch (err) {
+  // err.code: 'rejected' (err.message is the reason), 'host_changed' (ask again), 'timeout' (5 s),
+  // 'disconnected' (you left the room)
+}
+```
+
+- Keep what the host decides in `room.state` (or host entities), not in variables: when the host
+  changes, the next host has the state but not the old host's variables.
+- The same request (same name and data) while one is waiting returns the same promise.
+- The host's own requests run its handler directly.
+
+## Claims: take something exactly once
+
+For "first one wins": a pickup, a seat, a flag. The server decides.
+
+```js
+if (await room.claim(coin.id)) score += 1;  // true for exactly one player, false for the rest
+room.on('claimed', (key, playerId) => hide(key)); // everyone, the winner included
+room.claimed(key);        // who holds it, or null
+room.release(key);        // the holder (or the host) lets go; everyone gets 'released'
+```
+
+- Use one key per thing (an entity id is ideal). A claim is held until released or until its
+  holder leaves. A room holds at most 1,024 claims.
+- Release a key only once the thing is long gone (seconds later): a claim still on its way could
+  otherwise take it again.
+
+## Inputs (host-simulated games)
+
+Players send controls; the host runs the game with them.
+
+```js
+room.input({ left: keys.a, right: keys.d, jump: keys.w, aim: angle }); // every frame, on every player
+
+// on the host, in its game loop:
+const inp = room.inputs.get(playerId); // that player's latest: { left, right, jump, aim }
+```
+
+- The latest input goes to the host about 20 times a second; a tap between two sends still
+  arrives as `true`.
+- A player who stops sending (left, froze, hid the tab) reads as neutral after 500 ms: booleans
+  false, numbers 0. Players who never sent read as `{}`, so write `inp.aim ?? 0`.
+- The host's own input is read the same way: `room.inputs.get(room.me)`.
+- Keep inputs small (under 1 KB): buttons and axes, not positions.
+
+## State and timers
+
+```js
+room.state                          // one shared JSON document: score, phase, round
+room.setState({ score: [1, 0] })    // host only; shallow merge, null deletes a key; saved on the server
+room.on('state', (state, patch) => {})
+
+room.timer('round', 60_000);        // host only: fires once, on whoever is host when it's due
+room.on('timer', 'round', () => endRound()); // register on every player
+room.timeLeft('round');             // ms left (0 once due), or null: show countdowns with it
+room.clearTimer('round');
+```
+
+- State is for facts, not motion (at most about 10 changes a second; 64 KB in all).
+- A timer fires exactly once even if the host changes: its handler's `setState` changes and the
+  timer's clear go out together.
+- Keys starting with `$` in state (`$timers`, `$teams`, …) belong to the SDK.
+
+## Slots and teams
+
+```js
+const p = room.players.find((q) => q.id === room.me);
+p.slot                      // 0…maxPlayers − 1, stable for this player, reused after they leave
+const COLOURS = ['#ff6b1a', '#52aaff', '#6bff8a', '#ffd84a'];
+const colour = COLOURS[p.slot % COLOURS.length];
+
+if (room.isHost) room.assignTeams(2);   // balanced by count; joiners are placed automatically
+room.teamOf(playerId);                  // 0 or 1 (undefined before assignTeams)
+room.assignTeams(2, { rebalance: true }); // between rounds: even the teams out
+```
+
+Use `slot`, not the order of `room.players`, for sides, colours and spawn points.
+
+## Host changes
+
+`room.isHost` is true on the player who runs the host's work; it can move to another player at
+any time (the host left or froze, or its hidden tab couldn't keep its game loop going). Host entities, timers and state carry over
+by themselves. For anything else, `room.on('host', () => …)` runs on the player who just became
+host (not for the room's first host: check `room.isHost` at start). `room.on('host_changed',
+(hostId, previousHostId) => …)` runs on everyone.
+
+## relay.tick: the game loop
+
+```js
+relay.tick(60, (dt, tick) => { if (room.isHost) stepWorld(dt); moveMyShip(dt); }); // dt in seconds, fixed
+function frame() { draw(); requestAnimationFrame(frame); }                      // draw separately
+```
+
+- Runs at a fixed rate with a constant `dt`, and keeps running in hidden tabs (a hidden host keeps
+  the game going). After a stall it catches up at most 5 steps. Returns a function that stops it.
+- Draw in `requestAnimationFrame`; don't simulate there.
+- Simulate at 60 steps a second if you can: others then see perfectly even motion.
+
+## Debugging
+
+`GameRelay.connect({ publicKey, debug: true })` shows an overlay (ping, smoothing delay, messages
+and bytes per second, entities per kind, host). Warnings print to the console either way, once
+each, and each one says the fix and names the llms.txt section to read. The full list:
+
+- `room.on('playerJoined') is a custom event …; the built-in for a player arriving is room.on('player_joined')` (see Room reference)
+- `room.send() of x/y more than 20×/s: you're hand-writing sync; use room.define + room.spawn`
+- `room.setState() more than 10×/s: state is for facts (score, round, phase); for things that move use room.define + room.spawn`
+- `room.emit('hit') more than 30×/s: events are for moments; for things that change every frame use room.define + room.spawn`
+- `room.all('shp'): no kind 'shp' is defined; did you mean 'ship'?`
+- `ship jumped across the map without teleport(): call entity.teleport() when respawning`
+- `ship fields differ between players: are they on different builds?`
+- `this room holds 1024 entities, the most it can: new ones from other players are ignored` (remove bullets and effects when they're done)
+- `request('sit') repeated while the first is still waiting: await the first call instead`
+- `ship:… belongs to ada; only its owner can change it. Update in a loop over .mine() …` and `ship has no field 'vx'; add it to room.define('ship', …)`: that write was skipped
+- `this room holds 1024 claims; release keys you're done with`
+- `the server dropped messages: this player sent more than 120 per second`
+- `tick loop fell back to setInterval (a worker was blocked by the page's security settings)`: hidden tabs tick slowly
+
+Test on a bad network before shipping: `connect({ …, simulate: { latency: 150, jitter: 30, loss: 0.05 } })`
+(development only).
+
+## Invite links
+
+The easiest way to play with friends: put the room code in the page URL and send the link.
+
+```js
+// Join the room in this page's link (?room=CODE), or start one.
+const room = (await relay.joinInvite().catch(() => null)) ?? (await relay.createRoom({ maxPlayers: 4 }));
+history.replaceState(null, '', room.inviteUrl()); // the address bar is now the invite link
+
+room.inviteUrl()          // this page's URL plus ?room=CODE (other query params and the hash are kept)
+await room.shareInvite()  // share sheet on phones, clipboard elsewhere: 'shared' | 'copied' | 'cancelled'
+```
+
+- `relay.joinInvite(url?)` resolves `null` when there is no `?room=` in the URL, and rejects like
+  `joinRoom` (`room_not_found`, `room_full`) when the room is gone or full. An old link points at a
+  room that may have closed, so catch and fall back (above).
+- Call `shareInvite()` from a click or tap: browsers only allow sharing and copying after a user
+  gesture. It rejects if copying isn't allowed (e.g. a page not served over https).
+- When the player leaves the room, clear the link: `history.replaceState(null, '', location.pathname)`.
+
+## Lobby: tags, room lists, parties
+
+```js
+// Tags are matchmaking pools, e.g. game modes. Quick match only pairs players with the same tag.
+const room = await relay.quickMatch({ maxPlayers: 4, tag: 'ctf' });
+
+// Browse public rooms (created with { public: true }) that have free seats.
+const rooms = await relay.listRooms('ctf'); // [{ code, players, maxPlayers, tag, createdAt }], up to 50
+
+// Parties: friends queue together (up to 8 members). When the leader creates, joins or
+// quick-matches a room, every connected member is moved in too.
+const party = await relay.createParty();  // share party.code
+await relay.joinParty('H4KQZ');
+relay.on('party', (party) => renderParty(party)); // { code, leaderId, members } or null
+relay.on('room', (room) => startGame(room));      // you were moved into a room by your leader
+await relay.leaveParty();
+```
+
+## Room reference
+
+```js
+room.id            // stable room id (matches webhook payloads)
+room.code          // 4-6 char code other players can join with
+room.me            // your player id
+room.isHost        // true if this client is the host now (see Host changes)
+room.hostId
+room.maxPlayers
+room.players       // [{ id, name, avatar, joinedAt, connected, slot }] in join order
+room.state         // shared JSON facts; only the host writes (see State and timers)
+room.renderTime    // the server-clock moment others' entities are drawn at
+room.chatHistory   // recent chat lines (see Chat)
+room.seed          // random 32-bit number the server picked, the same for everyone (see Time and fairness)
+await room.leave()
+
+room.on('player_joined', (player) => {})
+room.on('player_left', (playerId, reason) => {})       // 'left' | 'timeout' | 'kicked'
+room.on('player_disconnected', (playerId) => {})       // seat kept 30s for reconnect
+room.on('player_reconnected', (playerId) => {})
+room.on('host', () => {})                               // you just became host
+room.on('host_changed', (hostId, previousHostId) => {})
+room.on('state', (state, patch, fromPlayerId) => {})
+room.on('closed', (reason, message) => {})              // 'left' | 'lost' | 'kicked' | 'closed' (see Moderation)
+```
+
+`on()` returns an unsubscribe function; `off(event, handler)` works too (on `relay` and `room`).
+
+## Signed-in players (optional)
+
+By default players are anonymous. If your game has its own accounts, mint player tokens on
+your backend with the instance's **secret key**. Never ship the secret key to the browser.
+
+```js
+// your server
+const res = await fetch('https://gamerelay.io/v1/auth/token', {
+  method: 'POST',
+  headers: { authorization: `Bearer ${process.env.GAMERELAY_SECRET_KEY}` },
+  body: JSON.stringify({
+    playerId: user.id, // 1–64 chars of letters, digits and _ . : - ; may not start with "p_"
+    playerName: user.name,
+    playerAvatar: user.avatarUrl, // optional, up to 512 chars; may be an image URL
+    ttlSeconds: 3600, // optional, 60 to 86400 (default 1 hour)
+    claims: { role: user.role }, // optional, up to 1 KB of JSON, delivered with this player's webhook events
+  }),
+});
+const { token } = await res.json(); // a standard HS256 JWT (iss/aud "gamerelay")
+
+// your game: getToken is called again whenever the SDK (re)connects, so return a fresh token
+const relay = await GameRelay.connect({ getToken: () => fetch('/my/gamerelay-token').then((r) => r.text()) });
+```
+
+## Player data
+
+```js
+await relay.storage.set('best', { score: 1200 }); // per player, per game, persisted
+const best = await relay.storage.get('best');     // null if unset
+```
+
+Any JSON value, up to 256 keys per player (keys up to 128 characters). Needs the "Persisted
+data" setting (on by default).
+
+## Chat
+
+```js
+room.on('chat', ({ from, name, avatar, text, ts }) => addLine(name, avatar, text)); // includes your own lines
+room.chat('gg 👍');                  // everyone in the room, you included
+for (const m of room.chatHistory) addLine(m.name, m.avatar, m.text); // last 20 lines when you joined
+```
+
+- Max 120 characters (an emoji counts as one), single line: newlines and control characters
+  become spaces. `room.chat` throws `too_large` / `bad_request` before sending.
+- Name and avatar come from the player's token, never from the message, so nobody can chat as
+  someone else.
+- Avatars: players from your backend get `playerAvatar` from the token (can be an image URL).
+  Anonymous players may pass `playerAvatar` to `connect` as a short id or emoji (≤32 chars, no
+  URLs); map it to your own art. `room.players[i].avatar` has it too.
+- Up to 5 lines in a burst, then 1 per second per player (`rate_limited` error event).
+  Chat can be switched off per game in the dashboard. History is kept in memory, not saved.
+- Render `text` as text (e.g. `textContent`, or canvas `fillText`), never as HTML.
+
+## Leaderboards
+
+```js
+// Keeps each player's best score per board. Returns { best, rank, improved }.
+const { rank, improved } = await relay.leaderboard.submit('points', 1200);
+
+// Top scores plus your own entry, even if you're outside the top: { order, entries, me }.
+const { entries, me } = await relay.leaderboard.top('points', { limit: 10 }); // default 10, max 100
+for (const e of entries) console.log(e.rank, e.name, e.score); // ties share a rank
+
+// Lower is better (race times): set the order on the board's first submit.
+await relay.leaderboard.submit('fastest-lap', 41.73, { order: 'asc' });
+```
+
+- Board names: 1–32 characters of letters, digits and `_ . : -` (e.g. `level-3`, `daily:2026-09-25`).
+  Up to 32 boards per game; each player has one entry per board.
+- A board's order (`desc` by default) is fixed by its first submit. Submitting with the other
+  order fails with `bad_request`.
+- Names come from `playerName` (or your token), updated on every submit.
+- Scores are sent by the browser, so a determined player can fake one. Fine for casual games.
+  Anonymous players are per tab, so use signed-in players if a board should mean one person, one entry.
+- **Board rules** make faking a score a hassle: the game's owner can set, per board, a min and max
+  score, a max score per minute the player has spent in rooms of the game (higher-is-better
+  boards), a minimum play time, "only while in a room", and a cooldown between submits
+  (dashboard: instance → Leaderboards, or the account MCP's `set_leaderboard_rules`). A score that
+  breaks one fails with the error code `rejected` and no detail; the reason goes to the instance
+  logs. So submit scores while the player is still in the room they earned them in.
+- Leaderboards use the same "Persisted data" setting as player data: turning it off disables both.
+
+## Moderation
+
+You (the game's owner) can kick a player or close a room; players can't. Three ways:
+the dashboard (instance → Live lobbies → click a room), the account MCP server
+(`kick_player`, `close_room`), or your backend with the **secret key**:
+
+```js
+// your server, e.g. from a chat.message webhook
+const headers = { authorization: `Bearer ${process.env.GAMERELAY_SECRET_KEY}`, 'content-type': 'application/json' };
+await fetch(`https://gamerelay.io/v1/rooms/${code}/kick`, {
+  method: 'POST',
+  headers,
+  body: JSON.stringify({ playerId, message: 'Keep it friendly', ban: true }), // ban defaults to true
+});
+await fetch(`https://gamerelay.io/v1/rooms/${code}/close`, { method: 'POST', headers, body: JSON.stringify({ message: 'Round over' }) });
+```
+
+In the game:
+
+```js
+room.on('closed', (reason, message) => {
+  if (reason === 'kicked') showToast(message ?? 'You were removed from the room');
+  if (reason === 'closed') showToast(message ?? 'The room was closed');
+  backToMenu(); // relay.room is null now; the SDK won't try to rejoin
+});
+```
+
+- A kicked player is banned from that room until it closes (`ban: false` lets them back);
+  joining it again fails with `banned`. They stay connected and can join or create other rooms.
+- Everyone else sees `player_left` with reason `'kicked'`. Closing sends everyone `closed('closed')`
+  and the room and its state are gone.
+- Messages are optional, up to 120 characters. Webhooks get `player.left` (reason `kicked`) and
+  `room.closed` (reason `closed`).
+
+## Webhooks (your backend)
+
+Add a webhook in the dashboard (instance → Webhooks) and gamerelay POSTs JSON to your
+backend when things happen (up to 5 webhooks per game). Deliveries are retried with backoff
+for about 8½ hours if your endpoint doesn't answer 2xx within 5 seconds. Production URLs must be
+`https://` on port 443.
+
+Events (subscribe to some or all):
+
+| type | data |
+| --- | --- |
+| `room.created` | `{ room }` |
+| `room.closed` | `{ room, reason: 'empty' \| 'closed' }` (`empty` about 2 minutes after the last player leaves; `closed` = by you) |
+| `player.joined` | `{ room, player, resumed }` |
+| `player.left` | `{ room, player, reason: 'left' \| 'kicked' \| 'timeout' }` |
+| `host.changed` | `{ room, hostId, previousHostId }` |
+| `score.submitted` | `{ board, order, player, score, best, rank, improved }` |
+| `chat.message` | `{ room, player, message: { id, text, ts } }` |
+| `webhook.test` | `{ message }` (the dashboard's "Send test") |
+
+`room` is `{ id, code, tag, isPublic, maxPlayers }`; `player` is `{ id, name, claims }` where
+`claims` are the custom claims from the player's token (or null). Every delivery is an envelope
+`{ id, type, version: 1, createdAt, instanceId, data }`. Use `id` to ignore duplicates: delivery
+is at least once, and order isn't guaranteed across retries.
+
+Verify every request. The `gamerelay-signature` header is `t=<unix seconds>,v1=<hex>` where
+v1 is HMAC-SHA256 of `${t}.${rawBody}` with your webhook's signing secret (`whsec_…`):
+
+```js
+import { createHmac, timingSafeEqual } from 'node:crypto';
+
+function verifyGamerelay(rawBody, header, secret) {
+  const { t, v1 } = Object.fromEntries(header.split(',').map((kv) => kv.split('=')));
+  if (Math.abs(Date.now() / 1000 - Number(t)) > 300) return false; // replay window
+  const expected = createHmac('sha256', secret).update(`${t}.${rawBody}`).digest('hex');
+  return v1?.length === expected.length && timingSafeEqual(Buffer.from(v1), Buffer.from(expected));
+}
+
+// e.g. with Hono / Bun: const raw = await req.text(); verify, then JSON.parse(raw)
+```
+
+Webhooks are notifications: they can't block or change what happens in the game.
+
+## Connection events
+
+The SDK reconnects on its own (exponential backoff) and puts the player back in their room.
+This also happens after a server restart. Reliable `send`s made while offline are queued (up
+to 256) and sent on reconnect. Unreliable ones are dropped.
+
+```js
+relay.on('disconnected', () => showBanner('Reconnecting…'));
+relay.on('reconnected', () => hideBanner());
+relay.on('server_restarting', () => showBanner('Server update, back in a second…'));
+relay.on('replaced', () => showBanner('Opened in another tab'));  // signed-in players only
+relay.on('error', (err) => console.warn(err.code, err.message)); // e.g. not_host, rate_limited
+const ms = await relay.ping();
+```
+
+Calls that wait for a reply (`createRoom`, `storage.get`, `leaderboard.submit`, `ping`, …) reject
+with a `GameRelayError` whose `code` is `disconnected` if the connection is down or drops first.
+
+Test on a bad network before shipping. `simulate` is for development only, so remove it for
+players:
+
+```js
+const relay = await GameRelay.connect({
+  publicKey: 'gr_pub_…',
+  simulate: { latency: 150, jitter: 30, loss: 0.05 }, // +150 ms round trip, ±30 ms, 5% of unreliable sends lost
+});
+```
+
+## Time and fairness
+
+```js
+relay.now()  // the server's clock (ms), synced from pings when you connect; same timeline for everyone
+room.on('message', (d, from, meta) => buffer.push({ at: meta.at, d })); // when the server got it
+
+// Fair randomness: the server picks room.seed, so the host can't reroll until it wins.
+const rand = GameRelay.seededRandom(room.seed); // or: import { seededRandom } from '@gamerelay/sdk'
+const deck = shuffle(cards, rand);              // same order for every player
+room.on('seed', (seed) => startRound(GameRelay.seededRandom(seed)));
+if (room.isHost) room.reseed();                 // next round
+```
+
+- `meta.at` and `relay.now()` share the server's clock, so a message's age is `relay.now() - meta.at`
+  regardless of network jitter. Entities already do this for you (`room.renderTime`).
+- Players own avatars trusts each player with their own position and hits: simple and
+  responsive. When fairness matters, the host simulates from inputs instead (a player can't move
+  faster than the game allows).
+
+## Low level: send and message
+
+Everything above is built on a raw relay you can use directly for anything the primitives don't
+cover (custom protocols, porting an existing game). Don't send positions this way: use entities.
+
+```js
+room.send(data)                      // any JSON value to everyone else
+room.send(data, { to: playerId })    // to one player
+room.send(data, { reliable: false }) // may be dropped under load
+room.on('message', (data, fromPlayerId, meta) => {}) // meta.at: server receive time (ms)
+room.reseed()                        // host only: new room.seed for a new round
+```
+
+## Rules and limits
+
+- Positions and anything that moves go in entities; moments in events; facts in state.
+- Use `player.slot` for sides, colours and spawn points, not `room.players` order or `isHost`
+  (the host can change mid-game).
+- Limit: about 120 messages per second per player (the SDK batches its own sends). One event or
+  request is at most about 15 KB, room state 64 KB. Up to 64 players per room, 256 entities per
+  player and 1,024 per room, 1,024 claims per room.
+- Keep data JSON-only (no Maps, Dates or class instances), nested at most 16 deep.
+- Player names are cut to 24 characters. Tags are 1–32 characters.
+- Parties, chat and persisted data can be turned off per game in the dashboard; their calls
+  then fail with `unsupported`.
+- Each account has a plan (current limits: `GET https://gamerelay.io/v1/plans`). The free plan is
+  1 game with up to 16 players online, which suits turn-based games and small multiplayer.
+  `connect()` rejects with `at_capacity` when the account has that many players online, and with
+  `quota_exceeded` when a free account used its monthly traffic. Show a friendly "try again later"
+  instead of retrying in a loop.
+- **Allowed origins** (dashboard, per game, optional): the sites that may use the public key,
+  e.g. `https://mygame.com`, `https://*.itch.zone` (subdomains), `http://localhost` (any port).
+  Up to 20 entries; set them in the dashboard or with the account MCP's `update_instance`. From
+  any other site, `connect()` rejects: with `unauthorized` and a message that says so for
+  anonymous players, or with `disconnected` for players using `getToken` (the WebSocket is
+  refused). Pages opened from `file://` or in sandboxed iframes send no usable origin and are
+  refused too. When a game won't connect after going live somewhere new, add that site's
+  origin. An empty list allows every site.
