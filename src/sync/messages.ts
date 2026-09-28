@@ -43,7 +43,7 @@ export function checkJson(where: string, data: Json): string {
   if (new TextEncoder().encode(json).byteLength > LIMITS.maxMessageBytes - 512) {
     throw new GameRelayError(
       'too_large',
-      `${where}: data is over ${Math.floor(LIMITS.maxMessageBytes / 1024)} KB; for big or fast-changing data use room.define + room.spawn`,
+      `${where}: data is over ${Math.floor(LIMITS.maxMessageBytes / 1024)} KB; for big or fast-changing data use entities (room.define(kind, fields), then its .spawn())`,
     );
   }
   return json;
@@ -92,7 +92,7 @@ export class Messages {
       this.#warn(
         'emit',
         `emit:${type}`,
-        `room.emit('${type}') more than ${RATE_WARN}×/s: events are for moments; for things that change every frame use room.define + room.spawn`,
+        `room.emit('${type}') more than ${RATE_WARN}×/s: events are for moments; for things that change every frame use entities (room.define(kind, fields), then its .spawn())`,
       );
     }
   }

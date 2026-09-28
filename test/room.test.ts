@@ -58,7 +58,7 @@ describe('setState rate warning', () => {
     const { room, warned, messages } = host();
     for (let i = 0; i < 12; i++) room.setState({ n: i });
     expect(warned).toEqual(['set_state']);
-    expect(messages[0]).toContain('use room.define + room.spawn');
+    expect(messages[0]).toContain('use entities (room.define(kind, fields), then its .spawn())');
   });
 
   test("a timer's handler batch counts once, however many setState calls it makes", () => {

@@ -42,7 +42,7 @@ describe('Messages', () => {
     expect(() => m.emit('player_joined', 1)).toThrow(/reserved/);
     expect(() => m.emit('spawn', 1)).toThrow(/reserved/);
     expect(() => m.emit('fn', (() => 1) as unknown as Json)).toThrow(/must be JSON/);
-    expect(() => m.emit('big', 'x'.repeat(20_000))).toThrow(/room.define \+ room.spawn/);
+    expect(() => m.emit('big', 'x'.repeat(20_000))).toThrow(/use entities \(room.define\(kind, fields\), then its \.spawn\(\)\)/);
   });
 
   test('more than 30 of one event per second warns once', () => {
