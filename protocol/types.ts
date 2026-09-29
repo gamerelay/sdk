@@ -366,6 +366,17 @@ export interface MessageMsg extends Base<'message'> {
   /** When the server received it (ms since the epoch, server clock; compare with `relay.now()`). */
   at: number;
 }
+/**
+ * A `message` in the short form an SDK asks for with `/ws?compact=1`: `s` is the sender's room
+ * slot (`PlayerInfo.slot`) instead of its id, and there's no `v`. A relayed message is most of a
+ * game's traffic, and its envelope was about half of each one.
+ */
+export interface CompactMessageMsg {
+  t: 'm';
+  s: number;
+  d: Json;
+  at: number;
+}
 /** The room has a new seed (the host asked for one). Sent to everyone, the host included. */
 export interface SeedMsg extends Base<'seed'> {
   seed: number;
@@ -439,7 +450,8 @@ export type ServerMessage =
   | PartyMsg
   | PartyRoomMsg
   | RemovedMsg
-  | ServerBatchMsg;
+  | ServerBatchMsg
+  | CompactMessageMsg;
 
 export interface ServerBatchMsg extends Base<'batch'> {
   m: ServerMessage[];

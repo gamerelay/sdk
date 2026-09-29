@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { LIMITS } from '@gamerelay/protocol/limits';
 import type { Json } from '@gamerelay/protocol/types';
-import { Lan, MAX_LAN_COPY_BYTES, MAX_UNCONFIRMED, Merge, RETRY_MS, STALE_MS, type LanDeps, type Wrapped } from '../src/sync/lan';
+import { Lan, MAX_LAN_COPY_BYTES, MAX_UNCONFIRMED, Merge, PROBE_EVERY, RACE_WINDOW, RETRY_MS, SPARSE_MS, STALE_MS, type LanDeps, type Wrapped } from '../src/sync/lan';
 
 const w = (n: number, e = 'A', b?: number): Wrapped => ({ $gr: 'l', e, n, ...(b ? { b } : {}), d: n });
 
@@ -1838,5 +1838,89 @@ describe('LAN shortcut: the LAN first, a relay otherwise, in one connection', ()
       expect(peers[1]!.closed).toBe(true);
       expect(sent.map((x) => x.d.k)).toEqual(['hi']);
     });
+  });
+});
+
+describe('LAN shortcut: copies that lose to the server stop (performance)', () => {
+  test('the merge reports each race: won, arrived after the server’s copy, or held until it came', () => {
+    const races: [string, boolean][] = [];
+    const merge = new Merge(() => {}, () => true, (from, won) => races.push([from, won]));
+    merge.accept('bo', w(1), 0, 'ws'); // no LAN copy: no race
+    merge.accept('bo', w(2), 0, 'lan'); // first: won
+    merge.accept('bo', w(2), 0, 'ws');
+    merge.accept('bo', w(3), 0, 'ws');
+    merge.accept('bo', w(3), 0, 'lan'); // after the server's: lost
+    merge.accept('bo', w(5, 'A', 4), 0, 'lan'); // waits for 4's server copy
+    merge.accept('bo', w(4), 0, 'ws');
+    merge.accept('bo', w(5), 0, 'ws'); // (delivered as the LAN copy, once 4 came: won)
+    merge.accept('bo', w(7, 'A', 7), 0, 'ws');
+    expect(races).toEqual([
+      ['bo', true],
+      ['bo', false],
+      ['bo', true],
+    ]);
+  });
+
+  /** We are `a`, with an open channel to `b`; `clock` is the steady clock. */
+  async function pair(clock: { t: number }) {
+    const sent: string[] = [];
+    let channel: FakePeer['channel'] | null = null;
+    const l = new Lan(
+      deps({
+        enabled: true,
+        clock: () => clock.t,
+        createPeer: () => {
+          const p = new FakePeer();
+          p.channel.send = (t: string) => sent.push(t);
+          channel = p.channel;
+          queueMicrotask(() => p.channel.onopen?.());
+          return p as unknown as RTCPeerConnection;
+        },
+      }),
+    );
+    await l.signal('b', hi);
+    await Bun.sleep(0);
+    const receive = (data: unknown) => (channel!.onmessage as unknown as (ev: { data: string }) => void)({ data: JSON.stringify(data) });
+    return { l, sent, receive };
+  }
+
+  /** `count` of b's broadcasts from `from` on, each with its LAN copy first (`lanFirst`) or last. */
+  function race(l: Lan, receive: (d: unknown) => void, from: number, count: number, lanFirst: (i: number) => boolean) {
+    for (let i = 0; i < count; i++) {
+      const n = from + i;
+      const copy = { $gr: 'l', e: 's', n, d: n };
+      if (lanFirst(i)) {
+        receive(copy);
+        l.receiveServer('b', copy as Wrapped, 0);
+      } else {
+        l.receiveServer('b', copy as Wrapped, 0);
+        receive(copy);
+      }
+    }
+  }
+
+  test('a player whose copies nearly always lose hears so, once per window; one whose copies win doesn’t', async () => {
+    const { l, sent, receive } = await pair({ t: 0 });
+    l.receiveServer('b', { $gr: 'l', e: 's', n: 1, d: 1 }, 0); // the server starts the session
+    race(l, receive, 2, RACE_WINDOW, (i) => i === 0); // 1 of 32 first
+    expect(sent.filter((t) => t === '{"$gr":"slow"}')).toHaveLength(1);
+    race(l, receive, 2 + RACE_WINDOW, RACE_WINDOW, (i) => i % 4 === 0); // a quarter first: worth it
+    expect(sent.filter((t) => t === '{"$gr":"slow"}')).toHaveLength(1);
+    l.close();
+  });
+
+  test('told so, we send that player only every PROBE_EVERYth copy, for SPARSE_MS; then all again', async () => {
+    const clock = { t: 0 };
+    const { l, sent, receive } = await pair(clock);
+    const copies = () => sent.filter((t) => t.startsWith('{"$gr":"l"')).length;
+    for (let i = 0; i < 20; i++) l.wrap(i, false);
+    expect(copies()).toBe(20);
+    receive({ $gr: 'slow' });
+    for (let i = 0; i < 10 * PROBE_EVERY; i++) l.wrap(i, false);
+    expect(copies()).toBe(20 + 10); // the probes keep the races going
+    clock.t = SPARSE_MS;
+    for (let i = 0; i < 20; i++) l.wrap(i, false);
+    expect(copies()).toBe(50);
+    l.close();
   });
 });

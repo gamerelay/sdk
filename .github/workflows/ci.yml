@@ -6,8 +6,9 @@
 #
 # Publishing uses npm trusted publishing (OIDC), so no npm secret is needed. The NPM_TOKEN secret is
 # only a fallback for the first release, before the package exists on npm to trust this workflow.
-# JSR also uses OIDC: the @gamerelay/sdk package on jsr.io has to be linked to this repo. Until it
-# is, the JSR step warns and the npm release still goes out.
+# JSR also uses OIDC: the @gamerelay/sdk package on jsr.io is linked to this repo (2026-09-29). If
+# the JSR step fails, it warns and the npm release still goes out; rerun just the jsr job to
+# publish that version there (docs/PUBLISH.md in the private repo).
 # OPS_WEBHOOK_URL is a Discord webhook; without it the report is skipped.
 name: CI
 
