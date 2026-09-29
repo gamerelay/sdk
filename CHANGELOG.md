@@ -4,6 +4,15 @@ Every release of `@gamerelay/sdk`, newest first. The notes under a version's hea
 GitHub release. Until 1.0, a minor version (0.x.0) may change the API; each break is listed
 here with what to change.
 
+## 0.1.0-alpha.3 (2026-09-29)
+
+- **Smaller messages:** the SDK asks the server for relayed messages in a short form (the
+  sender's room slot instead of its id), about 18% fewer bytes per message and per metered
+  byte. gamerelay.io serves it; an older server just sends the long form.
+- **Player to player uses less upload:** a player whose copies reach you after the server's
+  (common on a relayed route near the game server) is told so, and then sends you only every
+  10th copy for 30 s, which keeps checking whether the route got faster.
+
 ## 0.1.0-alpha.2 (2026-09-29)
 
 - **Player to player, on by default (experimental):** broadcasts also go straight between

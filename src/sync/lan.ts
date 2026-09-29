@@ -75,6 +75,8 @@ interface Held {
   /** When it arrived (the steady clock). */
   since: number;
   source: 'lan' | 'ws';
+  /** A LAN copy of it arrived (even if the server's copy is the one delivered). */
+  lan?: boolean;
   b?: number;
   s?: number;
 }
@@ -121,6 +123,11 @@ export class Merge {
     private readonly deliver: (from: PlayerId, d: Json, at: number) => void,
     /** Whether we have room state number `s` (see `Wrapped.s`). Default: yes. */
     private readonly stateSeen: (s: number) => boolean = () => true,
+    /**
+     * A race was decided: a LAN copy arrived and either delivered its message (`won`) or didn't
+     * (the server's copy came first, or had to be waited for).
+     */
+    private readonly raced: (from: PlayerId, won: boolean) => void = () => {},
   ) {}
 
   /** One copy arrived. `now`: the steady clock, for `tick`. */
@@ -149,6 +156,8 @@ export class Merge {
       for (const e of this.#unconfirmed.get(from) ?? []) if (e.w.e === w.e) this.#hold(st, e.w, e.at, 'lan', e.since);
       this.#unconfirmed.delete(from);
     }
+    // A LAN copy of a message already delivered: its server copy won.
+    if (source === 'lan' && st.last !== null && w.n <= st.last) this.raced(from, false);
     this.#hold(st, w, at, source, now);
     // Even a duplicate moves `serverSeen` on, which can free what's held.
     this.#pump(from, st);
@@ -162,9 +171,10 @@ export class Merge {
       if (held) {
         // The server's copy of a held LAN copy: in order by definition, so no barrier applies.
         if (source === 'ws') Object.assign(held, { source, at, b: undefined, s: undefined });
+        else held.lan = true; // a LAN copy of a held server copy: it lost the race
       } else {
         const lan = source === 'lan';
-        st.held.set(w.n, { d: w.d, at, since: now, source, b: lan ? w.b : undefined, s: lan ? w.s : undefined });
+        st.held.set(w.n, { d: w.d, at, since: now, source, lan, b: lan ? w.b : undefined, s: lan ? w.s : undefined });
       }
       if (st.held.size > MAX_HELD) this.#discard(st);
     }
@@ -249,6 +259,7 @@ export class Merge {
     st.held.delete(n);
     st.last = n;
     this.won[h.source]++;
+    if (h.lan) this.raced(from, h.source === 'lan');
     this.deliver(from, h.d, h.at);
   }
 
@@ -430,6 +441,13 @@ interface Peer {
   rtt: number | null;
   /** The current connection trades public addresses (`LanDeps.direct`, when it was set up). */
   direct: boolean;
+  /** Its LAN copies to us since we last judged them (`RACE_WINDOW`), and how many delivered first. */
+  races: number;
+  wins: number;
+  /** Until then (steady clock), it said our copies lose to the server's: send it only probes. */
+  sparseUntil: number;
+  /** Copies we didn't send it while sparse (every `PROBE_EVERY`th one still goes). */
+  skipped: number;
   /**
    * What it may send us over the LAN: the server's per-connection rate, so copies can't outrun
    * what the server would take. Kept across its connections, so starting over doesn't refill it.
@@ -454,6 +472,18 @@ export const MAX_LAN_COPY_BYTES = 2048;
 /** After the server rate-limits us, LAN copies pause this long: it's dropping what we send. */
 export const RATE_PAUSE_MS = 1000;
 const utf8 = new TextEncoder();
+/**
+ * A copy that reaches a player after the server's copy of it is wasted upstream (and relay)
+ * bandwidth: on a relayed route near the game server, it often is. Every `RACE_WINDOW` of a
+ * player's copies we judge them, and if fewer than `SLOW_SHARE` delivered first we tell it
+ * (`{ $gr: 'slow' }`, which older SDKs ignore). It then sends us only every `PROBE_EVERY`th copy
+ * for `SPARSE_MS`, so we keep judging; if the route gets faster, the notices stop and so does that.
+ */
+export const RACE_WINDOW = 32;
+export const SLOW_SHARE = 0.1;
+export const SPARSE_MS = 30_000;
+export const PROBE_EVERY = 10;
+const SLOW: Json = { $gr: 'slow' };
 
 /** Give up on a peer that hasn't connected in this long (not on the same network, or isolated Wi-Fi). */
 const CONNECT_MS = 8000;
@@ -518,7 +548,11 @@ export class Lan {
   constructor(deps: LanDeps) {
     this.#deps = deps;
     this.#clock = deps.clock ?? (() => performance.now());
-    this.merge = new Merge((from, d, at) => deps.deliver(from, d, at), (seq) => this.stateSeen(seq));
+    this.merge = new Merge(
+      (from, d, at) => deps.deliver(from, d, at),
+      (seq) => this.stateSeen(seq),
+      (from, won) => this.#raced(from, won),
+    );
   }
 
   /** Players we have an open LAN channel with. */
@@ -657,8 +691,10 @@ export class Lan {
     const text = JSON.stringify(w);
     // (Well under the server's own limit, `LIMITS.maxMessageBytes`, so what it would refuse is covered.)
     if (text.length > MAX_LAN_COPY_BYTES || utf8.encode(text).byteLength > MAX_LAN_COPY_BYTES) return w;
+    const now = this.#clock();
     for (const p of this.#peers.values()) {
       if (!p.open || p.stalled || !p.channel || p.channel.bufferedAmount > MAX_BUFFERED) continue;
+      if (now < p.sparseUntil && ++p.skipped % PROBE_EVERY !== 0) continue; // it said ours lose
       try {
         p.channel.send(text);
       } catch {
@@ -666,6 +702,24 @@ export class Lan {
       }
     }
     return w;
+  }
+
+  /** A race of `from`'s copies was decided; every `RACE_WINDOW`, tell it if they mostly lose. */
+  #raced(from: PlayerId, won: boolean): void {
+    const p = this.#peers.get(from);
+    if (!p?.open || !p.channel) return;
+    p.races++;
+    if (won) p.wins++;
+    if (p.races < RACE_WINDOW) return;
+    const slow = p.wins < p.races * SLOW_SHARE;
+    p.races = 0;
+    p.wins = 0;
+    if (!slow) return;
+    try {
+      p.channel.send(JSON.stringify(SLOW));
+    } catch {
+      // closing: its copies stop anyway
+    }
   }
 
   /** A copy arrived over the server. */
@@ -797,7 +851,7 @@ export class Lan {
     if (!p) {
       const bucket = new TokenBucket(LIMITS.ratePerSecond, LIMITS.rateBurst, this.#clock());
       p = {
-        id, pc: null, channel: null, open: false, gen: null, conn: null, server: null, stalled: false, stallTimer: null, early: [], timer: null, retries: 0, misses: 0, openedAt: 0, route: null, rtt: null, direct: false, bucket,
+        id, pc: null, channel: null, open: false, gen: null, conn: null, server: null, stalled: false, stallTimer: null, early: [], timer: null, retries: 0, misses: 0, openedAt: 0, route: null, rtt: null, direct: false, races: 0, wins: 0, sparseUntil: 0, skipped: 0, bucket,
         restartAt: Number.NEGATIVE_INFINITY, deferred: null, deferTimer: null, outbox: null,
       };
       this.#peers.set(id, p);
@@ -991,6 +1045,10 @@ export class Lan {
       p.openedAt = this.#clock();
       p.route = null;
       p.rtt = null;
+      // A new route: its races start over, and so do ours.
+      p.races = 0;
+      p.wins = 0;
+      p.sparseUntil = 0;
       this.#routesAt = Number.NEGATIVE_INFINITY; // read its route on the next tick
       this.#open++;
       if (p.timer) clearTimeout(p.timer);
@@ -1012,6 +1070,12 @@ export class Lan {
       try {
         w = JSON.parse(text);
       } catch {
+        return;
+      }
+      if (typeof w === 'object' && w !== null && (w as { $gr?: unknown }).$gr === 'slow') {
+        const now = this.#clock();
+        if (now >= p.sparseUntil) this.#deps.log?.(`LAN shortcut to ${p.id}: the server's copies arrive first, so only probes go this way`);
+        p.sparseUntil = now + SPARSE_MS;
         return;
       }
       if (!isWrapped(w)) return;

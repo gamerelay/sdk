@@ -391,6 +391,11 @@ export class GameRelay extends Emitter<RelayEvents> {
   /** Between reconnecting and re-entering the room: room messages must wait. */
   #resuming = false;
   #lastRoomInfo: RoomInfo | null = null;
+  /**
+   * Who holds each slot of the room the server has us in, from what it sent (`CompactMessageMsg`).
+   * Kept here, not in the Room: a batch can carry a join and messages before the Room exists.
+   */
+  #slots = new Map<number, PlayerId>();
   /** Network simulation (`simulate`): outbound and inbound delay lanes. */
   readonly #out?: (fn: () => void) => void;
   readonly #in?: (fn: () => void) => void;
@@ -812,7 +817,8 @@ export class GameRelay extends Emitter<RelayEvents> {
     // close() may have been called while a reconnect waited on the token.
     if (this.#stopped) throw new GameRelayError('disconnected', 'Closed');
     // `lan=1`: we know the shortcut's wire format (the server unwraps it for SDKs that don't).
-    const url = `${this.#base.replace(/^http/, 'ws')}/ws?token=${encodeURIComponent(token)}${this.lanEnabled ? '&lan=1' : ''}`;
+    // `compact=1`: relayed messages in their short form (`CompactMessageMsg`).
+    const url = `${this.#base.replace(/^http/, 'ws')}/ws?token=${encodeURIComponent(token)}&compact=1${this.lanEnabled ? '&lan=1' : ''}`;
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(url, 'gamerelay.v1.json');
       this.#ws = ws;
@@ -935,6 +941,23 @@ export class GameRelay extends Emitter<RelayEvents> {
     this.#onDisconnect(1006);
   }
 
+  /**
+   * A player joined or left the room the server has us in. Before its Room exists (we're still
+   * awaiting the join's reply, in the same batch), the Room will be made from `#lastRoomInfo`, so
+   * that is kept up to date too.
+   */
+  #seat(msg: Extract<ServerMessage, { t: 'player_joined' | 'player_left' }>): void {
+    const info = this.#lastRoomInfo;
+    const pending = info !== null && this.room?.id !== info.id;
+    if (msg.t === 'player_joined') {
+      this.#slots.set(msg.player.slot, msg.player.id);
+      if (pending) info.players = [...info.players.filter((p) => p.id !== msg.player.id), msg.player];
+    } else {
+      for (const [slot, id] of this.#slots) if (id === msg.playerId) this.#slots.delete(slot);
+      if (pending) info.players = info.players.filter((p) => p.id !== msg.playerId);
+    }
+  }
+
   #setParty(party: PartyInfo | null): void {
     this.party = party;
     this.room?.lanPartyChanged();
@@ -966,6 +989,17 @@ export class GameRelay extends Emitter<RelayEvents> {
       case 'batch':
         for (const m of msg.m) this.#handle(m);
         return;
+      case 'm': {
+        // The short form names the sender by slot; the server said who holds it before this.
+        const from = this.#slots.get(msg.s);
+        if (from === undefined) return; // (a server bug: it names every slot's holder first)
+        return this.#handle({ v: V, t: 'message', from, d: msg.d, at: msg.at });
+      }
+      case 'player_joined':
+      case 'player_left':
+        this.#seat(msg);
+        this.room?.handle(msg);
+        return;
       case 'welcome':
         return;
       case 'reply':
@@ -990,6 +1024,7 @@ export class GameRelay extends Emitter<RelayEvents> {
         return;
       case 'room':
         this.#lastRoomInfo = msg.room;
+        this.#slots = new Map(msg.room.players.map((p) => [p.slot, p.id]));
         if (this.room?.id === msg.room.id) this.room.sync(msg.room);
         return;
       case 'party':
