@@ -131,3 +131,15 @@ test("room.timer() and clearTimer() don't count as setState calls (review)", () 
   for (let i = 0; i < 8; i++) room.clearTimer(`respawn:${i}`);
   expect(warned).toEqual([]);
 });
+
+test('a state patch cannot reach the state object’s prototype: __proto__, constructor and prototype are skipped', () => {
+  const { room } = makeRoom('pb', { hostId: 'pa', players: [player('pa', 0), player('pb', 1)] });
+  // As the server delivers it: parsed JSON, where `__proto__` is an own key like any other.
+  const patch = JSON.parse('{"__proto__":{"isAdmin":true},"constructor":{"name":"x"},"prototype":1,"score":3}') as JsonObject;
+  room.handle({ v: 1, t: 'state', from: 'pa', patch, seq: 1 } as never);
+  expect(room.state.score).toBe(3);
+  expect(Object.getPrototypeOf(room.state)).toBe(Object.prototype);
+  expect((room.state as Record<string, unknown>).isAdmin).toBeUndefined();
+  expect(room.state.constructor).toBe(Object);
+  expect(Object.keys(room.state)).toEqual(['score']);
+});

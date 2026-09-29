@@ -29,6 +29,7 @@ import {
 } from '@gamerelay/protocol/types';
 import { GameRelayError } from './errors';
 import { Ticker, pickScheduler } from './core/ticker';
+import { MAX_BATCH, PACE_PER_SECOND, SendBudget } from './core/budget';
 import type { FieldInput } from './core/codec';
 import { mountOverlay, type OverlayStats } from './debug/overlay';
 import { Rate, looksPositional } from './debug/rate';
@@ -44,6 +45,7 @@ import { RequestRejection, Requests } from './sync/requests';
 import { TEAMS_KEY, TEAM_COUNT_KEY, balanceTeams } from './sync/teams';
 import { Timers } from './sync/timers';
 import type { SyncTransport } from './sync/transport';
+import { Lan, isSignal, isWrapped, type LanStats } from './sync/lan';
 
 export { GameRelayError };
 export type { Entity, EntityBase, RemoveReason, DefineOptions, SpawnOptions } from './sync/entities';
@@ -88,6 +90,18 @@ export interface ConnectOptions {
   simulate?: NetworkSimulation;
   /** Show a small overlay (ping, smoothing, traffic, entities, warnings). For development. */
   debug?: boolean;
+  /**
+   * Experimental, on by default: players also send broadcasts straight to each other over WebRTC,
+   * racing the server's copy, so each pair takes its best route: directly on the same network, else
+   * through the server's nearest TURN relay, when it has relays. Everything still goes through the
+   * server as well. Nobody sees another player's public address. `false` turns it off. `{ forceRelay: true }`: through the relay only, even on
+   * one network (for testing the relay). `{ direct: 'party' }` (experimental): members of your party
+   * may also connect straight to each other over the internet, which shows each of them the
+   * other's public IP address; everyone else still goes through the relay. It also needs the
+   * instance's "Direct connections" setting on (dashboard; off by default). Ask each player first,
+   * and don't use it in games children under 13 may play.
+   */
+  lan?: boolean | { forceRelay?: boolean; direct?: 'party' };
 }
 
 export interface NetworkSimulation {
@@ -218,16 +232,49 @@ export type RoomEvents = {
 interface Pending {
   resolve: (data: Json | undefined) => void;
   reject: (err: GameRelayError) => void;
+  timer: ReturnType<typeof setTimeout>;
+  /** A ping's `ts`: its pong carries that, not the rid. */
+  ts?: number;
 }
 
 type Outgoing = { [K in RoomClientMessage['t']]: Omit<Extract<RoomClientMessage, { t: K }>, 'v'> }[RoomClientMessage['t']];
 type Request = { t: string; [key: string]: Json | undefined };
 
-const MAX_BATCH = 64;
 /** Stay under the server's 16 KB message limit, with room for the batch wrapper and signature. */
 const MAX_FRAME_BYTES = 15_000;
 const utf8 = new TextEncoder();
 const MAX_QUEUED = 256;
+/**
+ * A request the server hasn't answered in this long fails with `timeout`. The server answers in
+ * milliseconds, so this only fires when the frame or its answer was lost (a dead socket the
+ * watchdog hasn't caught yet, or a frame the rate limit dropped).
+ */
+const REPLY_TIMEOUT_MS = 10_000;
+/** Timed-out requests remembered, so a late answer is dropped instead of reported as an error. */
+const MAX_EXPIRED = 64;
+/** How often the connection's upkeep runs (`#watch`). */
+const WATCH_MS = 1000;
+/**
+ * Nothing received for this long while connected: ping, to learn whether the socket still works. A
+ * socket can stay open for minutes after the network under it is gone (Wi-Fi to cellular), losing
+ * everything sent on it, and the server's pings are invisible to the page. At most one ping per
+ * 5 s of silence, a sliver of the rate limit.
+ */
+const PROBE_IDLE_MS = 5000;
+/** A ping that hears nothing back, no message at all, for this long means the socket is dead. */
+const PROBE_TIMEOUT_MS = 3000;
+/** The clock is re-measured this often, as the two clocks drift (and a sleep can stop ours). */
+const CLOCK_RESAMPLE_MS = 20_000;
+/** Clock samples kept: the one with the shortest round trip wins. */
+const CLOCK_SAMPLES = 8;
+
+/**
+ * A clock that only moves forward, in ms since the epoch: the server offset is kept against it, so
+ * the wall clock stepping (sleep and wake, an NTP fix, the player changing it) can't move `now()`.
+ */
+const monotonic = () => performance.timeOrigin + performance.now();
+/** The LAN shortcut asks for fresh relay credentials this often (they last an hour on the server). */
+const ICE_REFRESH_MS = 20 * 60 * 1000;
 const DEFAULT_URL = 'https://gamerelay.io';
 let defaultUrl = DEFAULT_URL;
 
@@ -308,16 +355,36 @@ export class GameRelay extends Emitter<RelayEvents> {
   /** This connection's frame key and sequence (signed frames); private so the console can't read it. */
   #frameKey: FrameKey | null = null;
   #frameSeq = 0;
-  /** Recent clock samples; the one with the shortest round trip is the most accurate. */
+  /** Recent clock samples (server time minus `monotonic()`); the one with the shortest round trip is the most accurate. */
   #clock: { offset: number; rtt: number }[] = [];
   #clockOffset = 0;
+  /** The samples are from an older connection: the next one replaces them (the route may have changed). */
+  #clockStale = false;
+  /** When we last asked for a clock sample (performance.now()). */
+  #sampledAt = Number.NEGATIVE_INFINITY;
+  readonly #watchTimer: ReturnType<typeof setInterval>;
+  /** When this socket last delivered anything (performance.now()). */
+  #heardAt = 0;
+  /** When the ping we're waiting on to hear back went out, if we are. */
+  #probeAt: number | null = null;
+  /** When `#watch` last ran: a long gap means our timers were frozen, not that the socket died. */
+  #watchedAt = performance.now();
+  #unwatchPage: () => void = () => {};
   readonly #opts: ConnectOptions;
   readonly #base: string;
   #token: { value: string; expiresAt: number } | null = null;
   #rid = 0;
   readonly #pending = new Map<number, Pending>();
+  /** Pings waiting for their pong, by `ts`: the rid they were sent with. */
+  readonly #pongs = new Map<number, number>();
+  readonly #expired = new Set<number>();
   #outbox: Outgoing[] = [];
+  /** The server's rate limit for this connection, charged as it charges (see `lanWithinRate`). */
+  readonly #budget = new SendBudget(performance.now());
   #flushScheduled = false;
+  #flushSoonScheduled = false;
+  /** A flush waiting for the rate limit to pay for what's held (`#flush`). */
+  #flushRetry: ReturnType<typeof setTimeout> | null = null;
   #attempts = 0;
   #reconnectHintMs: number | null = null;
   #stopped = false;
@@ -351,6 +418,17 @@ export class GameRelay extends Emitter<RelayEvents> {
         this.warn('worker', 'worker', "tick loop fell back to setInterval (a worker was blocked by the page's security settings); hidden tabs will tick slowly"),
       ),
     });
+    this.#watchTimer = setInterval(() => this.#watch(), WATCH_MS);
+    // Outside a browser (Bun, Node) the upkeep timer mustn't keep the process alive by itself.
+    (this.#watchTimer as { unref?: () => void }).unref?.();
+    const back = () => this.#pageBack();
+    const shown = () => document.visibilityState === 'visible' && back();
+    if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') document.addEventListener('visibilitychange', shown);
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') window.addEventListener('online', back);
+    this.#unwatchPage = () => {
+      if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') document.removeEventListener('visibilitychange', shown);
+      if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') window.removeEventListener('online', back);
+    };
   }
 
   static async connect(options: ConnectOptions): Promise<GameRelay> {
@@ -362,6 +440,11 @@ export class GameRelay extends Emitter<RelayEvents> {
 
   get connected(): boolean {
     return this.#ws?.readyState === 1 && this.#frameKey !== null;
+  }
+
+  /** @internal Connected and back in the room: what we queue now goes straight to the server. */
+  get serverReady(): boolean {
+    return this.connected && !this.#resuming;
   }
 
   createRoom(options: RoomOptions & { public?: boolean } = {}): Promise<Room> {
@@ -403,12 +486,13 @@ export class GameRelay extends Emitter<RelayEvents> {
 
   /** Round-trip time in ms. */
   async ping(): Promise<number> {
-    const start = Date.now();
+    const start = monotonic();
+    this.#sampledAt = performance.now();
     // Pongs are matched by `ts`, so concurrent pings in the same millisecond need distinct ones.
-    let ts = start;
-    while (this.#pending.has(-ts)) ts++;
+    let ts = Math.floor(start);
+    while (this.#pongs.has(ts)) ts++;
     const serverTime = await this.request({ t: 'ping', ts });
-    const rtt = Date.now() - start;
+    const rtt = monotonic() - start;
     this.#lastRtt = rtt;
     if (typeof serverTime === 'number') this.#clockSample(serverTime - (start + rtt / 2), rtt);
     return rtt;
@@ -419,7 +503,7 @@ export class GameRelay extends Emitter<RelayEvents> {
    * (`meta.at`) and state on one shared timeline, e.g. to render others slightly in the past.
    */
   now(): number {
-    return Date.now() + this.#clockOffset;
+    return monotonic() + this.#clockOffset;
   }
 
   /**
@@ -428,7 +512,13 @@ export class GameRelay extends Emitter<RelayEvents> {
    * Returns a function that stops the loop.
    */
   tick(rate: number, fn: (dt: number, tick: number) => void): () => void {
-    return this.#ticker.add(rate, fn);
+    return this.#ticker.add(rate, (dt, tick) => {
+      try {
+        fn(dt, tick);
+      } finally {
+        this.#flushSoon();
+      }
+    });
   }
 
   /** @internal The server-clock moment of the running `tick` step (see `SyncTransport.writeTime`), else now. */
@@ -437,9 +527,31 @@ export class GameRelay extends Emitter<RelayEvents> {
     return at === null ? this.now() : this.now() - (performance.now() - at);
   }
 
+  /** @internal A broadcast queued now gets through the server's rate limit: its LAN copy may race. */
+  lanWithinRate(): boolean {
+    return this.#budget.allows(this.#outbox.length, performance.now());
+  }
+
+  /** @internal The experimental LAN shortcut is on (the default; `connect({ lan: false })` turns it off). */
+  get lanEnabled(): boolean {
+    return this.#opts.lan !== false;
+  }
+
+  /** @internal The LAN shortcut through the relay only (`lan: { forceRelay: true }`). */
+  get lanForceRelay(): boolean {
+    const lan = this.#opts.lan;
+    return typeof lan === 'object' && lan.forceRelay === true;
+  }
+
+  /** @internal Direct connections over the internet, with party members (`lan: { direct: 'party' }`). */
+  get lanDirect(): 'party' | null {
+    const lan = this.#opts.lan;
+    return typeof lan === 'object' && lan.direct === 'party' ? 'party' : null;
+  }
+
   /** @internal */
-  newEntityId(kind: string): string {
-    return this.#ids(kind);
+  newEntityId(kind: string, owner: PlayerId): string {
+    return this.#ids(kind, owner);
   }
 
   /** @internal Print a warning once per kind (and list it in the debug overlay). */
@@ -453,7 +565,7 @@ export class GameRelay extends Emitter<RelayEvents> {
       const now = Date.now();
       const secs = Math.max(0.001, (now - last.at) / 1000);
       const rate = (k: 'msgsIn' | 'msgsOut' | 'bytesIn' | 'bytesOut') => Math.round((this.#stats[k] - last[k]) / secs);
-      const info = this.room?.debugInfo() ?? { delayMs: 0, entities: {} };
+      const info = this.room?.debugInfo() ?? { delayMs: 0, entities: {}, lan: undefined };
       const stats: OverlayStats = {
         ping: this.#lastRtt,
         delayMs: info.delayMs,
@@ -463,6 +575,7 @@ export class GameRelay extends Emitter<RelayEvents> {
         bytesIn: rate('bytesIn'),
         bytesOut: rate('bytesOut'),
         host: this.room?.isHost ?? false,
+        lan: info.lan,
         warnings: this.#warnings.list(),
       };
       last = { ...this.#stats, at: now };
@@ -473,10 +586,13 @@ export class GameRelay extends Emitter<RelayEvents> {
 
   close(): void {
     this.#stopped = true;
+    this.room?.closeLan();
     this.#ws?.close(1000);
     this.#ticker.stop();
     this.#unmountOverlay?.();
     if (this.#debugPing) clearInterval(this.#debugPing);
+    clearInterval(this.#watchTimer);
+    this.#unwatchPage();
     this.#failPending();
   }
 
@@ -494,18 +610,65 @@ export class GameRelay extends Emitter<RelayEvents> {
   /** @internal */
   request(message: Request): Promise<Json | undefined> {
     if (!this.connected) return Promise.reject(new GameRelayError('disconnected', 'Not connected'));
-    if (!this.#resuming) this.#flush();
+    // What was queued first goes first, leaving the budget a token for the request itself.
+    if (!this.#resuming) this.#flush(1);
     const rid = ++this.#rid;
-    // `ping` correlates by `ts`, everything else by `rid`.
     return new Promise((resolve, reject) => {
-      this.#pending.set(message.t === 'ping' ? -Number(message.ts) : rid, { resolve, reject });
+      const timer = setTimeout(() => {
+        if (!this.#settle(rid, () => {})) return;
+        // Its answer may still come: drop it then, as nobody is waiting for it any more.
+        this.#expired.add(rid);
+        if (this.#expired.size > MAX_EXPIRED) this.#expired.delete(this.#expired.values().next().value!);
+        reject(new GameRelayError('timeout', `No answer from the server in ${REPLY_TIMEOUT_MS / 1000} s (${message.t}); try again`));
+      }, REPLY_TIMEOUT_MS);
+      // `ping` is answered by `ts` (a pong), everything else by `rid`; errors carry the rid for both.
+      const ts = message.t === 'ping' ? Number(message.ts) : undefined;
+      this.#pending.set(rid, { resolve, reject, timer, ts });
+      if (ts !== undefined) this.#pongs.set(ts, rid);
       this.#raw({ ...message, v: V, rid });
     });
   }
 
   #clockSample(offset: number, rtt: number): void {
-    this.#clock = [...this.#clock, { offset, rtt }].slice(-8);
-    this.#clockOffset = this.#clock.reduce((best, c) => (c.rtt < best.rtt ? c : best)).offset;
+    const best = this.#clock.reduce<{ offset: number; rtt: number } | null>((b, c) => (!b || c.rtt < b.rtt ? c : b), null);
+    // Each sample puts the true offset within half its round trip. One that can't agree with the
+    // best one means a clock moved (ours stops in some sleeps): the old samples are wrong now.
+    if (this.#clockStale || (best && Math.abs(offset - best.offset) > (rtt + best.rtt) / 2 + 2)) this.#clock = [];
+    this.#clockStale = false;
+    this.#clock = [...this.#clock, { offset, rtt }].slice(-CLOCK_SAMPLES);
+    this.#clockOffset = this.#clock.reduce((b, c) => (c.rtt < b.rtt ? c : b)).offset;
+  }
+
+  /** Once a second: notice a dead socket, and keep the clock fresh. */
+  #watch(): void {
+    const now = performance.now();
+    const frozen = now - this.#watchedAt > 2.5 * WATCH_MS;
+    this.#watchedAt = now;
+    if (!this.connected) return;
+    if (this.#probeAt !== null && this.#heardAt >= this.#probeAt) this.#probeAt = null;
+    if (this.#probeAt !== null) {
+      // Our timers were frozen or throttled (a hidden or suspended page): its answer may be queued
+      // behind us, so the wait starts over rather than ending.
+      if (frozen) this.#probe();
+      else if (now - this.#probeAt >= PROBE_TIMEOUT_MS) this.#dropSocket();
+      return;
+    }
+    if (now - this.#heardAt >= PROBE_IDLE_MS || now - this.#sampledAt >= CLOCK_RESAMPLE_MS) this.#probe();
+  }
+
+  /** Ping, and give up on the socket if nothing at all comes back in time (`#watch`). */
+  #probe(): void {
+    if (!this.connected) return;
+    this.#probeAt = performance.now();
+    void this.ping().catch(() => {});
+  }
+
+  /**
+   * The page came back (shown again, or back online): the network may have changed while it was
+   * away, and the clock may have stopped. Check both now rather than after 5 s of silence.
+   */
+  #pageBack(): void {
+    this.#probe();
   }
 
   async #enter(message: Request): Promise<Room> {
@@ -522,16 +685,45 @@ export class GameRelay extends Emitter<RelayEvents> {
     return this.room;
   }
 
-  #flush(): void {
+  /**
+   * What a `tick` step queued goes out when this wake's steps are done, not on the next animation
+   * frame (up to a frame later). A microtask runs after every loop due in the wake, the room's own
+   * included, so their sends still share one frame.
+   */
+  #flushSoon(): void {
+    if (this.#flushSoonScheduled || this.#outbox.length === 0) return;
+    this.#flushSoonScheduled = true;
+    queueMicrotask(() => {
+      this.#flushSoonScheduled = false;
+      this.#flush();
+    });
+  }
+
+  /** Send the outbox. `reserve`: budget tokens to leave for a frame about to follow (a request). */
+  #flush(reserve = 0): void {
     this.#flushScheduled = false;
     if (!this.connected || this.#resuming) {
       // Keep reliable messages for after the reconnect; drop the rest.
-      this.#outbox = this.#outbox.filter((m) => !(m.t === 'send' && m.r === false)).slice(-MAX_QUEUED);
+      this.#outbox = this.#trim(this.#outbox.filter((m) => !(m.t === 'send' && m.r === false)), MAX_QUEUED);
       return;
     }
     const loss = this.#opts.simulate?.loss ?? 0;
-    const items = this.#outbox.filter((m) => !(loss && m.t === 'send' && m.r === false && Math.random() < loss));
+    let items = this.#outbox.filter((m) => !(loss && m.t === 'send' && m.r === false && Math.random() < loss));
     this.#outbox = [];
+    // The server drops a frame it can't pay for whole, so send only what the budget covers. What a
+    // later message replaces goes first, newest first (those were queued with no budget, so they
+    // have no LAN copy out); the reliable rest waits, in order, for the budget to refill.
+    const left = Math.max(0, Math.floor(this.#budget.left(performance.now())) - reserve);
+    if (items.length > left) {
+      let extra = items.length - left;
+      for (let i = items.length - 1; i >= 0 && extra > 0; i--) {
+        if (!this.#isReplaceable(items[i]!)) continue;
+        items.splice(i, 1);
+        extra--;
+      }
+      this.#outbox = this.#trim(items.slice(left), MAX_QUEUED);
+      items = items.slice(0, left);
+    }
     // Batch by count and by size: the server rejects frames over its message limit.
     let chunk: unknown[] = [];
     let size = 0;
@@ -548,6 +740,34 @@ export class GameRelay extends Emitter<RelayEvents> {
       size += n;
     }
     send();
+    if (this.#outbox.length > 0 && !this.#flushRetry) {
+      // Come back when the budget pays for what's held (a frame's worth at most).
+      const need = Math.min(this.#outbox.length, MAX_BATCH) - this.#budget.left(performance.now());
+      this.#flushRetry = setTimeout(() => {
+        this.#flushRetry = null;
+        this.#flush();
+      }, Math.max(0, Math.ceil((need * 1000) / PACE_PER_SECOND)));
+    }
+  }
+
+  /**
+   * `items` cut to `max`: first what a later message replaces, oldest first, and only then the
+   * oldest of the rest, which nothing will make up for.
+   */
+  #trim(items: Outgoing[], max: number): Outgoing[] {
+    let extra = items.length - max;
+    if (extra <= 0) return items;
+    const kept: Outgoing[] = [];
+    for (const m of items) {
+      if (extra > 0 && this.#isReplaceable(m)) extra--;
+      else kept.push(m);
+    }
+    return kept.slice(-max);
+  }
+
+  /** Unreliable sends (plain entity updates among them: the next one carries newer values) and heartbeats. */
+  #isReplaceable(m: Outgoing): boolean {
+    return (m.t === 'send' && m.r === false) || m.t === 'heartbeat';
   }
 
   #raw(message: unknown): void {
@@ -556,6 +776,8 @@ export class GameRelay extends Emitter<RelayEvents> {
     const frame = signFrame(this.#frameKey, ++this.#frameSeq, JSON.stringify(message));
     this.#stats.msgsOut++;
     this.#stats.bytesOut += frame.length;
+    const m = message as { t?: string; m?: unknown[] };
+    this.#budget.sent(m.t === 'batch' && m.m ? Math.max(1, m.m.length) : 1, performance.now());
     if (this.#out) this.#out(() => ws.readyState === 1 && ws.send(frame));
     else ws.send(frame);
   }
@@ -589,28 +811,37 @@ export class GameRelay extends Emitter<RelayEvents> {
     const token = await this.#getToken();
     // close() may have been called while a reconnect waited on the token.
     if (this.#stopped) throw new GameRelayError('disconnected', 'Closed');
-    const url = `${this.#base.replace(/^http/, 'ws')}/ws?token=${encodeURIComponent(token)}`;
+    // `lan=1`: we know the shortcut's wire format (the server unwraps it for SDKs that don't).
+    const url = `${this.#base.replace(/^http/, 'ws')}/ws?token=${encodeURIComponent(token)}${this.lanEnabled ? '&lan=1' : ''}`;
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(url, 'gamerelay.v1.json');
       this.#ws = ws;
       this.#frameKey = null;
       this.#frameSeq = 0;
+      this.#heardAt = performance.now();
+      this.#probeAt = null;
       let welcomed = false;
       const receive = (ev: MessageEvent) => {
         // (A delayed message can arrive after its socket was replaced.)
         if (this.#ws !== ws) return;
+        this.#heardAt = performance.now();
         this.#stats.msgsIn++;
         this.#stats.bytesIn += String(ev.data).length;
         const msg = attempt(() => JSON.parse(String(ev.data)) as ServerMessage | null);
         if (!msg) return;
         if (msg.t === 'welcome') {
           welcomed = true;
+          // The server made this connection's bucket before it said welcome, and nothing is sent
+          // before it (frames are signed with its key), so ours starts now and never runs ahead.
+          this.#budget.reset(performance.now());
           this.playerId = msg.playerId;
           // An older server sends no features: everything stays off.
           if (msg.features) this.features = { ...this.features, ...msg.features };
           this.#frameKey = unmaskKey(msg.k, msg.playerId);
-          // A rough clock until the pings below (and any the game sends) refine it.
-          if (this.#clock.length === 0) this.#clockOffset = msg.serverTime - Date.now();
+          // A rough clock until the pings below (and any the game sends) refine it. The old samples
+          // stay in use until then, so the clock doesn't jump back to this rough one.
+          if (this.#clock.length === 0) this.#clockOffset = msg.serverTime - monotonic();
+          this.#clockStale = true;
           resolve();
           for (const delay of [0, 1_000, 3_000]) setTimeout(() => void this.ping().catch(() => {}), delay);
         }
@@ -635,6 +866,7 @@ export class GameRelay extends Emitter<RelayEvents> {
     if (this.#stopped) return;
     if (code === 4001) {
       this.#stopped = true;
+      this.room?.closeLan(); // another tab took over: this one's LAN copies would speak for it
       this.fire('replaced');
       return;
     }
@@ -644,7 +876,10 @@ export class GameRelay extends Emitter<RelayEvents> {
 
   #scheduleReconnect(): void {
     const backoff = Math.min(10_000, 250 * 2 ** this.#attempts) * (0.5 + Math.random() / 2);
-    const delay = this.#reconnectHintMs ?? backoff;
+    // A restart drops every player at once: spread them over 0.5–1.5× the server's hint, or they
+    // would all come back in the same millisecond.
+    const hint = this.#reconnectHintMs;
+    const delay = hint === null ? backoff : hint * (0.5 + Math.random());
     this.#reconnectHintMs = null;
     this.#attempts++;
     setTimeout(() => void this.#reconnect(), delay);
@@ -660,9 +895,13 @@ export class GameRelay extends Emitter<RelayEvents> {
     this.#attempts = 0;
     // Hold queued room messages until we are back in the party and room.
     this.#resuming = true;
-    // A 'disconnected' failure means the connection dropped again: keep the party and room for the
-    // next attempt instead of treating them as gone.
-    const gone = (err: GameRelayError) => err.code !== 'disconnected';
+    // A 'disconnected' failure means the connection dropped again, and a 'timeout' that it went
+    // quiet: keep the party and room for the next attempt instead of treating them as gone.
+    let silent = false;
+    const gone = (err: GameRelayError) => {
+      if (err.code === 'timeout') silent = true;
+      return err.code !== 'disconnected' && err.code !== 'timeout';
+    };
     try {
       const party = this.party;
       if (party) await this.request({ t: 'party_join', code: party.code }).catch((err) => gone(err) && this.#setParty(null));
@@ -677,25 +916,47 @@ export class GameRelay extends Emitter<RelayEvents> {
     } finally {
       this.#resuming = false;
     }
+    if (silent) this.#dropSocket(); // the server never answered: try again on a new socket
     if (!this.connected) return; // dropped mid-resume; the scheduled reconnect takes over
     this.#flush();
     this.fire('reconnected');
   }
 
+  /**
+   * Give up on this socket now and reconnect as if it had closed. A socket that went dead (a network
+   * switch, a sleeping laptop) can take minutes to report its close, and the seat's grace may run out
+   * first, so we don't wait for its close event (it's ignored when it comes).
+   */
+  #dropSocket(): void {
+    const ws = this.#ws;
+    if (!ws) return;
+    this.#ws = null;
+    attempt(() => ws.close());
+    this.#onDisconnect(1006);
+  }
+
   #setParty(party: PartyInfo | null): void {
     this.party = party;
+    this.room?.lanPartyChanged();
     this.fire('party', party);
   }
 
   #failPending(): void {
-    for (const p of this.#pending.values()) p.reject(new GameRelayError('disconnected', 'Connection lost'));
+    const pending = [...this.#pending.values()];
     this.#pending.clear();
+    this.#pongs.clear();
+    for (const p of pending) {
+      clearTimeout(p.timer);
+      p.reject(new GameRelayError('disconnected', 'Connection lost'));
+    }
   }
 
-  #settle(key: number, fn: (p: Pending) => void): boolean {
-    const p = this.#pending.get(key);
+  #settle(rid: number, fn: (p: Pending) => void): boolean {
+    const p = this.#pending.get(rid);
     if (!p) return false;
-    this.#pending.delete(key);
+    this.#pending.delete(rid);
+    if (p.ts !== undefined) this.#pongs.delete(p.ts);
+    clearTimeout(p.timer);
     fn(p);
     return true;
   }
@@ -711,14 +972,16 @@ export class GameRelay extends Emitter<RelayEvents> {
         this.#settle(msg.rid, (p) => p.resolve(msg.data));
         return;
       case 'pong':
-        this.#settle(-msg.ts, (p) => p.resolve(msg.serverTime));
+        this.#settle(this.#pongs.get(msg.ts) ?? 0, (p) => p.resolve(msg.serverTime));
         return;
       case 'error': {
         const err = new GameRelayError(msg.code, msg.message);
         if (msg.code === 'rate_limited') {
           this.warn('rate_limited', 'rate_limited', 'the server dropped messages: this player sent more than 120 per second; send less often (check emit and setState rates)');
+          this.room?.lanPause();
         }
-        if (msg.rid === undefined || !this.#settle(msg.rid, (p) => p.reject(err))) this.fire('error', err);
+        if (msg.rid !== undefined && (this.#settle(msg.rid, (p) => p.reject(err)) || this.#expired.has(msg.rid))) return;
+        this.fire('error', err);
         return;
       }
       case 'server_restarting':
@@ -780,6 +1043,12 @@ export class Room extends Emitter<RoomEvents> {
   readonly #claims: Claims;
   readonly #requests: Requests;
   readonly #inputs: Inputs;
+  readonly #lan: Lan;
+  /** When we last asked for this room's relay credentials (`#fetchIce`), and whether we have any. */
+  #iceAt = 0;
+  #iceHave = false;
+  /** The owner allows direct connections between party members (the `turn` reply's `direct`). */
+  #directAllowed = false;
   readonly #inputsView: { get(playerId: PlayerId): Readonly<Record<string, Json>> };
   readonly #stopLoop: () => void;
   #unwatchVisibility: () => void = () => {};
@@ -810,8 +1079,7 @@ export class Room extends Emitter<RoomEvents> {
     const transport: SyncTransport = {
       me,
       // `h` (host-only) lets the server drop a replaced host's late writes, timer effects included.
-      send: (data, o) =>
-        relay.queue({ t: 'send', d: data, to: o.to, r: o.reliable ? undefined : false, h: o.host || this.#timers.firing ? true : undefined }),
+      send: (data, o) => this.#queueSend(data, o.to, o.reliable, o.host || this.#timers.firing, o.supersedable),
       now: () => relay.now(),
       writeTime: () => relay.writeTime(),
       player: (id) => this.players.find((p) => p.id === id),
@@ -823,13 +1091,14 @@ export class Room extends Emitter<RoomEvents> {
       onSpawn: (e) => this.#fireEntity(this.#spawnHandlers, e),
       onRemove: (e, reason) => this.#fireEntity(this.#removeHandlers, e, reason),
       warn,
-    }, (kind) => relay.newEntityId(kind));
+      perSender: relay.lanEnabled,
+    }, (kind, owner) => relay.newEntityId(kind, owner));
     this.#messages = new Messages(transport, (type, data, from, meta) => this.#fireCustom(type, data, from, meta), warn);
     this.#health = new HostHealth({
       now: () => performance.now(),
       isHost: () => this.isHost,
       ready: () => relay.connected,
-      send: (m) => relay.queue(m),
+      send: (m) => this.#queue(m),
     });
     this.#timers = new Timers({
       ready: () => relay.connected,
@@ -843,19 +1112,42 @@ export class Room extends Emitter<RoomEvents> {
     this.#claims = new Claims({
       me,
       isHost: () => this.isHost,
-      queue: (m) => relay.queue(m),
+      queue: (m) => this.#queue(m),
       fire: (event, key, playerId) => this.fire(event, key, playerId),
       warn,
+      now: () => performance.now(),
+      ready: () => relay.serverReady,
     });
     this.#claims.sync(info.claims);
     this.#requests = new Requests(transport, warn);
     this.#inputs = new Inputs(transport);
     this.#inputsView = Object.freeze({ get: (playerId: PlayerId) => this.#inputs.get(playerId) });
+    this.#lan = new Lan({
+      me,
+      enabled: relay.lanEnabled,
+      signal: (to, data) => relay.queue({ t: 'send', d: data, to }),
+      now: () => relay.now(),
+      hostId: () => this.hostId,
+      players: () => this.players.map((p) => p.id),
+      serverReady: () => relay.serverReady,
+      withinRate: () => relay.lanWithinRate(),
+      relay: { only: relay.lanForceRelay },
+      direct: relay.lanDirect === 'party' ? (id) => this.#directAllowed && (relay.party?.members.some((m) => m.id === id) ?? false) : undefined,
+      deliver: (from, d, at) => this.#receive(d, from, at),
+      log: (m) => console.info(`[gamerelay] ${m}`),
+    });
+    this.#lan.stateAt(info.stateSeq);
+    for (const p of this.players) this.#lan.add(p.id);
+    this.#fetchIce();
     this.#stopLoop = relay.tick(60, () => {
+      // Fresh credentials, and the owner's current say on direct connections (even without relays).
+      if ((this.#iceHave || relay.lanDirect) && relay.now() - this.#iceAt > ICE_REFRESH_MS) this.#fetchIce();
+      this.#lan.tick();
       this.#entities.tick();
       this.#health.tick();
       this.#timers.tick();
       this.#requests.tick();
+      this.#claims.tick();
       this.#inputs.tick();
     });
     if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
@@ -903,7 +1195,89 @@ export class Room extends Emitter<RoomEvents> {
     if (looksPositional(data) && this.#sendRate.hit(this.#relay.now())) {
       this.#relay.warn('send_positions', 'send_positions', "room.send() of x/y more than 20×/s: you're hand-writing sync; use entities (room.define(kind, fields), then its .spawn()) and the SDK smooths it, sends it to late joiners and cleans up after players who leave");
     }
-    this.#relay.queue({ t: 'send', d: data, to: options.to, r: options.reliable === false ? false : undefined, h });
+    this.#queueSend(data, options.to, options.reliable !== false, h === true);
+  }
+
+  /**
+   * Every relayed send goes out here. With the LAN shortcut open, a broadcast is numbered and a copy
+   * races to LAN peers; the server still gets (and relays) every message as before.
+   */
+  #queueSend(data: Json, to: PlayerId | undefined, reliable: boolean, host: boolean, supersedable = false): void {
+    const broadcast = to === undefined && this.#lan.enabled;
+    const d = broadcast ? (this.#lan.wrap(data, host, supersedable) as unknown as Json) : data;
+    if (!broadcast) this.#lan.barrier();
+    this.#relay.queue({ t: 'send', d, to, r: reliable ? undefined : false, h: host ? true : undefined });
+  }
+
+  /**
+   * Everything else the room sends goes out here. What others will see (state, claims, chat, seed,
+   * a step down) is a barrier for the LAN shortcut: no later broadcast's LAN copy may overtake it.
+   */
+  #queue(m: Parameters<GameRelay['queue']>[0]): void {
+    if (m.t !== 'heartbeat' && m.t !== 'visibility') this.#lan.barrier();
+    this.#relay.queue(m);
+  }
+
+  /**
+   * The LAN shortcut: this room's relays and credentials (the server only gives them to players in
+   * a room, for that room). Asked for on joining, after a reconnect, and again well before they
+   * expire. No connection is tried until the first answer; a server without relays (or a failed
+   * ask) means the LAN only, and a failed refresh keeps the credentials we have.
+   */
+  #fetchIce(): void {
+    if (!this.#relay.lanEnabled) return;
+    this.#iceAt = this.#relay.now();
+    const none = (why: string) => {
+      if (this.#iceHave) return;
+      if (this.#relay.lanForceRelay) console.info(`[gamerelay] LAN shortcut: no relays (${why})`);
+      void this.#lan.setRelays(null);
+    };
+    this.#relay
+      .request({ t: 'turn' })
+      .then((data) => {
+        const reply = data as { ice?: RTCIceServer[]; direct?: boolean } | undefined;
+        const allowed = reply?.direct === true;
+        if (allowed !== this.#directAllowed) {
+          this.#directAllowed = allowed;
+          this.#lan.directChanged();
+        }
+        const ice = reply?.ice;
+        if (!ice?.length) return none('none on this server');
+        this.#iceHave = true;
+        void this.#lan.setRelays(ice);
+      })
+      .catch((err: GameRelayError) => none(err.message));
+  }
+
+  /** @internal Our party changed: direct connections follow who's in it (`lan: { direct: 'party' }`). */
+  lanPartyChanged(): void {
+    this.#lan.directChanged();
+  }
+
+  /** @internal The connection is closed or replaced: close the LAN channels too. */
+  closeLan(): void {
+    this.#lan.close();
+  }
+
+  /** @internal The server rate-limited us: LAN copies pause too (see `Lan.pause`). */
+  lanPause(): void {
+    this.#lan.pause();
+  }
+
+  /**
+   * Experimental (`connect({ lan: true })`): the players you have a direct LAN channel with. Their
+   * broadcasts reach you over it as well as through the server, and you keep whichever comes first.
+   */
+  lanPeers(): PlayerId[] {
+    return this.#lan.peers();
+  }
+
+  /**
+   * Experimental: how the LAN shortcut's channel with a player goes: `'direct'` (the same network)
+   * or `'relay'` (through our TURN relay). `null`: no channel, or not known yet.
+   */
+  lanRoute(playerId: PlayerId): 'direct' | 'relay' | null {
+    return this.#lan.route(playerId);
   }
 
   /** Host only. Shallow-merges `patch` into the shared, persisted room state (`null` deletes a key). */
@@ -920,7 +1294,7 @@ export class Room extends Emitter<RoomEvents> {
     if (!this.isHost) throw new GameRelayError('not_host', 'Only the host can set state');
     this.state = applyPatch(this.state, patch);
     if (this.#batchPatch) Object.assign(this.#batchPatch, patch);
-    else this.#relay.queue({ t: 'set_state', patch });
+    else this.#queue({ t: 'set_state', patch });
   }
 
   #countState(): void {
@@ -940,14 +1314,14 @@ export class Room extends Emitter<RoomEvents> {
       const patch = this.#batchPatch;
       this.#batchPatch = null;
       if (this.#batchCounted) this.#countState(); // the game's writes inside count once
-      if (Object.keys(patch).length > 0) this.#relay.queue({ t: 'set_state', patch });
+      if (Object.keys(patch).length > 0) this.#queue({ t: 'set_state', patch });
     }
   }
 
   /** Host only: ask the server for a new `room.seed` (a new round). Everyone gets a `seed` event. */
   reseed(): void {
     if (!this.isHost) throw new GameRelayError('not_host', 'Only the host can pick a new seed');
-    this.#relay.queue({ t: 'reseed' });
+    this.#queue({ t: 'reseed' });
   }
 
   /** Send a chat line to the room (max 120 characters, single line). Arrives as a `chat` event for everyone, you included. */
@@ -958,7 +1332,7 @@ export class Room extends Emitter<RoomEvents> {
         ? new GameRelayError('bad_request', 'Chat messages cannot be empty')
         : new GameRelayError('too_large', `Chat messages are limited to ${LIMITS.maxChatLength} characters`);
     }
-    this.#relay.queue({ t: 'chat', text: checked.text });
+    this.#queue({ t: 'chat', text: checked.text });
   }
 
   /**
@@ -1177,8 +1551,14 @@ export class Room extends Emitter<RoomEvents> {
   }
 
   /** @internal For the debug overlay. */
-  debugInfo(): { delayMs: number; entities: Record<string, number>; hosted: Record<string, number> } {
-    return { delayMs: this.#entities.delay.ms, entities: this.#entities.counts(), hosted: this.#entities.hostedCounts() };
+  debugInfo(): {
+    delayMs: number;
+    entities: Record<string, number>;
+    hosted: Record<string, number>;
+    lan: LanStats | undefined;
+  } {
+    const lan = this.#relay.lanEnabled ? this.#lan.stats() : undefined;
+    return { delayMs: this.#entities.delayMs, entities: this.#entities.counts(), hosted: this.#entities.hostedCounts(), lan };
   }
 
   #fireEntity(map: Map<string, Set<EntityHandler>>, entity: Entity, reason?: RemoveReason): void {
@@ -1234,6 +1614,7 @@ export class Room extends Emitter<RoomEvents> {
     this.#live = false;
     this.#claims.close();
     this.#requests.close();
+    this.#lan.close();
     this.#stopLoop();
     this.#unwatchVisibility();
   }
@@ -1243,6 +1624,7 @@ export class Room extends Emitter<RoomEvents> {
     this.#live = false;
     this.#claims.close();
     this.#requests.close();
+    this.#lan.close();
     this.#stopLoop();
     this.#unwatchVisibility();
     this.fire('closed', reason, message);
@@ -1250,18 +1632,23 @@ export class Room extends Emitter<RoomEvents> {
 
   /** @internal Resync after a reconnect, emitting events for anything that changed. */
   sync(info: RoomInfo): void {
+    this.#lan.resync(); // the server doesn't replay what we missed: held LAN copies' server copies aren't coming
+    this.#lan.stateAt(info.stateSeq);
+    this.#fetchIce();
     const before = new Map(this.players.map((p) => [p.id, p]));
     const after = new Set(info.players.map((p) => p.id));
     this.players = info.players;
     for (const p of info.players) {
       if (before.has(p.id)) continue;
       this.#entities.playerJoined(p.id);
+      this.#lan.add(p.id, false); // noted; reconnect() below starts with everyone at once
       this.fire('player_joined', p);
     }
     for (const id of before.keys()) {
       if (after.has(id)) continue;
       this.#entities.playerLeft(id);
       this.#inputs.playerLeft(id);
+      this.#lan.remove(id);
       this.fire('player_left', id, 'timeout');
     }
     // State first: becoming host here must work from the room's current state, not our stale copy
@@ -1278,6 +1665,8 @@ export class Room extends Emitter<RoomEvents> {
     // Deliver chat that arrived while we were reconnecting.
     const seen = new Set(this.chatHistory.map((m) => m.id));
     for (const m of info.chat ?? []) if (!seen.has(m.id)) this.#receiveChat(m);
+    // Whatever LAN signalling went on while we were away went nowhere: start again.
+    this.#lan.reconnect();
   }
 
   #receiveChat(message: ChatMessage): void {
@@ -1285,12 +1674,23 @@ export class Room extends Emitter<RoomEvents> {
     this.fire('chat', message);
   }
 
+  /** A relayed message, from the server or (with the LAN shortcut) straight from its sender. */
+  #receive(d: Json, from: PlayerId, at: number): void {
+    if (this.#entities.receive(d, from, at) || this.#messages.receive(d, from, at) || this.#requests.receive(d, from) || this.#inputs.receive(d, from)) return;
+    this.fire('message', d, from, { at });
+  }
+
   /** @internal */
   handle(msg: ServerMessage): void {
+    // An event the server sent everyone (a host change, a join, a claim): a reaction we broadcast
+    // to it must not reach a LAN peer before the event itself does. A state patch carries a number
+    // instead (`Lan.stateAt`), which a LAN peer checks for itself: no barrier, no wait.
+    if (msg.t !== 'message' && msg.t !== 'state') this.#lan.barrier();
     switch (msg.t) {
       case 'message':
-        if (this.#entities.receive(msg.d, msg.from, msg.at) || this.#messages.receive(msg.d, msg.from, msg.at) || this.#requests.receive(msg.d, msg.from) || this.#inputs.receive(msg.d, msg.from)) return;
-        return this.fire('message', msg.d, msg.from, { at: msg.at });
+        if (isSignal(msg.d)) return void this.#lan.signal(msg.from, msg.d);
+        if (isWrapped(msg.d)) return this.#lan.receiveServer(msg.from, msg.d, msg.at);
+        return this.#receive(msg.d, msg.from, msg.at);
       case 'seed':
         this.seed = msg.seed;
         return this.fire('seed', msg.seed, msg.from);
@@ -1298,16 +1698,19 @@ export class Room extends Emitter<RoomEvents> {
         return this.#receiveChat(msg.message);
       case 'state':
         this.state = applyPatch(this.state, msg.patch);
-        return this.fire('state', this.state, msg.patch, msg.from);
+        this.fire('state', this.state, msg.patch, msg.from);
+        return this.#lan.stateAt(msg.seq); // after the handlers: what it frees comes after the patch
       case 'player_joined':
         this.players = [...this.players.filter((p) => p.id !== msg.player.id), msg.player];
         this.#entities.playerJoined(msg.player.id);
+        this.#lan.add(msg.player.id, false); // the newcomer starts
         this.#keepTeams();
         return this.fire('player_joined', msg.player);
       case 'player_left':
         this.players = this.players.filter((p) => p.id !== msg.playerId);
         this.#entities.playerLeft(msg.playerId);
         this.#inputs.playerLeft(msg.playerId);
+        this.#lan.remove(msg.playerId);
         this.#keepTeams();
         return this.fire('player_left', msg.playerId, msg.reason);
       case 'player_disconnected':
@@ -1326,9 +1729,14 @@ export class Room extends Emitter<RoomEvents> {
   }
 }
 
+/** Keys a patch may not set: assigning them would change the state object's prototype, not its data. */
+const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
 function applyPatch(state: JsonObject, patch: JsonObject): JsonObject {
   const next = { ...state };
   for (const [k, v] of Object.entries(patch)) {
+    // A patch comes from the server as parsed JSON, where `__proto__` is an ordinary key.
+    if (UNSAFE_KEYS.has(k)) continue;
     if (v === null) delete next[k];
     else next[k] = v;
   }

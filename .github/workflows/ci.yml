@@ -1,10 +1,13 @@
 # Every pull request and every push runs the typecheck, tests and pack. A merge to the default
 # branch (a release PR opened by `bun run release:sdk` in the private repo) also publishes to npm
-# with provenance, when its version isn't on npm yet, then tags it `v<version>` and posts the
-# result to the ops channel. Pushes that don't change the version publish nothing.
+# with provenance, when its version isn't on npm yet, then tags it `v<version>`, posts its
+# CHANGELOG.md notes as a GitHub release, publishes it to JSR, and posts the result to the ops
+# channel. Pushes that don't change the version publish nothing.
 #
 # Publishing uses npm trusted publishing (OIDC), so no npm secret is needed. The NPM_TOKEN secret is
 # only a fallback for the first release, before the package exists on npm to trust this workflow.
+# JSR also uses OIDC: the @gamerelay/sdk package on jsr.io has to be linked to this repo. Until it
+# is, the JSR step warns and the npm release still goes out.
 # OPS_WEBHOOK_URL is a Discord webhook; without it the report is skipped.
 name: CI
 
@@ -28,6 +31,11 @@ jobs:
       - run: bun run typecheck
       - run: bun test
       - run: bun run pack:npm
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      # JSR rejects public exports without explicit types; catch that on the PR, not at release.
+      - run: deno publish --dry-run --allow-dirty
 
   publish:
     needs: test
@@ -67,8 +75,23 @@ jobs:
       - name: Publish to npm
         if: steps.version.outputs.new == 'true'
         working-directory: npm
-        # A prerelease (0.1.0-alpha.0) goes out under its label, never as latest (scripts/dist-tag.ts).
-        run: npm publish --provenance --tag "$(bun ../scripts/dist-tag.ts)"
+        # A prerelease (0.1.0-beta.0) goes out under its label (scripts/dist-tag.ts). An alpha also
+        # becomes latest while no stable version is, so `npm i @gamerelay/sdk` gets the newest
+        # alpha: it's published as latest, and the alpha tag is added after.
+        run: |
+          name=$(node -p 'require("./package.json").name')
+          version=$(node -p 'require("./package.json").version')
+          label=$(bun ../scripts/dist-tag.ts)
+          current=$(npm view "$name" dist-tags.latest 2>/dev/null || true)
+          if [ "$(bun ../scripts/dist-tag.ts --moves-latest "$current")" = true ]; then
+            echo "$name@$version: publishing as latest (was ${current:-none}), then tagging $label"
+            npm publish --provenance --tag latest
+            # Trusted publishing only covers `npm publish`: without NPM_TOKEN this warns, and
+            # latest (what `npm i` installs) is already right.
+            npm dist-tag add "$name@$version" "$label" || echo "::warning::published as latest, but couldn't move the $label tag (no NPM_TOKEN?): npm dist-tag add $name@$version $label"
+          else
+            npm publish --provenance --tag "$label"
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Tag the release
@@ -76,9 +99,45 @@ jobs:
         run: |
           git tag "v${{ steps.version.outputs.version }}"
           git push origin "v${{ steps.version.outputs.version }}"
+      - name: GitHub release
+        if: steps.version.outputs.new == 'true'
+        # The notes are the version's CHANGELOG.md section; prereleases (0.1.0-alpha.2) are marked so.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          notes=$(bun scripts/release-notes.ts "$VERSION") || notes="See CHANGELOG.md."
+          flag=""
+          case "$VERSION" in *-*) flag="--prerelease" ;; esac
+          gh release create "v$VERSION" --verify-tag --title "v$VERSION" --notes "$notes" $flag \
+            || echo "::warning::published to npm, but couldn't create the GitHub release for v$VERSION"
+
+  jsr:
+    needs: publish
+    if: needs.publish.outputs.new == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # JSR trusted publishing
+    outputs:
+      ok: ${{ steps.jsr.outputs.ok }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: Publish to JSR
+        id: jsr
+        run: |
+          if deno publish; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::npm has the release, but JSR didn't take it (is @gamerelay/sdk on jsr.io linked to this repo?)"
+          fi
 
   report:
-    needs: [test, publish]
+    needs: [test, publish, jsr]
     # Only for a merge that tried to release (a new version), or whose tests failed.
     if: >-
       always() && github.event_name == 'push' && github.ref_name == github.event.repository.default_branch &&
@@ -91,11 +150,13 @@ jobs:
           TESTS: ${{ needs.test.result }}
           PUBLISH: ${{ needs.publish.result }}
           VERSION: ${{ needs.publish.outputs.version }}
+          JSR: ${{ needs.jsr.outputs.ok }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           [ -n "$WEBHOOK" ] || { echo "OPS_WEBHOOK_URL isn't set; skipping"; exit 0; }
           if [ "$PUBLISH" = success ]; then
             text="[sdk] ✅ Published @gamerelay/sdk ${VERSION}: https://www.npmjs.com/package/@gamerelay/sdk/v/${VERSION}"
+            [ "$JSR" = true ] && text="$text (and on JSR)" || text="$text (JSR didn't take it: ${RUN})"
           elif [ "$TESTS" != success ]; then
             text="[sdk] ❌ Tests didn't pass on ${GITHUB_REF_NAME} (${TESTS}), nothing published. ${RUN}"
           else

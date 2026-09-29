@@ -17,7 +17,7 @@ MCP servers (Streamable HTTP):
   with `shape: 'avatars' | 'host' | 'mixed'`, `check_public_key`).
   `claude mcp add --transport http gamerelay https://gamerelay.io/mcp`
 - `https://gamerelay.io/mcp/admin`: everything in the dashboard, as you. The first call opens
-  your browser to sign in and approve the agent (OAuth). Tools: `whoami`, `list_instances`,
+  your browser to sign in and approve the agent (OAuth). Tools: the three docs tools above, `whoami`, `list_instances`,
   `get_instance`, `create_instance`, `update_instance` (chat, parties, saves, logs, room size, allowed origins),
   `delete_instance`, `rotate_key`, `list_rooms`, `get_room`, `kick_player`, `close_room`,
   `search_logs`, `get_usage`,
@@ -32,6 +32,12 @@ Script tag (exposes `window.GameRelay`):
 
 ```html
 <script src="https://gamerelay.io/sdk/gamerelay.js"></script>
+```
+
+Module build, for `import` without a bundler:
+
+```js
+import { GameRelay } from 'https://gamerelay.io/sdk/gamerelay.mjs';
 ```
 
 Or npm: `npm i @gamerelay/sdk`, then `import { GameRelay } from '@gamerelay/sdk'`.
@@ -63,7 +69,7 @@ relay.playerId   // your id
 relay.room       // the Room you're in, or null
 relay.party      // your party, or null
 relay.connected  // false while reconnecting
-relay.features   // what this game's plan includes: { voice, unreliable }. Flags for upcoming paid features; nothing uses them yet
+relay.features   // what this game's plan includes: { voice, unreliable }. Reserved flags for plan features; nothing uses them yet.
 relay.close()    // disconnect and stop reconnecting
 ```
 
@@ -784,7 +790,11 @@ const ms = await relay.ping();
 ```
 
 Calls that wait for a reply (`createRoom`, `storage.get`, `leaderboard.submit`, `ping`, …) reject
-with a `GameRelayError` whose `code` is `disconnected` if the connection is down or drops first.
+with a `GameRelayError` whose `code` is `disconnected` if the connection is down or drops first,
+or `timeout` if no answer comes in 10 s.
+`createRoom` and `quickMatch` also reject with `too_many_rooms` when a player already has 4 rooms
+nobody else is in (they close after two idle minutes) or the game is at its plan's room limit:
+reuse a room for the next round instead of creating one each time.
 
 Test on a bad network before shipping. `simulate` is for development only, so remove it for
 players:

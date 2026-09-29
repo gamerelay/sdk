@@ -23,12 +23,29 @@ await $`bun run build`.cwd(root);
 rmSync(out, { recursive: true, force: true });
 mkdirSync(out);
 const dts = join(out, 'gamerelay.d.ts');
-await $`bunx dts-bundle-generator -o ${dts} src/index.ts --external-inlines @gamerelay/protocol --no-banner --no-check`.cwd(root).quiet();
+// `stripInternal` keeps members tagged `@internal` (plumbing between the SDK's own classes) out
+// of the published types. A throwaway tsconfig, so the workspace and public configs stay as they are.
+const packConfig = join(root, 'tsconfig.pack.json');
+await Bun.write(packConfig, JSON.stringify({ extends: './tsconfig.json', compilerOptions: { stripInternal: true } }));
+try {
+  await $`bunx dts-bundle-generator -o ${dts} src/index.ts --project ${packConfig} --external-inlines @gamerelay/protocol --no-banner --no-check`
+    .cwd(root)
+    .quiet();
+} finally {
+  rmSync(packConfig, { force: true });
+}
+if ((await Bun.file(dts).text()).includes('@internal')) throw new Error('gamerelay.d.ts still has @internal members');
 // `declare const X = 1 as const` isn't valid in a declaration file; the literal alone is.
-await Bun.write(dts, (await Bun.file(dts).text()).replace(/^(declare const \w+ = [\w'"]+) as const;$/gm, '$1;'));
+let types = (await Bun.file(dts).text()).replace(/^(declare const \w+ = [\w'"]+) as const;$/gm, '$1;');
+// Room's constructor is internal, so stripping it would leave an implicit public `new Room()`.
+const roomClass = /^(export declare class Room extends [^{]+\{)$/m;
+if (!roomClass.test(types)) throw new Error('gamerelay.d.ts: no Room class to make unconstructable');
+types = types.replace(roomClass, '$1\n\tprivate constructor();');
+await Bun.write(dts, types);
 for (const f of ['gamerelay.mjs', 'gamerelay.js']) cpSync(join(root, 'dist', f), join(out, f));
 cpSync(join(root, 'llms.txt'), join(out, 'llms.txt'));
 cpSync(join(root, 'README.md'), join(out, 'README.md'));
+cpSync(join(root, 'CHANGELOG.md'), join(out, 'CHANGELOG.md'));
 // The licence sits at the repo root: two levels up here, beside package.json in the public repo.
 cpSync(existsSync(join(root, 'LICENSE')) ? join(root, 'LICENSE') : join(root, '../../LICENSE'), join(out, 'LICENSE'));
 
@@ -39,7 +56,12 @@ await Bun.write(
       name: pkg.name,
       version: pkg.version,
       description: pkg.description,
-      keywords: ['multiplayer', 'browser-games', 'websocket', 'netcode', 'lobby', 'matchmaking', 'gamedev', 'relay'],
+      // What people search npm for (docs/BREADCRUMBS.md). Only true ones: it works with any engine.
+      keywords: [
+        'multiplayer', 'browser-games', 'html5-game', 'gamedev', 'game-server', 'netcode', 'realtime',
+        'websocket', 'lobby', 'matchmaking', 'relay', 'host-migration', 'entity-sync',
+        'phaser', 'threejs', 'kaplay', 'pixi', 'llm', 'ai',
+      ],
       homepage: 'https://gamerelay.io/docs',
       // npm checks provenance against this, so it must name the public repo CI publishes from.
       repository: { type: 'git', url: 'git+https://github.com/gamerelay/sdk.git' },
@@ -54,7 +76,7 @@ await Bun.write(
       unpkg: './gamerelay.js',
       jsdelivr: './gamerelay.js',
       sideEffects: false,
-      files: ['gamerelay.mjs', 'gamerelay.js', 'gamerelay.d.ts', 'llms.txt'],
+      files: ['gamerelay.mjs', 'gamerelay.js', 'gamerelay.d.ts', 'llms.txt', 'CHANGELOG.md'],
       publishConfig: { access: 'public' },
     },
     null,

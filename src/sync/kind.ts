@@ -34,7 +34,8 @@ export interface Kind<F = Record<string, FieldInput>> {
   all(): KindEntity<F>[];
   /**
    * The ones you can write right now: yours, plus host entities while you're the host. Update
-   * these (`for (const e of enemies.mine()) e.x += e.vx * dt`); writing any other one throws.
+   * these (`for (const e of enemies.mine()) e.x += e.vx * dt`); a write to any other one is
+   * skipped, with a console warning.
    */
   mine(): KindEntity<F>[];
   /** One by id, if it's this kind and in the room. */

@@ -3,8 +3,12 @@ import type { Json, PlayerId, PlayerInfo } from '@gamerelay/protocol/types';
 /** What the sync modules need from a room: sending, the server clock, and who's who. */
 export interface SyncTransport {
   readonly me: PlayerId;
-  /** `host`: a host-only write, which the server drops if we're no longer the host. */
-  send(data: Json, options: { to?: PlayerId; reliable: boolean; host?: boolean }): void;
+  /**
+   * `host`: a host-only write, which the server drops if we're no longer the host.
+   * `supersedable`: the sender's next write replaces this one (entity updates), so its LAN copy may
+   * race even when host-only (`sync/lan.ts`).
+   */
+  send(data: Json, options: { to?: PlayerId; reliable: boolean; host?: boolean; supersedable?: boolean }): void;
   /** The server's clock (ms), as estimated by `relay.now()`. */
   now(): number;
   player(id: PlayerId): PlayerInfo | undefined;

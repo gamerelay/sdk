@@ -9,6 +9,8 @@ export const INPUT_REPEAT_MS = 200;
 /** A player silent this long reads as neutral input (no stuck keys). */
 export const INPUT_STALE_MS = 500;
 const MAX_INPUT_BYTES = 1024;
+/** Presses the host holds for one player at once (see `receive`); more are shown as sent, not held. */
+export const MAX_HELD_KEYS = 32;
 
 type InputState = Record<string, Json>;
 const EMPTY: Readonly<InputState> = Object.freeze({});
@@ -124,8 +126,15 @@ export class Inputs {
     const now = this.#t.now();
     const d = Object.freeze(data.d as InputState);
     const held = rec?.held ?? new Map<string, number>();
+    // Presses that have shown for their interval are done: a player cycling through key names
+    // mustn't grow the host's memory.
+    for (const [k, until] of held) if (until <= now) held.delete(k);
     // A press shows for at least one send interval, even if its release arrives right behind it.
-    for (const [k, v] of Object.entries(d)) if (v === true && !(rec?.d[k] === true)) held.set(k, now + INPUT_SEND_MS);
+    for (const [k, v] of Object.entries(d)) {
+      if (v !== true || rec?.d[k] === true) continue;
+      if (held.size >= MAX_HELD_KEYS && !held.has(k)) continue; // no real pad has this many buttons down at once
+      held.set(k, now + INPUT_SEND_MS);
+    }
     this.#remote.set(from, { k: data.k, s: data.s, d, at: now, held });
     return true;
   }

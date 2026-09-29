@@ -21,6 +21,11 @@ export class DelayEstimator {
     this.#max = maxMs;
   }
 
+  /** Whether any sample has come in (until then, `ms` is a default guess). */
+  get sampled(): boolean {
+    return this.#seen;
+  }
+
   get ms(): number {
     return this.#delay;
   }

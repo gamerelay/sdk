@@ -1,3 +1,5 @@
+import type { LanStats } from '../sync/lan';
+
 export interface OverlayStats {
   ping: number | null;
   delayMs: number;
@@ -7,7 +9,17 @@ export interface OverlayStats {
   bytesOut: number;
   entities: Record<string, number>;
   host: boolean;
+  /** The LAN shortcut, when it's on: open channels, and which path delivered each broadcast first. */
+  lan?: LanStats;
   warnings: { message: string; count: number }[];
+}
+
+/** The open channels' round trips, fastest to slowest (` · rtt 4–31 ms`), once any is known. */
+function lanRtt(lan: LanStats): string {
+  const ms = Object.values(lan.rttMs ?? {});
+  if (ms.length === 0) return '';
+  const [lo, hi] = [Math.min(...ms), Math.max(...ms)];
+  return ` · rtt ${lo === hi ? lo : `${lo}–${hi}`} ms`;
 }
 
 export function formatOverlay(s: OverlayStats): string {
@@ -20,6 +32,7 @@ export function formatOverlay(s: OverlayStats): string {
     `frames/s ${s.msgsIn} in · ${s.msgsOut} out`,
     `KB/s ${(s.bytesIn / 1024).toFixed(1)} in · ${(s.bytesOut / 1024).toFixed(1)} out`,
     `entities ${entities || 'none'}`,
+    ...(s.lan ? [`lan ${s.lan.peers} peer${s.lan.peers === 1 ? '' : 's'} · first ${s.lan.lanFirst} lan · ${s.lan.serverFirst} server${lanRtt(s.lan)}`] : []),
     ...s.warnings.map((w) => `! ${w.message}${w.count > 1 ? ` (×${w.count})` : ''}`),
   ].join('\n');
 }
