@@ -1,5 +1,23 @@
-/** Every warning the SDK can print, and the llms.txt section that explains its fix. */
-export const SECTIONS = {
+export type WarningKind =
+  | 'worker'
+  | 'rate_limited'
+  | 'kind'
+  | 'fields'
+  | 'jump'
+  | 'room_full'
+  | 'write'
+  | 'send_positions'
+  | 'emit'
+  | 'event_name'
+  | 'request'
+  | 'claims'
+  | 'set_state';
+
+/**
+ * Every warning the SDK can print, and the llms.txt section that explains its fix. Typed
+ * explicitly (not `as const`) so JSR can document it without inferring.
+ */
+export const SECTIONS: Readonly<Record<WarningKind, string>> = {
   worker: 'relay.tick: the game loop',
   rate_limited: 'Rules and limits',
   kind: 'Entities',
@@ -13,8 +31,7 @@ export const SECTIONS = {
   request: 'Requests to the host',
   claims: 'Claims: take something exactly once',
   set_state: 'State and timers',
-} as const satisfies Record<string, string>;
-export type WarningKind = keyof typeof SECTIONS;
+};
 
 /** Console warnings written for the LLM that will read them: each key prints once, then counts. */
 export class Warnings {

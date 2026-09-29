@@ -1,7 +1,7 @@
-import { describe, expect, test } from 'bun:test';
-import { FULL, REMOVE, SPAWN, TELEPORT } from '../src/core/codec';
+import { describe, expect, spyOn, test } from 'bun:test';
+import { FULL, REMOVE, SPAWN, TELEPORT, compileSchema } from '../src/core/codec';
 import { createIdAllocator } from '../src/core/ids';
-import { EntityStore, MAX_OWN, MAX_ROOM, type Entity } from '../src/sync/entities';
+import { EntityStore, MAX_OWN, MAX_PENDING_KINDS, MAX_ROOM, type Entity } from '../src/sync/entities';
 import { FakeNet, type NetOptions } from './fakeNet';
 
 const SHIP = { x: 'number', y: 'number', alive: 'flag' } as const;
@@ -303,6 +303,44 @@ describe('EntityStore: others’ entities', () => {
     expect(b.get(mine.id)?.x).toBe(7);
   });
 
+  describe('updates waiting for define are bounded (security review)', () => {
+    const DOT = { x: 'number' } as const;
+    const hashOf = (kind: string) => (/^[A-Za-z]/.test(kind) && kind.length <= 32 && !kind.includes(' ') ? compileSchema(kind, DOT).hash : 'none');
+    const spawnOf = (kind: string, from: string) => [`${kind}:${from}0000000:1`, SPAWN | FULL, [0, 5], hashOf(kind)] as const;
+    const send = (b: EntityStore, net: FakeNet, from: string, kinds: string[]) =>
+      b.receive({ $gr: 'u', t: net.now, e: kinds.map((k) => [...spawnOf(k, from)]) }, from, net.now);
+
+    test(`at most ${MAX_PENDING_KINDS} kinds wait; a kind past that is dropped`, () => {
+      const { b, net, run } = setup();
+      const kinds = Array.from({ length: MAX_PENDING_KINDS + 4 }, (_, i) => `kind${i}`);
+      send(b, net, 'pa', kinds);
+      b.define('kind0', DOT);
+      b.define(kinds.at(-1)!, DOT);
+      run(300);
+      expect(b.all('kind0')).toHaveLength(1);
+      expect(b.all(kinds.at(-1)!)).toEqual([]);
+    });
+
+    test('a kind name define would refuse never waits, so it takes no place', () => {
+      const { b, net, run } = setup();
+      send(b, net, 'pa', Array.from({ length: MAX_PENDING_KINDS }, (_, i) => `${i}-starts-with-a-digit`));
+      send(b, net, 'pa', ['x'.repeat(40), 'has space', 'late']);
+      b.define('late', DOT);
+      run(300);
+      expect(b.all('late')).toHaveLength(1);
+    });
+
+    test('a player who leaves takes its waiting kinds with it, freeing their places', () => {
+      const { b, net, run } = setup();
+      send(b, net, 'pc', Array.from({ length: MAX_PENDING_KINDS }, (_, i) => `kind${i}`));
+      b.playerLeft('pc');
+      send(b, net, 'pa', ['late']);
+      b.define('late', DOT);
+      run(300);
+      expect(b.all('late')).toHaveLength(1);
+    });
+  });
+
   test('only the owner writes: a spoofed update is ignored', () => {
     const { a, b, net, run } = setup();
     a.define('ship', SHIP);
@@ -403,6 +441,35 @@ describe('EntityStore: others’ entities', () => {
     run(300);
     expect(b.get(next)!.owner.name).toBe('ada');
     expect(b.get(next)!.x).toBe(5);
+  });
+
+  test('nobody can take another player’s ids at a newcomer by sending them first (security review)', () => {
+    // pc sends the newcomer (b) an id in ada's session, and a copy of ada's own id, before ada's
+    // updates get there. Ids carry their minter's tag, so neither is pc's to send.
+    const { a, b, net, run } = setup();
+    a.define('ship', SHIP);
+    b.define('ship', SHIP);
+    const ship = a.spawn('ship', { x: 1, y: 0, alive: true });
+    a.tick();
+    const [, , , hash] = net.updates('pa')[0]!.e[0]!;
+    const session = ship.id.split(':')[1];
+    const forged = (id: string) => [id, SPAWN | FULL, [0, 666, 1, 0, 2, true], hash!];
+    b.receive({ $gr: 'u', t: net.now, e: [forged(`ship:${session}:99`), forged(ship.id)] }, 'pc', net.now);
+    run(300);
+    expect(b.all('ship').map((e) => [e.id, e.owner.name, e.x])).toEqual([[ship.id, 'ada', 1]]);
+  });
+
+  test('an older SDK’s untagged session is not claimed whole by whoever sends it first (security review)', () => {
+    // V (ada) owns ship:vsess000:*; pc sends the newcomer ship:vsess000:99 first.
+    const { b, net, run } = setup();
+    b.define('ship', SHIP);
+    const hash = compileSchema('ship', SHIP).hash;
+    const spawn = (id: string, x: number) => [id, SPAWN | FULL, [0, x, 1, 0, 2, true], hash];
+    b.receive({ $gr: 'u', t: net.now, e: [spawn('ship:vsess000:99', 666)] }, 'pc', net.now);
+    b.receive({ $gr: 'u', t: net.now, e: [spawn('ship:vsess000:1', 1), spawn('ship:vsess000:2', 2)] }, 'pa', net.now);
+    run(300);
+    expect(b.get('ship:vsess000:1')?.owner.name).toBe('ada');
+    expect(b.get('ship:vsess000:2')?.owner.name).toBe('ada');
   });
 
   test('I3: when the owner stops, others stop at the same place (no overshoot)', () => {
@@ -865,4 +932,63 @@ test('a teleport goes out reliably, so loss can’t turn a respawn into a slide 
   run(600);
   expect(warns).not.toContain('jump:ship');
   expect(b.all('ship')[0]!.x).toBeCloseTo(900, 0);
+});
+
+describe('the rate warning', () => {
+  test("a host whose own and host entities send at 60/s, plus heartbeats, is told it's over the server's limit", () => {
+    const net = new FakeNet();
+    net.host = 'pa';
+    const warns: string[] = [];
+    const store = new EntityStore(net.join('pa', 'ada', () => {}), { warn: (_kind, key, message) => warns.push(`${key} | ${message}`) });
+    store.define('ship', SHIP, { rate: 60 });
+    store.define('rock', SHIP, { rate: 60 });
+    store.spawn('ship', { x: 0, y: 0, alive: true });
+    expect(warns).toEqual([]);
+    store.spawn('rock', { x: 0, y: 0, alive: true }, { owner: 'host' });
+    store.spawn('rock', { x: 1, y: 0, alive: true }, { owner: 'host' });
+    expect(warns.length).toBe(1);
+    expect(warns[0]).toContain('rate_limited:entities | your entities send about 124 messages a second');
+    expect(warns[0]).toContain('{ rate: 30 }');
+  });
+
+  test('kinds sharing a send tick count once per tick, so one group alone never goes over', () => {
+    const net = new FakeNet();
+    net.host = 'pb';
+    const warns: string[] = [];
+    const store = new EntityStore(net.join('pa', 'ada', () => {}), { warn: (_kind, key) => warns.push(key) });
+    for (const [kind, rate] of [['a', 60], ['b', 30], ['c', 20]] as const) {
+      store.define(kind, SHIP, { rate });
+      store.spawn(kind, { x: 0, y: 0, alive: true });
+    }
+    expect(warns).toEqual([]);
+  });
+});
+
+test("after a reconnect, keyframes are spread over the next second instead of all landing on one tick", () => {
+  const net = new FakeNet();
+  let up = true;
+  const store = new EntityStore({ ...net.join('pa', 'ada', () => {}), ready: () => up });
+  store.define('ship', SHIP);
+  for (let i = 0; i < 10; i++) store.spawn('ship', { x: i, y: 0, alive: true });
+  const run = (ms: number) => {
+    for (const end = net.now + ms; net.now < end; ) {
+      net.advanceTo(net.now + FRAME);
+      store.tick();
+    }
+  };
+  run(1500);
+  up = false;
+  run(1000);
+  up = true;
+  let n = 0;
+  const random = spyOn(Math, 'random').mockImplementation(() => (n++ % 10) / 10);
+  const before = net.updates('pa').length;
+  try {
+    run(1100);
+  } finally {
+    random.mockRestore();
+  }
+  const fullPerMessage = net.updates('pa').slice(before).map((u) => u.e.filter((e) => e[1] & FULL).length);
+  expect(fullPerMessage.reduce((a, b) => a + b, 0)).toBeGreaterThanOrEqual(10); // each one keyframed within the second
+  expect(Math.max(...fullPerMessage)).toBeLessThanOrEqual(2);
 });

@@ -1,22 +1,25 @@
 import { describe, expect, test } from 'bun:test';
-import { Claims } from '../src/sync/claims';
+import { CLAIM_RETRY_MS, CLAIM_TRIES, Claims } from '../src/sync/claims';
 
 function setup(me = 'pa', host = false) {
   const queued: { t: string; key: string }[] = [];
   const fired: [string, string, string][] = [];
   const warns: string[] = [];
   let isHost = host;
+  const clock = { now: 0, ready: true };
   const c = new Claims({
     me,
     isHost: () => isHost,
     queue: (m) => queued.push(m),
     fire: (e, key, id) => fired.push([e, key, id]),
     warn: (_kind, key) => warns.push(key),
+    now: () => clock.now,
+    ready: () => clock.ready,
   });
   const claimed = (key: string, playerId: string) => c.receive({ v: 1, t: 'claimed', key, playerId });
   const released = (key: string, playerId: string) => c.receive({ v: 1, t: 'released', key, playerId });
   const result = (key: string, holder: string | null) => c.receive({ v: 1, t: 'claim_result', key, holder });
-  return { c, queued, fired, warns, claimed, released, result, setHost: (h: boolean) => (isHost = h) };
+  return { c, queued, fired, warns, claimed, released, result, clock, setHost: (h: boolean) => (isHost = h) };
 }
 
 /** Settled value of a promise, or 'pending'. */
@@ -125,5 +128,53 @@ describe('Claims', () => {
     const a = s.c.claim('a');
     s.c.close();
     expect(await a).toBe(false);
+  });
+});
+
+describe('Claims that get no answer (a frame the server dropped)', () => {
+  test('are sent again, and a late answer settles them', async () => {
+    const s = setup();
+    const p = s.c.claim('k');
+    s.clock.now = CLAIM_RETRY_MS - 1;
+    s.c.tick();
+    expect(s.queued.length).toBe(1);
+    s.clock.now = CLAIM_RETRY_MS;
+    s.c.tick();
+    expect(s.queued).toEqual([{ t: 'claim', key: 'k' }, { t: 'claim', key: 'k' }]);
+    s.claimed('k', 'pa');
+    s.result('k', 'pa');
+    expect(await p).toBe(true);
+  });
+
+  test('settle from the table after the last try instead of hanging; an answer after that is ignored', async () => {
+    const s = setup();
+    const lost = s.c.claim('a');
+    const won = s.c.claim('b');
+    s.claimed('b', 'pa'); // its broadcast came, its claim_result didn't
+    for (let i = 1; i <= CLAIM_TRIES; i++) {
+      s.clock.now = i * CLAIM_RETRY_MS;
+      s.c.tick();
+    }
+    expect(await peek(lost)).toBe(false);
+    expect(await peek(won)).toBe(true);
+    expect(s.queued.filter((m) => m.key === 'a').length).toBe(CLAIM_TRIES);
+    expect(s.warns).toContain('claims:timeout');
+    s.result('a', 'pa'); // too late: nothing is waiting, the table is what counts
+    expect(await lost).toBe(false);
+  });
+
+  test("time spent offline doesn't count: the rejoin's sync re-sends", () => {
+    const s = setup();
+    void s.c.claim('k');
+    s.clock.ready = false;
+    s.clock.now = 60_000;
+    s.c.tick();
+    expect(s.queued.length).toBe(1);
+    s.clock.ready = true;
+    s.c.sync({});
+    expect(s.queued.length).toBe(2);
+    s.clock.now += CLAIM_RETRY_MS - 1;
+    s.c.tick();
+    expect(s.queued.length).toBe(2);
   });
 });

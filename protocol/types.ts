@@ -136,6 +136,11 @@ export type ErrorCode =
   | 'quota_exceeded'
   /** A leaderboard score broke one of the board's rules (set by the game's owner). */
   | 'rejected'
+  /**
+   * No new room: the game has as many open rooms as its plan allows, or this player already
+   * made several that nobody joined (they expire after two idle minutes).
+   */
+  | 'too_many_rooms'
   | 'internal';
 
 export type LeaveReason = 'left' | 'timeout' | 'kicked';
@@ -263,6 +268,14 @@ export interface LeaderboardTopMsg extends Base<'lb_top'> {
 export interface PingMsg extends Base<'ping'> {
   ts: number;
 }
+/**
+ * Experimental: TURN relays and short-lived credentials for them, for the room we're in (the LAN
+ * shortcut). Reply: `{ ice: IceServer[], direct: boolean }`: one entry per relay (none when the
+ * server has no relays), and whether the owner allows direct connections between party members.
+ */
+export interface TurnMsg extends Base<'turn'> {
+  rid: number;
+}
 
 export type LobbyClientMessage =
   | CreateRoomMsg
@@ -274,6 +287,7 @@ export type LobbyClientMessage =
   | LeaderboardSubmitMsg
   | LeaderboardTopMsg
   | PingMsg
+  | TurnMsg
   | ListRoomsMsg
   | PartyCreateMsg
   | PartyJoinMsg
@@ -308,6 +322,12 @@ export interface WelcomeMsg extends Base<'welcome'> {
   serverTime: number;
   /** This connection's frame key, masked with `playerId` (`sign.ts`). Every client frame is signed with it. */
   k: string;
+}
+/** An `RTCIceServer`, as JSON. */
+export interface IceServer {
+  urls: string[];
+  username?: string;
+  credential?: string;
 }
 export interface ReplyMsg extends Base<'reply'> {
   rid: number;

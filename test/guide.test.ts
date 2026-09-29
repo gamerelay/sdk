@@ -10,17 +10,40 @@ const guide = await Bun.file(new URL('../llms.txt', import.meta.url)).text();
 // The README is the package's page on npm and GitHub: its snippets are held to the same rule.
 const readme = await Bun.file(new URL('../README.md', import.meta.url)).text();
 const codeOf = (doc: string) => [...doc.matchAll(/```(?:js|ts|html)\n([\s\S]*?)```/g)].map((m) => m[1]!).join('\n');
+const source = await Bun.file(new URL('../src/index.ts', import.meta.url)).text();
+// Other pages that make the same claims (read-only here). They're in the monorepo only: the public
+// gamerelay/sdk repo is this package alone, so there those checks are skipped.
+const optional = async (path: string) => {
+  const file = Bun.file(new URL(path, import.meta.url));
+  return (await file.exists()) ? file.text() : null;
+};
+const rootReadme = await optional('../../../README.md');
+const docsPage = await optional('../../../apps/dashboard/src/pages/DocsPage.vue');
+const monorepo = rootReadme !== null && docsPage !== null;
+
+/** Members tagged `@internal`: they're left out of the published types, so docs can't use them. */
+const INTERNAL = new Set([...source.matchAll(/@internal(?:(?!\*\/)[^])*\*\/\s*(\w+)\(/g)].map((m) => m[1]!));
 
 /** Methods and getters up the prototype chain (on / off come from a shared base), plus instance fields. */
 function members(proto: object, fields: string[]): Set<string> {
   const out = new Set(fields);
   for (let p: object | null = proto; p && p !== Object.prototype; p = Object.getPrototypeOf(p)) {
-    for (const k of Object.getOwnPropertyNames(p)) out.add(k);
+    for (const k of Object.getOwnPropertyNames(p)) if (!INTERNAL.has(k)) out.add(k);
   }
   return out;
 }
 const ROOM = members(Room.prototype, ['id', 'code', 'me', 'maxPlayers', 'hostId', 'players', 'state', 'chatHistory', 'seed']);
+// Room.request is public (ask the host); GameRelay.request is the internal one.
+ROOM.add('request');
 const RELAY = members(GameRelay.prototype, ['playerId', 'room', 'party', 'features', 'storage', 'leaderboard']);
+/** Built-in event names, read from the source so the lists can't drift. */
+const ROOM_EVENTS = new Set([
+  ...[...(source.match(/const ROOM_EVENTS = new Set<string>\(\[([^\]]*)\]/)?.[1] ?? '').matchAll(/'(\w+)'/g)].map((m) => m[1]!),
+  ...[...source.matchAll(/override on\(event: '(\w+)'/g)].map((m) => m[1]!), // spawn, remove, timer, host
+]);
+const RELAY_EVENTS = new Set(
+  [...(source.match(/export type RelayEvents = \{([^]*?)\n\};/)?.[1] ?? '').matchAll(/^  (\w+):/gm)].map((m) => m[1]!),
+);
 /** A real handle's members, so the list can't drift from the SDK. */
 const KIND = new Set(Object.keys(makeKind('x', {} as KindHost)));
 
@@ -44,6 +67,13 @@ for (const [file, doc, minHandles] of [['llms.txt', guide, 5], ['README.md', rea
       // global.ts adds seededRandom to the script-tag GameRelay.
       const statics = new Set([...Object.getOwnPropertyNames(GameRelay), ...(typeof seededRandom === 'function' ? ['seededRandom'] : [])]);
       expect([...used('GameRelay')].filter((k) => !statics.has(k))).toEqual([]);
+    });
+
+    test("room.on / relay.on name real events (a custom room event is one the doc also emits)", () => {
+      const on = (name: string) => [...code.matchAll(new RegExp(`\\b${name}\\.on\\('(\\w+)'`, 'g'))].map((m) => m[1]!);
+      const emitted = new Set([...code.matchAll(/\.emit\('(\w+)'/g)].map((m) => m[1]!));
+      expect(on('room').filter((e) => !ROOM_EVENTS.has(e) && !emitted.has(e))).toEqual([]);
+      expect(on('relay').filter((e) => !RELAY_EVENTS.has(e))).toEqual([]);
     });
 
     test('every kind handle (const x = room.define(…)) uses only Kind methods', () => {
@@ -105,5 +135,38 @@ describe('README.md', () => {
     expect(out.exitCode).toBe(0);
     const kb = Bun.gzipSync(out.stdout).length / 1024;
     expect(Math.abs(kb - claim)).toBeLessThanOrEqual(2);
+  });
+});
+
+describe('claims shared with the other docs', () => {
+  test.skipIf(!monorepo)('the root README, SDK README and docs page give the same size', () => {
+    const size = (doc: string | null) => doc?.match(/about (\d+) KB gzipped/)?.[1];
+    expect(size(readme)).toBeDefined();
+    expect({ root: size(rootReadme), docs: size(docsPage) }).toEqual({ root: size(readme), docs: size(readme) });
+  });
+
+  test('the experimental `lan` option stays out of llms.txt and the READMEs', () => {
+    const lan = /\blan\s*:|`lan`|\blan: true/;
+    for (const [file, doc] of Object.entries({ 'llms.txt': guide, 'README.md': readme, 'root README.md': rootReadme ?? '' })) {
+      expect({ file, lan: lan.test(doc) }).toEqual({ file, lan: false });
+    }
+  });
+
+  test.skipIf(!monorepo)('the experimental `lan` option is in its own docs section only', () => {
+    const lan = /\blan\s*:|`lan`|\blan: true/;
+    const page = docsPage ?? '';
+    const start = page.indexOf('<h2 id="experimental">');
+    const end = page.indexOf('<h2', start + 1);
+    const template = page.slice(page.indexOf('<template>'));
+    const outside = template.replace(page.slice(start, end), '');
+    expect(start).toBeGreaterThan(0);
+    expect(lan.test(outside)).toBe(false);
+  });
+
+  test('the event lists are read from the source', () => {
+    expect(ROOM_EVENTS).toContain('player_joined');
+    expect(ROOM_EVENTS).toContain('host');
+    expect(RELAY_EVENTS).toContain('replaced');
+    expect(INTERNAL).toContain('debugInfo');
   });
 });

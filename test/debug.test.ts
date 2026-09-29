@@ -49,6 +49,14 @@ describe('overlay', () => {
     );
   });
 
+  test('the LAN line shows the open channels’ round trips once known (reliability review)', () => {
+    const base = { ping: 1, delayMs: 0, msgsIn: 0, msgsOut: 0, bytesIn: 0, bytesOut: 0, entities: {}, host: false, warnings: [] };
+    const line = (rttMs: Record<string, number>) => formatOverlay({ ...base, lan: { peers: 2, lanFirst: 5, serverFirst: 1, rttMs } }).split('\n').at(-1);
+    expect(line({})).toBe('lan 2 peers · first 5 lan · 1 server');
+    expect(line({ a: 12 })).toBe('lan 2 peers · first 5 lan · 1 server · rtt 12 ms');
+    expect(line({ a: 31, b: 4 })).toBe('lan 2 peers · first 5 lan · 1 server · rtt 4–31 ms');
+  });
+
   test('mounting outside a browser does nothing', () => {
     const unmount = mountOverlay(() => {
       throw new Error('should not read');

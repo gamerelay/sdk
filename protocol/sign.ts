@@ -39,6 +39,12 @@ export function signFrame(key: FrameKey, seq: number, body: string): string {
   return `${hex8(frameCheck(key, seq, body))}.${seq}.${body}`;
 }
 
+/**
+ * The most a signature adds in front of the JSON: `<8 hex>.<seq>.` with `seq` at most 16 digits
+ * (any safe integer), which is what `openFrame` accepts.
+ */
+export const MAX_FRAME_ENVELOPE = 8 + 1 + 16 + 1;
+
 /** Split a signed frame; null if it isn't one. The caller checks `check` and `seq`. */
 export function openFrame(frame: string): { check: number; seq: number; body: string } | null {
   if (frame.length < 11 || frame.charCodeAt(8) !== 46 /* . */) return null;

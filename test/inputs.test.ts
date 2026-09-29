@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import type { Json } from '@gamerelay/protocol/types';
-import { Inputs } from '../src/sync/inputs';
+import { Inputs, MAX_HELD_KEYS } from '../src/sync/inputs';
 import { FakeNet } from './fakeNet';
 
 function setup() {
@@ -177,5 +177,21 @@ describe('Inputs', () => {
     expect(s.a.get('pa')).toEqual({ kick: true });
     s.run(50);
     expect(s.a.get('pa')).toEqual({ kick: false });
+  });
+
+  test('the host holds at most 32 presses per player, and forgets each once it has shown (security review)', () => {
+    const s = setup();
+    const keys = (from: number, n: number, v: boolean) => Object.fromEntries(Array.from({ length: n }, (_, i) => [`k${from + i}`, v]));
+    const heldNow = () => Object.values(s.a.get('pb')).filter((v) => v === true).length;
+    // 100 distinct presses, released at once: only 32 are held.
+    s.a.receive({ $gr: 'i', k: 'one', s: 1, d: keys(0, 100, true) }, 'pb');
+    s.a.receive({ $gr: 'i', k: 'one', s: 2, d: {} }, 'pb');
+    expect(heldNow()).toBe(MAX_HELD_KEYS);
+    // Once those have shown, new key names are held again: the old ones don't sit in the cap for ever.
+    s.run(60);
+    expect(heldNow()).toBe(0);
+    s.a.receive({ $gr: 'i', k: 'one', s: 3, d: keys(100, 10, true) }, 'pb');
+    s.a.receive({ $gr: 'i', k: 'one', s: 4, d: {} }, 'pb');
+    expect(heldNow()).toBe(10);
   });
 });

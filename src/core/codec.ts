@@ -36,6 +36,9 @@ const TYPES = new Set<FieldType>(['number', 'angle', 'flag', 'text', 'value']);
 const KIND = /^[A-Za-z][\w-]{0,31}$/;
 const NAME = /^[A-Za-z_$][\w$]{0,31}$/;
 
+/** A name `room.define` accepts: anything else can never be defined, so nothing waits for it. */
+export const isKindName = (kind: string): boolean => KIND.test(kind);
+
 const bad = (message: string) => new GameRelayError('bad_request', message);
 
 export const MAX_VALUE_BYTES = 4096;

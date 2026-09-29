@@ -10,7 +10,7 @@ Multiplayer for browser games, without writing a server. You declare what exists
 and who owns it; the SDK sends it, smooths it for everyone else, gives it to players who join
 late, and hands the host's share to another player when the host leaves. Rooms, quick match,
 invite links, parties, chat, saved player data and leaderboards come with it. Zero dependencies,
-fully typed, about 20 KB gzipped.
+fully typed, about 28 KB gzipped.
 
 **Docs:** [gamerelay.io/docs](https://gamerelay.io/docs) · **Guide for AI tools:**
 [gamerelay.io/llms.txt](https://gamerelay.io/llms.txt) (also in this package as `llms.txt`) ·

@@ -1,5 +1,7 @@
+import { LIMITS } from '@gamerelay/protocol/limits';
 import type { Json, PlayerId, PlayerInfo } from '@gamerelay/protocol/types';
 import type { Warn } from '../debug/warnings';
+import { HEARTBEAT_MS } from './host';
 import { SampleBuffer } from '../core/buffer';
 import { DelayEstimator } from '../core/clock';
 import {
@@ -15,11 +17,12 @@ import {
   decodeChanges,
   encodeChanges,
   isEntry,
+  isKindName,
   type Entry,
   type FieldInput,
   type KindSchema,
 } from '../core/codec';
-import { createIdAllocator, kindOf } from '../core/ids';
+import { createIdAllocator, kindOf, mintedBy } from '../core/ids';
 import { GameRelayError } from '../errors';
 import type { SyncTransport } from './transport';
 
@@ -63,6 +66,13 @@ export interface EntityHooks {
   onSpawn?(entity: Entity): void;
   onRemove?(entity: Entity, reason: RemoveReason): void;
   warn?: Warn;
+  /**
+   * One smoothing timeline per sender instead of one for the room (the LAN shortcut: a LAN peer's
+   * samples are ~1 ms old, a remote player's ~100+; mixed into one estimate they look like a very
+   * jittery network and push everyone's delay up). Host entities share one host timeline, so a
+   * host handover doesn't jump.
+   */
+  perSender?: boolean;
 }
 
 export const MAX_OWN = 256;
@@ -70,8 +80,14 @@ export const MAX_ROOM = 1024;
 /** Split outgoing updates well under the server's 16 KB message limit. */
 export const MAX_MESSAGE_BYTES = 8_000;
 const KEYFRAME_MS = 1000;
+/** The room calls `tick` this often a second: each call sends at most one message per group (own, host). */
+const TICKS_PER_SECOND = 60;
 const STAMP_SLACK_MS = 1000;
 const PENDING_PER_KIND = 256;
+/** Id sessions remembered per sender (one per page load), so an old one isn't taken for a reload. */
+const MAX_SESSIONS = 4;
+/** Kinds whose updates wait for `define` at once: a game defines a handful, so more is a flood. */
+export const MAX_PENDING_KINDS = 16;
 /** A connected owner sends at least a keyframe a second; this much silence means the entity is gone. */
 const EXPIRE_MS = 3000;
 /** How often (ms) the timeline is advanced at most: reads within one frame share it. */
@@ -147,33 +163,86 @@ const unknownField = (kind: string, key: string) => `${kind} has no field '${key
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 
 export class EntityStore {
+  /** The room's smoothing delay (every sender's, unless `perSender`). */
   readonly delay = new DelayEstimator();
+  /** `perSender`: each sender's own delay, keyed by player id (`HOST_OWNER` for host entities). */
+  readonly #delays = new Map<string, DelayEstimator>();
+  /** This advance's render time per timeline. */
+  readonly #times = new Map<string, number>();
   readonly #t: SyncTransport;
   readonly #hooks: EntityHooks;
-  readonly #newId: (kind: string) => string;
+  readonly #newId: (kind: string, owner: PlayerId) => string;
   readonly #schemas = new Map<string, KindSchema>();
   readonly #local = new Map<string, Local>();
   readonly #remote = new Map<string, Remote>();
   readonly #pending = new Map<string, { entry: Entry; from: PlayerId; t: number }[]>();
-  /** Which player first sent each id session: nobody else may create ids in it. */
-  readonly #sessions = new Map<string, PlayerId>();
+  /**
+   * Each sender's recent id sessions, newest first: a new one means it reloaded. Not a claim: who
+   * may mint in a session is its owner tag (`mintedBy`), never who sent it first.
+   */
+  readonly #sessions = new Map<PlayerId, string[]>();
   #lastAdvance = -Infinity;
+  #lastAdvanceNow = 0;
   /** When we last advanced while online: silence is only judged while we're listening. */
   #listening = Number.NaN;
   #lastT = 0;
   #down = false;
   readonly #warnedKinds = new Set<string>();
+  #warnedRate = false;
   /** The last stamp sent: stamps never run backwards. */
   #lastStamp = Number.NEGATIVE_INFINITY;
 
-  constructor(t: SyncTransport, hooks: EntityHooks = {}, newId: (kind: string) => string = createIdAllocator()) {
+  constructor(t: SyncTransport, hooks: EntityHooks = {}, newId: (kind: string, owner: PlayerId) => string = createIdAllocator()) {
     this.#t = t;
     this.#hooks = hooks;
     this.#newId = newId;
   }
 
+  /**
+   * The moment others' entities are drawn at. With `perSender` there's one per sender: this is the
+   * host entities' timeline, or on the host itself (which draws its own host entities live) the
+   * slowest sender's, so nothing is drawn earlier than it.
+   */
   renderTime(): number {
-    return this.#t.now() - this.delay.ms;
+    return this.#t.now() - this.#renderDelay();
+  }
+
+  #renderDelay(): number {
+    if (!this.#hooks.perSender) return this.delay.ms;
+    const host = this.#estimator(HOST_OWNER);
+    // The host draws its own host entities live: its host timeline is stale (from when it was a guest).
+    const hosting = this.#t.hostId?.() === this.#t.me;
+    if (host.sampled && !hosting) return host.ms;
+    let ms = 0;
+    for (const [owner, d] of this.#delays) if (d.sampled && !(hosting && owner === HOST_OWNER)) ms = Math.max(ms, d.ms);
+    return ms || this.delay.ms;
+  }
+
+  /** The smoothing delay to show (debug overlay): the room's, or with `perSender` the longest. */
+  get delayMs(): number {
+    if (!this.#hooks.perSender) return this.delay.ms;
+    let ms = 0;
+    for (const d of this.#delays.values()) ms = Math.max(ms, d.ms);
+    return ms || this.delay.ms;
+  }
+
+  #estimator(key: string): DelayEstimator {
+    if (!this.#hooks.perSender) return this.delay;
+    let d = this.#delays.get(key);
+    if (!d) this.#delays.set(key, (d = new DelayEstimator()));
+    return d;
+  }
+
+  /** Which timeline a remote entity is drawn on. */
+  #timeline(r: Remote): string {
+    return r.host ? HOST_OWNER : r.owner;
+  }
+
+  /** The render time for a timeline, as of the last advance. */
+  #timeOf(key: string): number {
+    let t = this.#times.get(key);
+    if (t === undefined) this.#times.set(key, (t = this.#lastAdvanceNow - this.#estimator(key).ms));
+    return t;
   }
 
   define(kind: string, fields: Record<string, FieldInput>, options: DefineOptions = {}): void {
@@ -206,13 +275,36 @@ export class EntityStore {
       return v;
     });
     const now = this.#t.now();
-    const rec = this.#makeLocal(this.#newId(kind), schema, values, host, now);
+    const rec = this.#makeLocal(this.#newId(kind, this.#t.me), schema, values, host, now);
     rec.nextKey = now + KEYFRAME_MS;
     rec.spawned = false;
     rec.leaveHost = !host && options.onLeave === 'host';
     this.#local.set(rec.id, rec);
+    this.#checkRate();
     this.#hooks.onSpawn?.(rec.obj);
     return rec.obj;
+  }
+
+  /**
+   * Warn once when what we own would send more messages a second than the server takes. Each group
+   * (own, host) sends one message on each of its kinds' send grids, and at most one per tick; a host
+   * adds its heartbeats. Past the limit, the SDK drops plain updates rather than lose whole frames.
+   */
+  #checkRate(): void {
+    if (this.#warnedRate) return;
+    const own = new Set<number>();
+    const hosted = new Set<number>();
+    for (const r of this.#local.values()) if (!r.removed) (r.host ? hosted : own).add(r.schema.rate);
+    const perSecond = (rates: Set<number>) => Math.min(TICKS_PER_SECOND, [...rates].reduce((a, b) => a + b, 0));
+    const beats = hosted.size > 0 ? 1000 / HEARTBEAT_MS : 0; // host entities are ours only while we're host
+    const total = perSecond(own) + perSecond(hosted) + beats;
+    if (total <= LIMITS.ratePerSecond) return;
+    this.#warnedRate = true;
+    this.#hooks.warn?.(
+      'rate_limited',
+      'rate_limited:entities',
+      `your entities send about ${Math.round(total)} messages a second (your own ${perSecond(own)}, host entities ${perSecond(hosted)}${beats ? `, the host's heartbeats ${beats}` : ''}), over the server's ${LIMITS.ratePerSecond}; some updates will be dropped. Lower a kind's rate: room.define(kind, fields, { rate: 30 })`,
+    );
   }
 
   all(kind: string): Entity[] {
@@ -275,9 +367,13 @@ export class EntityStore {
     }
     if (this.#down) {
       this.#down = false;
+      // Back online: changes go at once, keyframes spread over the next second. All due on one tick
+      // they'd make one big burst, and stay bunched on one tick a second from then on. Others still
+      // have our entities (a disconnected owner's freeze rather than expire), and a player who
+      // joined meanwhile gets a full update anyway.
       for (const rec of this.#local.values()) {
         rec.nextSend = now;
-        rec.nextKey = now;
+        rec.nextKey = now + Math.random() * KEYFRAME_MS;
       }
     }
     // Each message is stamped with when its values were written (the game's simulation step), not
@@ -348,12 +444,14 @@ export class EntityStore {
     if (from === this.#t.me || !Array.isArray(data.e)) return true;
     const t = typeof data.t === 'number' && Math.abs(data.t - at) <= STAMP_SLACK_MS ? data.t : at;
     let interval = 50;
+    let host = false;
     for (const entry of data.e) {
       if (!isEntry(entry)) continue;
+      if (entry[1] & HOST) host = true; // a message carries own entities or host ones, never both
       const schema = this.#apply(entry, from, t);
       if (schema) interval = 1000 / schema.rate;
     }
-    this.delay.observe(this.#t.now() - t, interval);
+    this.#estimator(host ? HOST_OWNER : from).observe(this.#t.now() - t, interval);
     return true;
   }
 
@@ -409,8 +507,13 @@ export class EntityStore {
       r.removedAt = r.buffer.latestTime ?? now;
       r.reason = 'left';
     }
-    for (const [kind, list] of this.#pending) this.#pending.set(kind, list.filter((p) => p.from !== id));
-    for (const [session, owner] of this.#sessions) if (owner === id) this.#sessions.delete(session);
+    for (const [kind, list] of this.#pending) {
+      const rest = list.filter((p) => p.from !== id);
+      // An empty list would still count toward MAX_PENDING_KINDS.
+      if (rest.length > 0) this.#pending.set(kind, rest);
+      else this.#pending.delete(kind);
+    }
+    this.#sessions.delete(id);
   }
 
   /** A remote host entity becomes ours to write, from the last values received (same object). */
@@ -434,6 +537,10 @@ export class EntityStore {
     return rec.writeGap > 0 ? rec.writeGap * 1.5 : 1000 / rec.schema.rate;
   }
 
+  /**
+   * `reliable` groups carry spawns, removes, keyframes or teleports, which the next update doesn't
+   * replace; only plain updates are `supersedable` (their LAN copy may race even when host-only).
+   */
   #flush(entries: Entry[], reliable: boolean, to?: PlayerId, host = false, stamp?: number): void {
     if (entries.length === 0) return;
     const now = this.#t.now();
@@ -443,7 +550,7 @@ export class EntityStore {
     let chunk: Entry[] = [];
     let size = 0;
     const send = () => {
-      if (chunk.length > 0) this.#t.send({ $gr: 'u', t, e: chunk } as unknown as Json, { to, reliable, ...(host ? { host } : {}) });
+      if (chunk.length > 0) this.#t.send({ $gr: 'u', t, e: chunk } as unknown as Json, { to, reliable, supersedable: !reliable, ...(host ? { host } : {}) });
       chunk = [];
       size = 0;
     };
@@ -461,11 +568,16 @@ export class EntityStore {
     const kind = kindOf(id);
     const schema = this.#schemas.get(kind);
     if (!schema) {
-      if (!kind) return undefined;
-      const list = this.#pending.get(kind) ?? [];
+      // Kept for a `define` still to come, within bounds: a sender inventing kind names mustn't
+      // grow our memory, and a name `define` would refuse is never coming.
+      if (!isKindName(kind)) return undefined;
+      let list = this.#pending.get(kind);
+      if (!list) {
+        if (this.#pending.size >= MAX_PENDING_KINDS) return undefined;
+        this.#pending.set(kind, (list = []));
+      }
       list.push({ entry, from, t });
       if (list.length > PENDING_PER_KIND) list.shift();
-      this.#pending.set(kind, list);
       return undefined;
     }
     let rec = this.#remote.get(id);
@@ -500,17 +612,23 @@ export class EntityStore {
         );
         return schema;
       }
-      const session = sessionOf(id);
-      const claimed = this.#sessions.get(session);
       // (Host entities keep the ids their first host minted, so they're exempt.)
-      if (!hosted && claimed !== undefined && claimed !== from) return schema; // someone else's id space
-      if (!hosted && claimed === undefined) {
-        this.#sessions.set(session, from);
-        // A new session from this owner means it reloaded or reconnected afresh: its old entities are gone.
-        for (const r of this.#remote.values()) {
-          if (r.host || r.owner !== from || r.removedAt !== undefined || sessionOf(r.id) === session) continue;
-          r.removedAt = r.buffer.latestTime ?? t;
-          r.reason = 'expired';
+      if (!hosted) {
+        const session = sessionOf(id);
+        // An id minted by someone else: refused however early it comes, so nobody can take another
+        // player's ids at a newcomer before the owner's own updates arrive. An older SDK's untagged
+        // ids can't be checked: each goes to whoever sends it first, as before, but no sender
+        // claims a whole session any more.
+        if (mintedBy(session, from) === false) return schema;
+        const known = this.#sessions.get(from) ?? [];
+        if (!known.includes(session)) {
+          this.#sessions.set(from, [session, ...known].slice(0, MAX_SESSIONS));
+          // A new session from this owner means it reloaded or reconnected afresh: its old entities are gone.
+          for (const r of this.#remote.values()) {
+            if (r.host || r.owner !== from || r.removedAt !== undefined || sessionOf(r.id) === session) continue;
+            r.removedAt = r.buffer.latestTime ?? t;
+            r.reason = 'expired';
+          }
         }
       }
       const created = this.#makeRemote(id, schema, hosted ? HOST_OWNER : from, t, hosted);
@@ -537,12 +655,15 @@ export class EntityStore {
     const now = this.#t.now();
     if (now - this.#lastAdvance < ADVANCE_MS) return this.#lastT;
     this.#lastAdvance = now;
-    const t = (this.#lastT = now - this.delay.ms);
+    this.#lastAdvanceNow = now;
+    this.#times.clear();
+    const t = (this.#lastT = now - this.#renderDelay());
     const online = this.#t.ready?.() ?? true;
     // Coming back from our own outage (offline, or our page frozen): nobody went silent, we did.
     const resumed = online && !(now - this.#listening <= OWN_STALL_MS);
     this.#listening = online ? now : Number.NaN;
     for (const r of this.#remote.values()) {
+      const t = this.#timeOf(this.#timeline(r));
       if (resumed) r.lastSeen = now;
       if (r.removedAt === undefined && online) {
         // Silence only counts while the owner is connected (a disconnected owner's entities freeze).
@@ -564,13 +685,19 @@ export class EntityStore {
         if (r.visible) this.#hooks.onRemove?.(r.obj, r.reason ?? 'removed');
       }
     }
+    // A player who left takes their timeline once their last entity is gone.
+    for (const key of this.#delays.keys()) {
+      if (key === HOST_OWNER || this.#t.player(key)) continue;
+      if (![...this.#remote.values()].some((r) => r.owner === key)) this.#delays.delete(key);
+    }
     return t;
   }
 
   /** Remote values are read lazily, once per frame, at the render time. */
   #refresh(r: Remote): void {
     if (r.readAt === Number.POSITIVE_INFINITY) return;
-    const t = this.#advance();
+    this.#advance();
+    const t = this.#timeOf(this.#timeline(r));
     if (r.readAt === t || r.readAt === Number.POSITIVE_INFINITY) return;
     r.values = r.buffer.read(t);
     r.readAt = t;

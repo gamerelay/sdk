@@ -56,11 +56,16 @@ export class TokenBucket {
 
   /** Try to spend `cost` tokens; returns false if the caller is over the limit. */
   take(now: number, cost = 1): boolean {
+    if (this.left(now) < cost) return false;
+    this.tokens -= cost;
+    return true;
+  }
+
+  /** The tokens there are now (spends nothing). */
+  left(now: number): number {
     const elapsed = Math.max(0, now - this.last) / 1000;
     this.last = now;
     this.tokens = Math.min(this.burst, this.tokens + elapsed * this.ratePerSecond);
-    if (this.tokens < cost) return false;
-    this.tokens -= cost;
-    return true;
+    return this.tokens;
   }
 }
