@@ -61,6 +61,13 @@ export interface RoomInfo {
   seed: number;
   /** Take-once claims held now: key → holder. */
   claims: Record<string, PlayerId>;
+  /** The host locked the room (`room.setAccess`): nobody new may join. Absent from older servers. */
+  locked?: boolean;
+  /** Listed by `listRooms` and open to quick match. Absent from older servers. */
+  public?: boolean;
+  /** What room lists show, set by the host (`room.setListing`). Absent until set. */
+  name?: string;
+  meta?: Json;
 }
 
 /** Public room as shown in a lobby list. (A type alias so it is assignable to `Json`.) */
@@ -70,6 +77,14 @@ export type RoomListing = {
   maxPlayers: number;
   tag: string | null;
   createdAt: number;
+  /** The host's name for the room (`room.setListing`), or null. */
+  name: string | null;
+  /** Small JSON the host set with `room.setListing` (map, phase, lap…), or null. */
+  meta: Json | null;
+  /** Locked by the host: joining fails with `locked`. Listed only with `includeFull`. */
+  locked: boolean;
+  /** The host's player name, or null while nobody hosts. */
+  hostName: string | null;
 };
 
 /** `desc`: higher scores are better (points). `asc`: lower is better (times). */
@@ -128,8 +143,10 @@ export type ErrorCode =
   | 'party_not_found'
   | 'party_full'
   | 'unsupported'
-  /** Kicked from this room by the game's owner; joining it again is refused. */
+  /** Kicked from this room (by its host or the game's owner); joining it again is refused. */
   | 'banned'
+  /** The room's host locked it: nobody new may join (players in it can still reconnect). */
+  | 'locked'
   /** The game's account has as many players online as its plan allows. */
   | 'at_capacity'
   /** The game's account used its monthly traffic allowance (free plan); resets on the 1st. */
@@ -209,6 +226,38 @@ export interface BatchMsg extends Base<'batch'> {
   m: RoomClientMessage[];
 }
 
+// Host controls: requests handled inside a Room, answered by `rid` (a reply, or an error such as
+// `not_host`). Not batched.
+/** Remove a player; with `ban` (default true) they can't join this room again until it closes. */
+export interface KickMsg extends Base<'kick'> {
+  rid: number;
+  playerId: PlayerId;
+  ban?: boolean;
+  /** Shown to the kicked player (`closed('kicked', message)`). */
+  message?: string;
+}
+/** Who may join. An omitted field stays as it is. */
+export interface SetAccessMsg extends Base<'set_access'> {
+  rid: number;
+  /** No new players; players in the room stay, and a dropped one can still resume their seat. */
+  locked?: boolean;
+  public?: boolean;
+  /** Never below the players seated now. */
+  maxPlayers?: number;
+}
+/** What room lists show. An omitted field stays as it is; `null` (or an empty name) clears it. */
+export interface SetListingMsg extends Base<'set_listing'> {
+  rid: number;
+  name?: string | null;
+  meta?: Json;
+}
+/** Hand the host role to another connected player. */
+export interface TransferHostMsg extends Base<'transfer_host'> {
+  rid: number;
+  playerId: PlayerId;
+}
+export type RoomRequestMessage = KickMsg | SetAccessMsg | SetListingMsg | TransferHostMsg;
+
 /** Messages handled by the server / lobby layer. `rid` correlates replies. */
 export interface CreateRoomMsg extends Base<'create_room'> {
   rid: number;
@@ -221,6 +270,12 @@ export interface CreateRoomMsg extends Base<'create_room'> {
 export interface JoinRoomMsg extends Base<'join_room'> {
   rid: number;
   code: string;
+  /**
+   * The SDK is getting back into the room it was in (after a reconnect). If it was kicked while
+   * away, the server sends `removed` (kicked, with the message) before refusing, instead of
+   * giving it a fresh seat.
+   */
+  resume?: boolean;
 }
 export interface QuickMatchMsg extends Base<'quick_match'> {
   rid: number;
@@ -230,6 +285,12 @@ export interface QuickMatchMsg extends Base<'quick_match'> {
 export interface ListRoomsMsg extends Base<'list_rooms'> {
   rid: number;
   tag?: string;
+  /** Also full and locked rooms (each listing says which). */
+  includeFull?: boolean;
+}
+/** Players online in this game now. Reply: `{ players: number }`. */
+export interface OnlineMsg extends Base<'online'> {
+  rid: number;
 }
 export interface PartyCreateMsg extends Base<'party_create'> {
   rid: number;
@@ -289,11 +350,12 @@ export type LobbyClientMessage =
   | PingMsg
   | TurnMsg
   | ListRoomsMsg
+  | OnlineMsg
   | PartyCreateMsg
   | PartyJoinMsg
   | PartyLeaveMsg;
 
-export type ClientMessage = LobbyClientMessage | RoomClientMessage | BatchMsg;
+export type ClientMessage = LobbyClientMessage | RoomClientMessage | RoomRequestMessage | BatchMsg;
 export type ClientMessageType = ClientMessage['t'];
 
 // ---------------------------------------------------------------------------
@@ -405,6 +467,19 @@ export interface ClaimResultMsg extends Base<'claim_result'> {
   key: string;
   holder: PlayerId | null;
 }
+/** The host changed who may join (`set_access`). Sent to everyone, the host included. */
+export interface AccessMsg extends Base<'access'> {
+  locked: boolean;
+  public: boolean;
+  maxPlayers: number;
+  from: PlayerId;
+}
+/** The host changed what room lists show (`set_listing`). Sent to everyone, the host included. */
+export interface ListingMsg extends Base<'listing'> {
+  name: string | null;
+  meta: Json | null;
+  from: PlayerId;
+}
 export interface PongMsg extends Base<'pong'> {
   ts: number;
   serverTime: number;
@@ -417,7 +492,7 @@ export interface PartyMsg extends Base<'party'> {
 export interface PartyRoomMsg extends Base<'party_room'> {
   roomId: string;
 }
-/** You are out of the room: kicked by the game's owner, or the room was closed. */
+/** You are out of the room: kicked (by its host or the game's owner), or the room was closed. */
 export interface RemovedMsg extends Base<'removed'> {
   roomId: string;
   reason: 'kicked' | 'closed';
@@ -445,6 +520,8 @@ export type ServerMessage =
   | ClaimedMsg
   | ReleasedMsg
   | ClaimResultMsg
+  | AccessMsg
+  | ListingMsg
   | PongMsg
   | ServerRestartingMsg
   | PartyMsg

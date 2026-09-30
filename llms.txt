@@ -576,7 +576,10 @@ await room.shareInvite()  // share sheet on phones, clipboard elsewhere: 'shared
 const room = await relay.quickMatch({ maxPlayers: 4, tag: 'ctf' });
 
 // Browse public rooms (created with { public: true }) that have free seats.
-const rooms = await relay.listRooms('ctf'); // [{ code, players, maxPlayers, tag, createdAt }], up to 50
+const rooms = await relay.listRooms('ctf'); // [{ code, players, maxPlayers, tag, createdAt, name, meta, locked, hostName }], up to 50
+// A server browser: full and locked rooms too (show them greyed out; joining fails with room_full / locked).
+const all = await relay.listRooms('ctf', { includeFull: true });
+const { players } = await relay.online(); // players online in this game right now
 
 // Parties: friends queue together (up to 8 members). When the leader creates, joins or
 // quick-matches a room, every connected member is moved in too.
@@ -587,6 +590,54 @@ relay.on('room', (room) => startGame(room));      // you were moved into a room 
 await relay.leaveParty();
 ```
 
+## Host controls: a lobby the host runs
+
+The room's host can run it like a game server: name it for the room list, lock it when the match
+starts, change its size, kick, and hand over. Each is host only and returns a promise that
+rejects with `not_host` for anyone else (check `room.isHost`).
+
+```js
+// Lobby: show up in the server browser with a name and a little JSON.
+if (room.isHost) await room.setListing({ name: 'Dunes, 3 laps', meta: { map: 'dunes', phase: 'lobby' } });
+
+// Race start: no one new mid-race. Players in the room stay, and a dropped one can rejoin their seat.
+if (room.isHost) {
+  await room.setAccess({ locked: true });
+  await room.setListing({ meta: { map: 'dunes', phase: 'racing', lap: 1 } }); // on a lap change, not every frame
+}
+
+// Back to the lobby: open again, maybe bigger.
+if (room.isHost) await room.setAccess({ locked: false, maxPlayers: 12 });
+
+// Kick (banned from this room until it closes; { ban: false } lets them back), or hand over.
+if (room.isHost) await room.kick(playerId, { message: 'No ramming' });
+if (room.isHost) await room.transferHost(playerId);
+
+room.on('access', ({ locked, maxPlayers }) => renderLobby()); // everyone, the host included
+room.on('listing', ({ name, meta }) => renderLobby());
+```
+
+- `room.locked`, `room.isPublic`, `room.maxPlayers`, `room.name` and `room.meta` are always current.
+- `setAccess({ locked, public, maxPlayers })`: omitted options stay as they are. Joining a locked
+  room fails with `locked`, and quick match skips it. `public: false` takes it out of room lists.
+  `maxPlayers` is 1–64 and never below the players in the room (disconnected seats count until
+  they time out): lower it and it rejects with `bad_request`.
+- `setListing({ name, meta })`: `name` up to 48 characters (one line), `meta` any JSON up to 512
+  bytes; `null` clears one. Rooms list them as `name` and `meta`. Both are written by a player
+  (the host), so render them as text (`textContent`, never `innerHTML`) and treat `meta` as
+  untrusted input: check its fields before you use them.
+- `setAccess` and `setListing` share a budget of 10 changes in a row, then 1 a second, per room;
+  over it they reject with `rate_limited`. Update on a phase or lap change.
+- `kick` works like the owner's (see Moderation): the player gets `closed('kicked', message)`,
+  everyone else `player_left` with reason `'kicked'`. The host can't kick itself (`room.leave()`).
+  A player kicked while their connection was down hears it when the SDK reconnects.
+- Bans are per player id. Anonymous players get a new id in a private window or another
+  browser, so a ban only slows a determined player down. To keep strangers out for good, lock
+  the room (`setAccess({ locked: true })`) once your players are in.
+- `transferHost` needs a connected player; everyone gets `host_changed` and the new host `host`.
+- The host role moves on its own when the host leaves or drops (see Host changes), so run these
+  from whoever `room.isHost` is now, e.g. in `room.on('host', …)`.
+
 ## Room reference
 
 ```js
@@ -595,13 +646,23 @@ room.code          // 4-6 char code other players can join with
 room.me            // your player id
 room.isHost        // true if this client is the host now (see Host changes)
 room.hostId
-room.maxPlayers
+room.maxPlayers    // the host can change it (see Host controls)
+room.locked        // no new players can join
+room.isPublic      // in room lists and quick match
+room.name          // what room lists show, or null (the host sets name and meta)
+room.meta
 room.players       // [{ id, name, avatar, joinedAt, connected, slot }] in join order
 room.state         // shared JSON facts; only the host writes (see State and timers)
 room.renderTime    // the server-clock moment others' entities are drawn at
 room.chatHistory   // recent chat lines (see Chat)
 room.seed          // random 32-bit number the server picked, the same for everyone (see Time and fairness)
 await room.leave()
+
+// Host only (see Host controls): each rejects with not_host for anyone else.
+await room.kick(playerId, { ban, message })             // ban defaults to true
+await room.setAccess({ locked, public, maxPlayers })    // omitted options stay as they are
+await room.setListing({ name, meta })                   // null clears one
+await room.transferHost(playerId)
 
 room.on('player_joined', (player) => {})
 room.on('player_left', (playerId, reason) => {})       // 'left' | 'timeout' | 'kicked'
@@ -611,6 +672,8 @@ room.on('host', () => {})                               // you just became host
 room.on('host_changed', (hostId, previousHostId) => {})
 room.on('state', (state, patch, fromPlayerId) => {})
 room.on('closed', (reason, message) => {})              // 'left' | 'lost' | 'kicked' | 'closed' (see Moderation)
+room.on('access', ({ locked, public: isPublic, maxPlayers }, fromPlayerId) => {})
+room.on('listing', ({ name, meta }, fromPlayerId) => {})
 ```
 
 `on()` returns an unsubscribe function; `off(event, handler)` works too (on `relay` and `room`).
@@ -699,7 +762,8 @@ await relay.leaderboard.submit('fastest-lap', 41.73, { order: 'asc' });
 
 ## Moderation
 
-You (the game's owner) can kick a player or close a room; players can't. Three ways:
+You (the game's owner) can kick a player or close a room; players can't, except the room's host,
+who can kick with `room.kick` (see Host controls). The owner has three ways:
 the dashboard (instance → Live lobbies → click a room), the account MCP server
 (`kick_player`, `close_room`), or your backend with the **secret key**:
 
@@ -726,9 +790,13 @@ room.on('closed', (reason, message) => {
 
 - A kicked player is banned from that room until it closes (`ban: false` lets them back);
   joining it again fails with `banned`. They stay connected and can join or create other rooms.
+  The same goes for a kick by the host. A ban is per player id: an anonymous player in a private
+  window is a new player, so lock the room (`room.setAccess({ locked: true })`) to keep people
+  out reliably.
 - Everyone else sees `player_left` with reason `'kicked'`. Closing sends everyone `closed('closed')`
   and the room and its state are gone.
-- Messages are optional, up to 120 characters. Webhooks get `player.left` (reason `kicked`) and
+- Messages are optional, up to 120 characters. Webhooks get `player.left` (reason `kicked`, and
+  `kickedBy`, the host's player id, when the host kicked them) and
   `room.closed` (reason `closed`).
 
 ## Webhooks (your backend)
@@ -745,7 +813,7 @@ Events (subscribe to some or all):
 | `room.created` | `{ room }` |
 | `room.closed` | `{ room, reason: 'empty' \| 'closed' }` (`empty` about 2 minutes after the last player leaves; `closed` = by you) |
 | `player.joined` | `{ room, player, resumed }` |
-| `player.left` | `{ room, player, reason: 'left' \| 'kicked' \| 'timeout' }` |
+| `player.left` | `{ room, player, reason: 'left' \| 'kicked' \| 'timeout', kickedBy? }` (`kickedBy`: the host, when it kicked them) |
 | `host.changed` | `{ room, hostId, previousHostId }` |
 | `score.submitted` | `{ board, order, player, score, best, rank, improved }` |
 | `chat.message` | `{ room, player, message: { id, text, ts } }` |
@@ -847,7 +915,8 @@ room.reseed()                        // host only: new room.seed for a new round
   request is at most about 15 KB, room state 64 KB. Up to 64 players per room, 256 entities per
   player and 1,024 per room, 1,024 claims per room.
 - Keep data JSON-only (no Maps, Dates or class instances), nested at most 16 deep.
-- Player names are cut to 24 characters. Tags are 1–32 characters.
+- Player names are cut to 24 characters. Tags are 1–32 characters. Room names (`setListing`)
+  are up to 48 characters and room `meta` up to 512 bytes of JSON.
 - Parties, chat and persisted data can be turned off per game in the dashboard; their calls
   then fail with `unsupported`.
 - Each account has a plan (current limits: `GET https://gamerelay.io/v1/plans`). The free plan is

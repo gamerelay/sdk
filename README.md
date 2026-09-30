@@ -85,11 +85,17 @@ history.replaceState(null, '', room.inviteUrl()); // the address bar is now the 
 
 ## Everything else
 
-Events, requests to the host, claims, inputs, timers, teams, lobbies and parties, chat,
+Events, requests to the host, claims, inputs, timers, teams, lobbies and parties, host controls
+(lock, resize, name and kick), chat,
 leaderboards, signed-in players, webhooks, moderation, allowed origins, testing on a bad network
 and limits are in the [docs](https://gamerelay.io/docs). While developing, pass `debug: true` to
 `connect()` for an overlay; the SDK also warns in the console, once each, about common mistakes
 and names the fix.
+
+Two things worth knowing before you build a lobby: a kick's ban is per player id, and an
+anonymous player in a private window gets a new one, so lock the room
+(`room.setAccess({ locked: true })`) to keep strangers out. A room's `name` and `meta` come from a
+player (the host): render them as text, never as HTML.
 
 ## License
 

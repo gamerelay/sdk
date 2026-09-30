@@ -27,6 +27,13 @@ export const LIMITS = {
   /** Avatar an anonymous player picks: a short id or emoji, never a URL. */
   maxAnonymousAvatarLength: 32,
   maxPlayersPerRoom: 64,
+  /** A room's name in room lists (`room.setListing`), in characters (graphemes). */
+  maxRoomNameLength: 48,
+  /** A room's listing `meta`, as UTF-8 JSON. */
+  maxRoomMetaBytes: 512,
+  /** `setAccess` and `setListing` changes per room: `roomSettingsBurst` at once, refilling at `roomSettingsPerSecond`. */
+  roomSettingsPerSecond: 1,
+  roomSettingsBurst: 10,
   /** Take-once claims a room holds at once (`room.claim`). */
   maxClaims: 1024,
   maxClaimKeyLength: 128,

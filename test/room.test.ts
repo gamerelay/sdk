@@ -12,6 +12,7 @@ function makeRoom(me: string, info: Partial<RoomInfo>) {
   const messages: string[] = [];
   const clock = { now: 1000 };
   const loops: (() => void)[] = [];
+  const requests: Record<string, unknown>[] = [];
   const relay = {
     connected: true,
     room: null,
@@ -20,10 +21,10 @@ function makeRoom(me: string, info: Partial<RoomInfo>) {
     tick: (_rate: number, fn: () => void) => (loops.push(fn), () => {}),
     warn: (_kind: string, key: string, message: string) => (warned.push(key), messages.push(message)),
     newEntityId: (kind: string) => `${kind}:t:1`,
-    request: async () => undefined,
+    request: async (m: Record<string, unknown>) => void requests.push(m),
   } as unknown as GameRelay;
   const full: RoomInfo = { id: 'r', code: 'ABCD', mode: 'relay', maxPlayers: 8, hostId: 'pa', players: [], state: {}, stateSeq: 0, chat: [], seed: 1, claims: {}, ...info };
-  return { room: new Room(relay, full, me), queued, warned, messages, clock, step: () => loops.forEach((fn) => fn()) };
+  return { room: new Room(relay, full, me), queued, requests, warned, messages, clock, step: () => loops.forEach((fn) => fn()) };
 }
 
 describe('Room resync', () => {
@@ -142,4 +143,127 @@ test('a state patch cannot reach the state object’s prototype: __proto__, cons
   expect((room.state as Record<string, unknown>).isAdmin).toBeUndefined();
   expect(room.state.constructor).toBe(Object);
   expect(Object.keys(room.state)).toEqual(['score']);
+});
+
+describe('host controls', () => {
+  const players = [player('pa', 0), player('pb', 1)];
+  const host = () => makeRoom('pa', { hostId: 'pa', players });
+
+  test('a non-host is refused before anything is sent', async () => {
+    const { room, requests } = makeRoom('pb', { hostId: 'pa', players });
+    await expect(room.kick('pa')).rejects.toMatchObject({ code: 'not_host' });
+    await expect(room.setAccess({ locked: true })).rejects.toMatchObject({ code: 'not_host' });
+    await expect(room.setListing({ name: 'x' })).rejects.toMatchObject({ code: 'not_host' });
+    await expect(room.transferHost('pb')).rejects.toMatchObject({ code: 'not_host' });
+    expect(requests).toEqual([]);
+  });
+
+  test('kick bans by default, and sends the message cleaned up', async () => {
+    const { room, requests } = host();
+    await room.kick('pb', { message: ' be\nnice ' });
+    await room.kick('pb', { ban: false, message: '   ' });
+    expect(requests).toEqual([
+      { t: 'kick', playerId: 'pb', ban: undefined, message: 'be nice' },
+      { t: 'kick', playerId: 'pb', ban: false, message: undefined },
+    ]);
+    await expect(room.kick('pa')).rejects.toMatchObject({ code: 'bad_request' });
+    await expect(room.kick('pb', { message: 'x'.repeat(121) })).rejects.toMatchObject({ code: 'too_large' });
+    expect(requests).toHaveLength(2);
+  });
+
+  test('setAccess checks maxPlayers against the limits and the players in the room', async () => {
+    const { room, requests } = host();
+    await expect(room.setAccess({ maxPlayers: 1 })).rejects.toMatchObject({ code: 'bad_request' });
+    await expect(room.setAccess({ maxPlayers: 65 })).rejects.toMatchObject({ code: 'bad_request' });
+    await expect(room.setAccess({ maxPlayers: 2.5 })).rejects.toMatchObject({ code: 'bad_request' });
+    await room.setAccess({ maxPlayers: 2, locked: true });
+    expect(requests).toEqual([{ t: 'set_access', locked: true, public: undefined, maxPlayers: 2 }]);
+  });
+
+  test('setListing checks the name and the size of meta (in UTF-8 bytes)', async () => {
+    const { room, requests } = host();
+    await expect(room.setListing({ name: 'x'.repeat(49) })).rejects.toMatchObject({ code: 'too_large' });
+    await expect(room.setListing({ meta: { s: 'é'.repeat(260) } })).rejects.toMatchObject({ code: 'too_large' }); // 260 characters, 520+ bytes
+    await room.setListing({ name: '  Pro\tlobby ', meta: { lap: 1 } });
+    await room.setListing({ name: null, meta: null });
+    expect(requests).toEqual([
+      { t: 'set_listing', name: 'Pro lobby', meta: { lap: 1 } },
+      { t: 'set_listing', name: null, meta: null },
+    ]);
+  });
+
+  test('transferHost refuses yourself', async () => {
+    const { room, requests } = host();
+    await expect(room.transferHost('pa')).rejects.toMatchObject({ code: 'bad_request' });
+    await room.transferHost('pb');
+    expect(requests).toEqual([{ t: 'transfer_host', playerId: 'pb' }]);
+  });
+
+  test('the limits match the server at their edges', async () => {
+    const { room, requests } = host();
+    await room.setAccess({ maxPlayers: 64 });
+    await expect(room.setAccess({ maxPlayers: 0 })).rejects.toMatchObject({ code: 'bad_request' });
+    const pad = JSON.stringify({ p: '' }).length;
+    await room.setListing({ meta: { p: 'x'.repeat(512 - pad) } }); // exactly 512 bytes
+    await expect(room.setListing({ meta: { p: 'x'.repeat(513 - pad) } })).rejects.toMatchObject({ code: 'too_large' });
+    await room.setListing({ name: '🏎️'.repeat(48) }); // characters, not bytes
+    await room.kick('pb', { message: 'x'.repeat(120) });
+    expect(requests.map((r) => r.t)).toEqual(['set_access', 'set_listing', 'set_listing', 'kick']);
+  });
+
+  test('a blank name clears it, and omitted options are sent as undefined', async () => {
+    const { room, requests } = host();
+    await room.setListing({ name: ' \n\t ' });
+    await room.setListing({ meta: { lap: 1 } });
+    await room.setAccess({});
+    expect(requests).toEqual([
+      { t: 'set_listing', name: null, meta: undefined },
+      { t: 'set_listing', name: undefined, meta: { lap: 1 } },
+      { t: 'set_access', locked: undefined, public: undefined, maxPlayers: undefined },
+    ]);
+  });
+
+  test('once the host role moves away, the controls refuse locally', async () => {
+    const { room, requests } = host();
+    room.handle({ v: 1, t: 'host_changed', hostId: 'pb', previousHostId: 'pa' });
+    await expect(room.setAccess({ locked: true })).rejects.toMatchObject({ code: 'not_host' });
+    await expect(room.kick('pb')).rejects.toMatchObject({ code: 'not_host' });
+    expect(requests).toEqual([]);
+  });
+
+  test('starts from the room info, with defaults for an older server', () => {
+    const now = makeRoom('pa', { locked: true, public: true, name: 'Night race', meta: { lap: 2 } }).room;
+    expect([now.locked, now.isPublic, now.name, now.meta]).toEqual([true, true, 'Night race', { lap: 2 }]);
+    const old = makeRoom('pa', {}).room;
+    expect([old.locked, old.isPublic, old.name, old.meta]).toEqual([false, false, null, null]);
+  });
+
+  test('access and listing messages update the room and fire their events', () => {
+    const { room } = makeRoom('pb', { hostId: 'pa', players });
+    const seen: unknown[] = [];
+    room.on('access', (access, from) => seen.push(['access', access, from]));
+    room.on('listing', (listing, from) => seen.push(['listing', listing, from]));
+    room.handle({ v: 1, t: 'access', locked: true, public: true, maxPlayers: 6, from: 'pa' });
+    room.handle({ v: 1, t: 'listing', name: 'Dunes', meta: { phase: 'racing' }, from: 'pa' });
+    expect([room.locked, room.isPublic, room.maxPlayers, room.name, room.meta]).toEqual([true, true, 6, 'Dunes', { phase: 'racing' }]);
+    expect(seen).toEqual([
+      ['access', { locked: true, public: true, maxPlayers: 6 }, 'pa'],
+      ['listing', { name: 'Dunes', meta: { phase: 'racing' } }, 'pa'],
+    ]);
+  });
+
+  test('a resync fires access and listing only for what changed while away', () => {
+    const { room } = makeRoom('pb', { hostId: 'pa', players });
+    const seen: string[] = [];
+    room.on('access', () => seen.push('access'));
+    room.on('listing', () => seen.push('listing'));
+    const info: RoomInfo = { id: 'r', code: 'ABCD', mode: 'relay', maxPlayers: 8, hostId: 'pa', players, state: {}, stateSeq: 0, chat: [], seed: 1, claims: {} };
+    room.sync(info);
+    expect(seen).toEqual([]);
+    room.sync({ ...info, locked: true });
+    expect(seen).toEqual(['access']);
+    room.sync({ ...info, locked: true, meta: { lap: 3 } });
+    expect(seen).toEqual(['access', 'listing']);
+    expect([room.locked, room.meta]).toEqual([true, { lap: 3 }]);
+  });
 });

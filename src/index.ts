@@ -3,7 +3,7 @@
  * Guide: https://gamerelay.io/llms.txt
  */
 import { LIMITS } from '@gamerelay/protocol/limits';
-import { normalizeChat } from '@gamerelay/protocol/chat';
+import { normalizeChat, normalizeLine } from '@gamerelay/protocol/chat';
 import { signFrame, unmaskKey, type FrameKey } from '@gamerelay/protocol/sign';
 import { attempt, safeStorage } from '@gamerelay/protocol/util';
 import {
@@ -116,6 +116,21 @@ export interface RoomOptions {
   tag?: string;
 }
 
+/** Who may join a room (`room.setAccess`, the `access` event). */
+export interface RoomAccess {
+  /** Nobody new may join (it fails with `locked`); players in the room stay, and can reconnect. */
+  locked: boolean;
+  /** Listed by `relay.listRooms` and open to quick match. */
+  public: boolean;
+  maxPlayers: number;
+}
+
+/** What room lists show about a room (`room.setListing`, the `listing` event). */
+export interface RoomListingInfo {
+  name: string | null;
+  meta: Json | null;
+}
+
 export interface SendOptions {
   /** Send to one player only. */
   to?: PlayerId;
@@ -139,6 +154,8 @@ const ROOM_EVENTS = new Set<string>([
   'closed',
   'claimed',
   'released',
+  'access',
+  'listing',
 ]);
 /** Names models guess for built-in room events: listening to one is legal, but only room.emit fires it. */
 const EVENT_ALIASES: Record<string, string> = {
@@ -219,14 +236,18 @@ export type RoomEvents = {
   /** A chat line from anyone in the room, including you. */
   chat: (message: ChatMessage) => void;
   /**
-   * You're out of the room: you left, it was lost while reconnecting, you were kicked by the
-   * game's owner, or the owner closed it. `message` is the moderator's note, if any.
+   * You're out of the room: you left, it was lost while reconnecting, you were kicked (by the
+   * room's host or the game's owner), or the owner closed it. `message` is the kicker's note, if any.
    */
   closed: (reason: CloseReason, message?: string) => void;
   /** Someone took a claim (`room.claim`): you included. */
   claimed: (key: string, playerId: PlayerId) => void;
   /** A claim is free again: released, or its holder left. */
   released: (key: string, playerId: PlayerId) => void;
+  /** The host changed who may join (`room.setAccess`): you included. `room.locked` and the rest are updated. */
+  access: (access: RoomAccess, from: PlayerId) => void;
+  /** The host changed what room lists show (`room.setListing`): you included. */
+  listing: (listing: RoomListingInfo, from: PlayerId) => void;
 };
 
 interface Pending {
@@ -471,9 +492,18 @@ export class GameRelay extends Emitter<RelayEvents> {
     return this.#enter({ t: 'quick_match', maxPlayers: options.maxPlayers, tag: options.tag });
   }
 
-  /** Public rooms with free seats, oldest first. */
-  async listRooms(tag?: string): Promise<RoomListing[]> {
-    return ((await this.request({ t: 'list_rooms', tag })) ?? []) as RoomListing[];
+  /**
+   * Public rooms with free seats, oldest first (up to 50). `includeFull` adds full and locked ones,
+   * for a server browser: each listing's `players`, `maxPlayers` and `locked` say which.
+   */
+  async listRooms(tag?: string, options: { includeFull?: boolean } = {}): Promise<RoomListing[]> {
+    return ((await this.request({ t: 'list_rooms', tag, includeFull: options.includeFull || undefined })) ?? []) as RoomListing[];
+  }
+
+  /** How many players are online in this game right now (everyone connected, in a room or not). */
+  async online(): Promise<{ players: number }> {
+    const data = (await this.request({ t: 'online' })) as { players?: number } | undefined;
+    return { players: data?.players ?? 0 };
   }
 
   /** Start a party; share `party.code` with friends. */
@@ -913,9 +943,11 @@ export class GameRelay extends Emitter<RelayEvents> {
       if (party) await this.request({ t: 'party_join', code: party.code }).catch((err) => gone(err) && this.#setParty(null));
       const room = this.room;
       if (room) {
-        await this.request({ t: 'join_room', code: room.code }).catch((err) => {
+        // `resume`: if we were kicked while away, the server says so (`removed`) instead of seating us afresh.
+        await this.request({ t: 'join_room', code: room.code, resume: true }).catch((err) => {
           if (!gone(err)) return;
-          if (this.room === room) this.room = null;
+          if (this.room !== room) return; // closed already (kicked, or the game moved on)
+          this.room = null;
           room.closeLocal('lost');
         });
       }
@@ -1054,7 +1086,8 @@ export class GameRelay extends Emitter<RelayEvents> {
 export class Room extends Emitter<RoomEvents> {
   readonly id: string;
   readonly code: string;
-  readonly maxPlayers: number;
+  /** Seats in the room. The host can change it (`setAccess`). */
+  maxPlayers: number;
   hostId: PlayerId;
   players: PlayerInfo[];
   state: JsonObject;
@@ -1093,6 +1126,10 @@ export class Room extends Emitter<RoomEvents> {
   readonly #sendRate = new Rate(20);
   /** False once this room object was left, closed or replaced: kind handles then throw. */
   #live = true;
+  #locked: boolean;
+  #public: boolean;
+  #name: string | null;
+  #meta: Json | null;
 
   /** @internal */
   constructor(
@@ -1111,6 +1148,10 @@ export class Room extends Emitter<RoomEvents> {
     this.state = info.state;
     this.chatHistory = info.chat ?? [];
     this.seed = info.seed;
+    this.#locked = info.locked ?? false;
+    this.#public = info.public ?? false;
+    this.#name = info.name ?? null;
+    this.#meta = info.meta ?? null;
     const transport: SyncTransport = {
       me,
       // `h` (host-only) lets the server drop a replaced host's late writes, timer effects included.
@@ -1196,6 +1237,95 @@ export class Room extends Emitter<RoomEvents> {
   /** True if you run the simulation. Re-check on `host_changed`. */
   get isHost(): boolean {
     return this.hostId === this.me;
+  }
+
+  /** The host locked the room (`setAccess`): nobody new can join. */
+  get locked(): boolean {
+    return this.#locked;
+  }
+
+  /** Listed by `relay.listRooms` and open to quick match. */
+  get isPublic(): boolean {
+    return this.#public;
+  }
+
+  /** The room's name in room lists (`setListing`), or null. */
+  get name(): string | null {
+    return this.#name;
+  }
+
+  /** The small JSON room lists show (`setListing`), or null. */
+  get meta(): Json | null {
+    return this.#meta;
+  }
+
+  /**
+   * Host only: remove a player. They get `closed('kicked', message)`, everyone else `player_left`
+   * with reason `'kicked'`. With `ban` (the default) they can't join this room again until it
+   * closes (joining fails with `banned`).
+   */
+  async kick(playerId: PlayerId, options: { ban?: boolean; message?: string } = {}): Promise<void> {
+    this.#hostOnly('room.kick');
+    if (playerId === this.me) throw new GameRelayError('bad_request', "room.kick: the host can't kick itself; use room.leave()");
+    const message = options.message === undefined ? null : this.#line('room.kick', 'message', options.message, LIMITS.maxModerationMessageLength);
+    await this.#hostRequest({ t: 'kick', playerId, ban: options.ban === false ? false : undefined, message: message ?? undefined });
+  }
+
+  /**
+   * Host only: who may join. `locked`: nobody new (joining fails with `locked`); players in the room
+   * stay and can reconnect. `public`: listed and open to quick match. `maxPlayers`: 1–64, never
+   * below the players in the room. Omitted options stay as they are. Everyone gets an `access` event.
+   */
+  async setAccess(access: { locked?: boolean; public?: boolean; maxPlayers?: number }): Promise<void> {
+    this.#hostOnly('room.setAccess');
+    const { maxPlayers } = access;
+    if (maxPlayers !== undefined && (!Number.isInteger(maxPlayers) || maxPlayers < 1 || maxPlayers > LIMITS.maxPlayersPerRoom)) {
+      throw new GameRelayError('bad_request', `room.setAccess: maxPlayers must be a whole number from 1 to ${LIMITS.maxPlayersPerRoom}`);
+    }
+    if (maxPlayers !== undefined && maxPlayers < this.players.length) {
+      throw new GameRelayError('bad_request', `room.setAccess: maxPlayers ${maxPlayers} is below the ${this.players.length} players in the room`);
+    }
+    await this.#hostRequest({ t: 'set_access', locked: access.locked, public: access.public, maxPlayers });
+  }
+
+  /**
+   * Host only: what `relay.listRooms` shows about this room. `name`: up to 48 characters, one line.
+   * `meta`: any small JSON (up to 512 bytes), e.g. `{ map: 'dunes', phase: 'racing', lap: 2 }`.
+   * Omitted options stay as they are; `null` clears one. Everyone gets a `listing` event. At most
+   * 10 changes in a row (shared with `setAccess`), then 1 a second: update on a phase or lap
+   * change, not every frame.
+   */
+  async setListing(listing: { name?: string | null; meta?: Json }): Promise<void> {
+    this.#hostOnly('room.setListing');
+    const name = typeof listing.name === 'string' ? this.#line('room.setListing', 'name', listing.name, LIMITS.maxRoomNameLength) : listing.name;
+    if (listing.meta !== undefined && listing.meta !== null && utf8.encode(JSON.stringify(listing.meta)).byteLength > LIMITS.maxRoomMetaBytes) {
+      throw new GameRelayError('too_large', `room.setListing: meta is limited to ${LIMITS.maxRoomMetaBytes} bytes of JSON`);
+    }
+    await this.#hostRequest({ t: 'set_listing', name, meta: listing.meta });
+  }
+
+  /** Host only: hand the host role to another connected player. Everyone gets `host_changed`. */
+  async transferHost(playerId: PlayerId): Promise<void> {
+    this.#hostOnly('room.transferHost');
+    if (playerId === this.me) throw new GameRelayError('bad_request', 'room.transferHost: you are the host already');
+    await this.#hostRequest({ t: 'transfer_host', playerId });
+  }
+
+  #hostOnly(call: string): void {
+    if (!this.isHost) throw new GameRelayError('not_host', `${call}: only the host can do this; check room.isHost`);
+  }
+
+  /** A line others will see, checked as the server checks it: blank is null (no text). */
+  #line(call: string, what: string, raw: string, max: number): string | null {
+    const checked = normalizeLine(String(raw), max);
+    if (!checked.ok && checked.reason === 'too_long') throw new GameRelayError('too_large', `${call}: the ${what} is limited to ${max} characters`);
+    return checked.ok ? checked.text : null;
+  }
+
+  /** Host controls: everyone sees what they change, so no later broadcast's LAN copy may overtake one. */
+  async #hostRequest(message: { t: string; [key: string]: Json | undefined }): Promise<void> {
+    this.#lan.barrier();
+    await this.#relay.request(message);
   }
 
   /** This page's URL with `?room=CODE`. A friend who opens it gets in with `relay.joinInvite()`. */
@@ -1697,6 +1827,11 @@ export class Room extends Emitter<RoomEvents> {
       this.seed = info.seed;
       this.fire('seed', info.seed, info.hostId);
     }
+    // Host controls that changed while we were away.
+    const access: RoomAccess = { locked: info.locked ?? false, public: info.public ?? false, maxPlayers: info.maxPlayers };
+    if (access.locked !== this.#locked || access.public !== this.#public || access.maxPlayers !== this.maxPlayers) this.#setAccess(access, info.hostId);
+    const listing: RoomListingInfo = { name: info.name ?? null, meta: info.meta ?? null };
+    if (listing.name !== this.#name || JSON.stringify(listing.meta) !== JSON.stringify(this.#meta)) this.#setListing(listing, info.hostId);
     // Deliver chat that arrived while we were reconnecting.
     const seen = new Set(this.chatHistory.map((m) => m.id));
     for (const m of info.chat ?? []) if (!seen.has(m.id)) this.#receiveChat(m);
@@ -1760,7 +1895,24 @@ export class Room extends Emitter<RoomEvents> {
       case 'released':
       case 'claim_result':
         return this.#claims.receive(msg);
+      case 'access':
+        return this.#setAccess(msg, msg.from);
+      case 'listing':
+        return this.#setListing(msg, msg.from);
     }
+  }
+
+  #setAccess(access: RoomAccess, from: PlayerId): void {
+    this.#locked = access.locked;
+    this.#public = access.public;
+    this.maxPlayers = access.maxPlayers;
+    this.fire('access', { locked: access.locked, public: access.public, maxPlayers: access.maxPlayers }, from);
+  }
+
+  #setListing(listing: RoomListingInfo, from: PlayerId): void {
+    this.#name = listing.name;
+    this.#meta = listing.meta;
+    this.fire('listing', { name: listing.name, meta: listing.meta }, from);
   }
 }
 
