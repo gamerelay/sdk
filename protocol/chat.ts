@@ -23,8 +23,16 @@ export type ChatCheck = { ok: true; text: string } | { ok: false; reason: 'empty
 
 /** Single line, whitespace collapsed, controls stripped, 1..maxChatLength characters. */
 export function normalizeChat(raw: string): ChatCheck {
+  return normalizeLine(raw, LIMITS.maxChatLength);
+}
+
+/**
+ * The same rules for any line a player writes that others see (a room's name, a host's kick
+ * message), with its own limit in characters.
+ */
+export function normalizeLine(raw: string, max: number): ChatCheck {
   const text = raw.replace(BIDI_CONTROLS, '').replace(CONTROLS, ' ').replace(/\s+/g, ' ').trim();
   if (text === '') return { ok: false, reason: 'empty' };
-  if (chatLength(text) > LIMITS.maxChatLength) return { ok: false, reason: 'too_long' };
+  if (chatLength(text) > max) return { ok: false, reason: 'too_long' };
   return { ok: true, text };
 }

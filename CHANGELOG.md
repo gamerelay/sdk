@@ -4,6 +4,34 @@ Every release of `@gamerelay/sdk`, newest first. The notes under a version's hea
 GitHub release. Until 1.0, a minor version (0.x.0) may change the API; each break is listed
 here with what to change.
 
+## 0.1.0-alpha.4 (2026-09-30)
+
+- **Host controls:** the room's host can run it like a game server. `room.kick(playerId, { ban?,
+  message? })` removes a player the way the owner's kick does (banned from the room by default).
+  `room.setAccess({ locked?, public?, maxPlayers? })` locks the room to newcomers (joins fail with
+  the new `locked` code; players in it can still reconnect), lists or unlists it, and changes its
+  size, never below the players in it. `room.setListing({ name?, meta? })` sets what room lists
+  show: a name of up to 48 characters and up to 512 bytes of JSON. `room.transferHost(playerId)`
+  hands the host role over. All four are host only (`not_host` for anyone else) and return
+  promises. Everyone gets the new `access` and `listing` events, and `room.locked`,
+  `room.isPublic`, `room.name` and `room.meta` stay current (`room.maxPlayers` too, which is no
+  longer read-only).
+- **Server browser:** `relay.listRooms(tag, { includeFull: true })` also lists full and locked
+  rooms, and every listing now has `name`, `meta`, `locked` and `hostName`.
+  `relay.online()` says how many players the game has online.
+- **Kicked while offline:** a player kicked while their connection was down now gets
+  `closed('kicked', message)` when the SDK reconnects, instead of `closed('lost')` or, without a
+  ban, quietly getting a fresh seat back (the reconnect asks to resume, and the server says why
+  it can't).
+- **Refused joins stay put:** joining a room that refuses you (locked, banned, full) no longer
+  takes you, or your party, out of the room you're in. A party moves only if every member can.
+- **A party leader keeps its room over a reconnect:** a leader whose connection drops gets its
+  own seat back even if a party member can't come in (kicked, or outside a room since locked or
+  filled), and nobody is pulled along; a reconnect also no longer hands the party's lead away.
+  This is the server's doing, so it applies to every SDK version.
+- These need a server with host controls (gamerelay.io has them). Older SDKs in the same room
+  are unaffected: they ignore the new events.
+
 ## 0.1.0-alpha.3 (2026-09-29)
 
 - **Smaller messages:** the SDK asks the server for relayed messages in a short form (the
