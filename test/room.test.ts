@@ -247,9 +247,13 @@ describe('host controls', () => {
     room.handle({ v: 1, t: 'listing', name: 'Dunes', meta: { phase: 'racing' }, from: 'pa' });
     expect([room.locked, room.isPublic, room.maxPlayers, room.name, room.meta]).toEqual([true, true, 6, 'Dunes', { phase: 'racing' }]);
     expect(seen).toEqual([
-      ['access', { locked: true, public: true, maxPlayers: 6 }, 'pa'],
+      // An older server's access doesn't say linkOnly: it has none.
+      ['access', { locked: true, public: true, linkOnly: false, maxPlayers: 6 }, 'pa'],
       ['listing', { name: 'Dunes', meta: { phase: 'racing' } }, 'pa'],
     ]);
+    room.handle({ v: 1, t: 'access', locked: false, public: false, linkOnly: true, maxPlayers: 6, from: 'pa' });
+    expect(room.linkOnly).toBe(true);
+    expect(seen.at(-1)).toEqual(['access', { locked: false, public: false, linkOnly: true, maxPlayers: 6 }, 'pa']);
   });
 
   test('a resync fires access and listing only for what changed while away', () => {

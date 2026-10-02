@@ -4,6 +4,20 @@ Every release of `@gamerelay/sdk`, newest first. The notes under a version's hea
 GitHub release. Until 1.0, a minor version (0.x.0) may change the API; each break is listed
 here with what to change.
 
+## 0.1.0-alpha.5 (2026-10-01)
+
+- **Short links:** `room.shareLink()` is the room's link, the same for its life:
+  `https://gamerelay.io/<game>/<link>` once the game's owner sets a slug and a play URL (dashboard
+  → instance → Short links), which previews in chat apps with the room's name and the game's cover
+  image and sends players to the play URL with `?join=<link>`. Without a slug it's the page's URL
+  with `?join=<link>`. `relay.joinLink(link)` joins by a link's id, and `relay.joinInvite()` now
+  reads `?join=` as well as `?room=`. `room.shareInvite()` shares the short link (falling back to
+  the `?room=` one on an older server).
+- **Link-only rooms:** `createRoom({ linkOnly: true })` and `room.setAccess({ linkOnly })` make a
+  room that its code doesn't get into (`room_not_found`, as for a wrong code), so nobody joins by
+  guessing one; a player with a seat in it still comes back by code. `room.linkOnly`, and
+  `linkOnly` in the `access` event.
+
 ## 0.1.0-alpha.4 (2026-09-30)
 
 - **Host controls:** the room's host can run it like a game server. `room.kick(playerId, { ban?,

@@ -122,6 +122,8 @@ export interface RoomAccess {
   locked: boolean;
   /** Listed by `relay.listRooms` and open to quick match. */
   public: boolean;
+  /** Joined by its short link only (`room.shareLink()`), not its code; players with a seat can still come back. */
+  linkOnly: boolean;
   maxPlayers: number;
 }
 
@@ -334,6 +336,8 @@ function nextFrame(cb: () => void): void {
 
 /** Invite links carry the room code in this query parameter: `?room=CODE`. */
 const INVITE_PARAM = 'room';
+/** Short links (`room.shareLink()`) arrive with the link's id in this one: `?join=ZumXpZzDsgo`. */
+const LINK_PARAM = 'join';
 
 function pageUrl(): string {
   if (typeof location === 'undefined') throw new Error('[gamerelay] No page URL here; pass one');
@@ -473,18 +477,34 @@ export class GameRelay extends Emitter<RelayEvents> {
     return this.connected && !this.#resuming;
   }
 
-  createRoom(options: RoomOptions & { public?: boolean } = {}): Promise<Room> {
-    return this.#enter({ t: 'create_room', maxPlayers: options.maxPlayers, public: options.public, tag: options.tag });
+  /**
+   * A new room, with you in it. `public`: listed by `listRooms` and open to quick match. `linkOnly`:
+   * joined by its short link (`room.shareLink()`) only, not by its code, so nobody gets in by
+   * guessing one; players with a seat can still come back by code (a reload).
+   */
+  createRoom(options: RoomOptions & { public?: boolean; linkOnly?: boolean } = {}): Promise<Room> {
+    return this.#enter({ t: 'create_room', maxPlayers: options.maxPlayers, public: options.public, linkOnly: options.linkOnly || undefined, tag: options.tag });
   }
   joinRoom(code: string): Promise<Room> {
     return this.#enter({ t: 'join_room', code: code.trim().toUpperCase() });
   }
   /**
-   * Join the room in an invite link (`?room=CODE`, from `room.inviteUrl()`), or resolve `null` if
-   * the page has none. Rejects like `joinRoom` when the room is gone or full.
+   * Join the room a short link is for (`room.shareLink()`; `link` is its id, `ZumXpZzDsgo`). A
+   * link-only room is joined this way. Rejects with `room_not_found` once the room has closed.
+   */
+  joinLink(link: string): Promise<Room> {
+    return this.#enter({ t: 'join_link', link: link.trim() });
+  }
+  /**
+   * Join the room in an invite: a short link's `?join=<link>` (`room.shareLink()`) or an invite
+   * link's `?room=CODE` (`room.inviteUrl()`), or resolve `null` if the page has neither. Rejects
+   * like `joinRoom` when the room is gone or full.
    */
   async joinInvite(url?: string): Promise<Room | null> {
-    const code = new URL(url ?? pageUrl()).searchParams.get(INVITE_PARAM)?.trim();
+    const params = new URL(url ?? pageUrl()).searchParams;
+    const link = params.get(LINK_PARAM)?.trim();
+    if (link) return this.joinLink(link);
+    const code = params.get(INVITE_PARAM)?.trim();
     return code ? this.joinRoom(code) : null;
   }
   /** Join the oldest open public room, or create one. */
@@ -717,6 +737,9 @@ export class GameRelay extends Emitter<RelayEvents> {
     if (old && old.id !== info.id) old.closeLocal('left');
     else old?.dispose();
     this.room = new Room(this, info, this.playerId);
+    // In a page, the room's short link now: shareInvite() must share in the tap that asks for it
+    // (iOS refuses a share or a copy that waits on the network first).
+    if (typeof location !== 'undefined') void this.room.shareLink().catch(() => {});
     return this.room;
   }
 
@@ -1128,6 +1151,10 @@ export class Room extends Emitter<RoomEvents> {
   #live = true;
   #locked: boolean;
   #public: boolean;
+  #linkOnly: boolean;
+  /** The room's short link, once asked for (it's the same for the room's life), and once it's here. */
+  #shareLink: Promise<string> | null = null;
+  #shareUrl: string | null = null;
   #name: string | null;
   #meta: Json | null;
 
@@ -1150,6 +1177,7 @@ export class Room extends Emitter<RoomEvents> {
     this.seed = info.seed;
     this.#locked = info.locked ?? false;
     this.#public = info.public ?? false;
+    this.#linkOnly = info.linkOnly ?? false;
     this.#name = info.name ?? null;
     this.#meta = info.meta ?? null;
     const transport: SyncTransport = {
@@ -1249,6 +1277,11 @@ export class Room extends Emitter<RoomEvents> {
     return this.#public;
   }
 
+  /** Joined by its short link only (`shareLink`), not its code. */
+  get linkOnly(): boolean {
+    return this.#linkOnly;
+  }
+
   /** The room's name in room lists (`setListing`), or null. */
   get name(): string | null {
     return this.#name;
@@ -1273,10 +1306,11 @@ export class Room extends Emitter<RoomEvents> {
 
   /**
    * Host only: who may join. `locked`: nobody new (joining fails with `locked`); players in the room
-   * stay and can reconnect. `public`: listed and open to quick match. `maxPlayers`: 1–64, never
-   * below the players in the room. Omitted options stay as they are. Everyone gets an `access` event.
+   * stay and can reconnect. `public`: listed and open to quick match. `linkOnly`: joined by its short
+   * link only (`shareLink`), not its code. `maxPlayers`: 1–64, never below the players in the room.
+   * Omitted options stay as they are. Everyone gets an `access` event.
    */
-  async setAccess(access: { locked?: boolean; public?: boolean; maxPlayers?: number }): Promise<void> {
+  async setAccess(access: { locked?: boolean; public?: boolean; linkOnly?: boolean; maxPlayers?: number }): Promise<void> {
     this.#hostOnly('room.setAccess');
     const { maxPlayers } = access;
     if (maxPlayers !== undefined && (!Number.isInteger(maxPlayers) || maxPlayers < 1 || maxPlayers > LIMITS.maxPlayersPerRoom)) {
@@ -1285,7 +1319,7 @@ export class Room extends Emitter<RoomEvents> {
     if (maxPlayers !== undefined && maxPlayers < this.players.length) {
       throw new GameRelayError('bad_request', `room.setAccess: maxPlayers ${maxPlayers} is below the ${this.players.length} players in the room`);
     }
-    await this.#hostRequest({ t: 'set_access', locked: access.locked, public: access.public, maxPlayers });
+    await this.#hostRequest({ t: 'set_access', locked: access.locked, public: access.public, linkOnly: access.linkOnly, maxPlayers });
   }
 
   /**
@@ -1336,11 +1370,40 @@ export class Room extends Emitter<RoomEvents> {
   }
 
   /**
-   * Share the invite link: the share sheet on phones, the clipboard elsewhere. Resolves with what
-   * happened (`'cancelled'` if the player closed the share sheet).
+   * The room's short link: `https://gamerelay.io/<game>/<link>` when the game has a slug (set in
+   * the dashboard), which previews with the room's name and the game's cover image and sends
+   * players to the game's play URL with `?join=<link>`; otherwise this page's URL with
+   * `?join=<link>`. Either way `relay.joinInvite()` joins it. The same link for the room's life,
+   * and the way into a link-only room.
+   */
+  shareLink(): Promise<string> {
+    this.#shareLink ??= this.#relay.request({ t: 'share_link' }).then(
+      (data) => {
+        const { link, url } = (data ?? {}) as { link?: string; url?: string | null };
+        if (!link) throw new GameRelayError('internal', 'room.shareLink: the server sent no link');
+        if (url) return (this.#shareUrl = url);
+        const page = new URL(pageUrl());
+        page.searchParams.delete(INVITE_PARAM);
+        page.searchParams.set(LINK_PARAM, link);
+        return (this.#shareUrl = page.href);
+      },
+      (err: unknown) => {
+        this.#shareLink = null;
+        throw err;
+      },
+    );
+    return this.#shareLink;
+  }
+
+  /**
+   * Share the invite: the room's short link (`shareLink`, fetched when you entered the room), or
+   * its code's (`inviteUrl`) from a server without short links. The share sheet on phones, the clipboard elsewhere. Resolves with
+   * what happened (`'cancelled'` if the player closed the share sheet).
    */
   async shareInvite(text = 'Join my game'): Promise<'shared' | 'copied' | 'cancelled'> {
-    const url = this.inviteUrl();
+    // The link fetched on entering the room, so the share stays in the tap; only if it isn't here
+    // yet (or the server has no short links) does this wait, or fall back to the code's link.
+    const url = this.#shareUrl ?? (await this.shareLink().catch(() => this.inviteUrl()));
     if (typeof navigator.share === 'function' && matchMedia('(pointer: coarse)').matches) {
       try {
         await navigator.share({ title: document.title, text, url });
@@ -1828,8 +1891,8 @@ export class Room extends Emitter<RoomEvents> {
       this.fire('seed', info.seed, info.hostId);
     }
     // Host controls that changed while we were away.
-    const access: RoomAccess = { locked: info.locked ?? false, public: info.public ?? false, maxPlayers: info.maxPlayers };
-    if (access.locked !== this.#locked || access.public !== this.#public || access.maxPlayers !== this.maxPlayers) this.#setAccess(access, info.hostId);
+    const access: RoomAccess = { locked: info.locked ?? false, public: info.public ?? false, linkOnly: info.linkOnly ?? false, maxPlayers: info.maxPlayers };
+    if (access.locked !== this.#locked || access.public !== this.#public || access.linkOnly !== this.#linkOnly || access.maxPlayers !== this.maxPlayers) this.#setAccess(access, info.hostId);
     const listing: RoomListingInfo = { name: info.name ?? null, meta: info.meta ?? null };
     if (listing.name !== this.#name || JSON.stringify(listing.meta) !== JSON.stringify(this.#meta)) this.#setListing(listing, info.hostId);
     // Deliver chat that arrived while we were reconnecting.
@@ -1902,11 +1965,13 @@ export class Room extends Emitter<RoomEvents> {
     }
   }
 
-  #setAccess(access: RoomAccess, from: PlayerId): void {
+  #setAccess(access: Omit<RoomAccess, 'linkOnly'> & { linkOnly?: boolean }, from: PlayerId): void {
     this.#locked = access.locked;
     this.#public = access.public;
+    // An older server's `access` doesn't say: it has no link-only rooms.
+    this.#linkOnly = access.linkOnly ?? false;
     this.maxPlayers = access.maxPlayers;
-    this.fire('access', { locked: access.locked, public: access.public, maxPlayers: access.maxPlayers }, from);
+    this.fire('access', { locked: access.locked, public: access.public, linkOnly: this.#linkOnly, maxPlayers: access.maxPlayers }, from);
   }
 
   #setListing(listing: RoomListingInfo, from: PlayerId): void {

@@ -81,7 +81,10 @@ const room = (await relay.joinInvite().catch(() => null)) ?? (await relay.create
 history.replaceState(null, '', room.inviteUrl()); // the address bar is now the invite link
 ```
 
-`room.shareInvite()` opens the share sheet on phones and copies the link elsewhere.
+`room.shareInvite()` opens the share sheet on phones and copies the link elsewhere. It shares
+the room's short link, `https://gamerelay.io/<game>/<link>` once the game has a slug (set in the
+dashboard), which previews with the room's name and the game's cover image; `joinInvite()` joins
+it (`?join=`). `createRoom({ linkOnly: true })` makes a room that only its link gets into.
 
 ## Everything else
 
