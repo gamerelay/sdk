@@ -10,7 +10,7 @@ export type Delays = Record<string, number>;
 /** More relays than this in a peer's delays are ignored (a handful of regions is the plan). */
 const MAX_RELAYS = 16;
 const MAX_DELAY_MS = 10_000;
-/** A relay that hasn't answered a STUN ping in this long is too far to help. */
+/** A relay that hasn't answered a probe in this long is too far to help. */
 export const PROBE_MS = 1500;
 
 const urlsOf = (s: RTCIceServer): string[] => (Array.isArray(s.urls) ? s.urls : [s.urls]);
@@ -82,16 +82,43 @@ export interface ProbeDeps {
   timeoutMs?: number;
 }
 
+/** A relay's stream URLs, for networks where UDP doesn't get out: TLS first (on 443 it gets through the most), then TCP. */
+export function streamUrls(s: RTCIceServer): string[] {
+  const urls = urlsOf(s).filter((u) => u.includes('transport=tcp'));
+  return [...urls.filter((u) => u.startsWith('turns:')), ...urls.filter((u) => u.startsWith('turn:'))];
+}
+
+/** Round trips before a relay candidate arrives over a stream: TCP's handshake (and TLS 1.3's), a 401, the Allocate. */
+const STREAM_ROUND_TRIPS = { tls: 4, tcp: 3 };
+
 /**
- * The delay to a relay: how long until our public-address (srflx) candidate arrives, which takes
- * one STUN round trip to it. That candidate shows the page our own address; it is never sent to
- * anyone. `null`: no STUN URL, no answer before the timeout or the end of gathering, or no WebRTC.
+ * The delay to a relay, in one round trip's time. First by STUN over UDP: how long until our
+ * public-address (srflx) candidate arrives, which takes one round trip. That candidate shows the
+ * page our own address; it is never sent to anyone. Where UDP doesn't get out, by the relay's
+ * TLS (else TCP) URL: how long until a relay candidate arrives, divided by the round trips that
+ * takes, so it compares with another player's UDP timing. That makes a short-lived allocation, gone
+ * when the probe closes its connection. `null`: nothing answered before the timeout or the end of
+ * gathering, or no WebRTC.
  */
 export async function probeRelay(server: RTCIceServer, deps: ProbeDeps = {}): Promise<number | null> {
-  const urls = stunUrls(server);
-  if (urls.length === 0) return null;
+  const stun = stunUrls(server);
+  if (stun.length > 0) {
+    const ms = await firstCandidate({ iceServers: [{ urls: stun }] }, 'srflx', deps);
+    if (ms !== null) return ms;
+  }
+  const url = streamUrls(server)[0];
+  if (!url) return null;
+  const config: RTCConfiguration = {
+    iceServers: [{ urls: [url], username: server.username, credential: server.credential }],
+    iceTransportPolicy: 'relay',
+  };
+  const ms = await firstCandidate(config, 'relay', deps);
+  return ms === null ? null : Math.round(ms / STREAM_ROUND_TRIPS[url.startsWith('turns:') ? 'tls' : 'tcp']);
+}
+
+/** How long until the first candidate of type `typ` arrives with `config`, or null. */
+async function firstCandidate(config: RTCConfiguration, typ: 'srflx' | 'relay', deps: ProbeDeps): Promise<number | null> {
   const clock = deps.clock ?? (() => performance.now());
-  const config: RTCConfiguration = { iceServers: [{ urls }] };
   let pc: RTCPeerConnection;
   try {
     pc = deps.createPeer?.(config) ?? new RTCPeerConnection(config);
@@ -109,9 +136,9 @@ export async function probeRelay(server: RTCIceServer, deps: ProbeDeps = {}): Pr
         resolve(ms);
       };
       pc.onicecandidate = (ev) => {
-        if (!ev.candidate) return done(null); // gathering ended without an answer
+        if (!ev.candidate) return done(null); // gathering ended without one
         const parts = ev.candidate.candidate.split(' ');
-        if (parts[parts.indexOf('typ') + 1] === 'srflx') done(Math.round(clock() - start));
+        if (parts[parts.indexOf('typ') + 1] === typ) done(Math.round(clock() - start));
       };
       pc.setLocalDescription(offer).catch(() => done(null));
     });

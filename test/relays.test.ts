@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { delaysFrom, pickRelay, probeRelay, relayAddresses, relayKey, routeOf, rttOf, stunUrls } from '../src/sync/relays';
+import { delaysFrom, pickRelay, probeRelay, relayAddresses, relayKey, routeOf, rttOf, streamUrls, stunUrls } from '../src/sync/relays';
 
 const sf = { urls: ['turn:192.241.216.26:3478', 'turn:192.241.216.26:3478?transport=tcp'], username: 'u', credential: 'c' };
 const ny = { urls: ['turn:203.0.113.7:3478'], username: 'u', credential: 'c' };
@@ -131,8 +131,63 @@ describe('relays: timing a STUN ping', () => {
     const make = () => new Peer(() => {}) as unknown as RTCPeerConnection;
     expect(await probeRelay(sf, { createPeer: make, timeoutMs: 5 })).toBeNull();
     let made = 0;
-    expect(await probeRelay({ urls: ['turns:relay.example:443'] }, { createPeer: () => (made++, make()) })).toBeNull();
+    expect(await probeRelay({ urls: ['stun:relay.example:3478'] }, { createPeer: () => (made++, make()) })).toBeNull();
     expect(made).toBe(0);
+  });
+
+  const nyc = {
+    urls: ['turn:167.172.234.10:3478', 'turn:167.172.234.10:3478?transport=tcp', 'turns:turn-nyc.gamerelay.io:443?transport=tcp'],
+    username: 'u',
+    credential: 'c',
+  };
+
+  test('a relay’s stream URLs, TLS first', () => {
+    expect(streamUrls(nyc)).toEqual(['turns:turn-nyc.gamerelay.io:443?transport=tcp', 'turn:167.172.234.10:3478?transport=tcp']);
+    expect(streamUrls(ny)).toEqual([]);
+  });
+
+  test('where UDP is blocked, a relay is timed over TLS: its relay candidate, in round trips', async () => {
+    const clock = { t: 0 };
+    const peers: Peer[] = [];
+    const ms = await probeRelay(nyc, {
+      clock: () => clock.t,
+      createPeer: (config) => {
+        const udp = peers.length === 0;
+        const p = new Peer((p) => {
+          if (udp) return p.onicecandidate?.({ candidate: null }); // no srflx: UDP doesn't get out
+          clock.t += 120; // TCP, TLS 1.3, a 401 and the Allocate: 4 round trips of 30 ms
+          p.onicecandidate?.({ candidate: { candidate: 'candidate:3 1 udp 1 167.172.234.10 50000 typ relay raddr 0.0.0.0 rport 0' } });
+        });
+        p.config = config;
+        peers.push(p);
+        return p as unknown as RTCPeerConnection;
+      },
+    });
+    expect(ms).toBe(30);
+    expect(peers[1]!.config).toEqual({
+      iceServers: [{ urls: ['turns:turn-nyc.gamerelay.io:443?transport=tcp'], username: 'u', credential: 'c' }],
+      iceTransportPolicy: 'relay',
+    });
+    expect(peers.every((p) => p.closed)).toBe(true);
+    // Over plain TCP, 3 round trips.
+    clock.t = 0;
+    peers.length = 0;
+    const tcpOnly = { ...sf };
+    const viaTcp = await probeRelay(tcpOnly, {
+      clock: () => clock.t,
+      createPeer: (config) => {
+        const udp = peers.length === 0;
+        const p = new Peer((p) => {
+          if (udp) return p.onicecandidate?.({ candidate: null });
+          clock.t += 90;
+          p.onicecandidate?.({ candidate: { candidate: 'candidate:3 1 udp 1 192.241.216.26 50000 typ relay raddr 0.0.0.0 rport 0' } });
+        });
+        p.config = config;
+        peers.push(p);
+        return p as unknown as RTCPeerConnection;
+      },
+    });
+    expect(viaTcp).toBe(30);
   });
 });
 

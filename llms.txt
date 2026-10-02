@@ -569,6 +569,25 @@ await room.shareInvite()  // share sheet on phones, clipboard elsewhere: 'shared
   gesture. It rejects if copying isn't allowed (e.g. a page not served over https).
 - When the player leaves the room, clear the link: `history.replaceState(null, '', location.pathname)`.
 
+### Short links
+
+Every room also has a short link, the same for its life: `https://gamerelay.io/<game>/<link>`
+once the game's owner sets a slug and a play URL (dashboard → instance → Short links). It
+previews in Discord, iMessage and Slack with the room's name (`room.setListing`) and the game's
+cover image, and sends players to the play URL with `?join=<link>`, which `joinInvite()` joins.
+
+```js
+const link = await room.shareLink()  // 'https://gamerelay.io/my-game/ZumXpZzDsgo' (no slug: this page's URL + ?join=)
+await relay.joinLink('ZumXpZzDsgo')  // join by a link's id (joinInvite() reads ?join= for you)
+await relay.createRoom({ linkOnly: true })  // a room nobody joins by guessing its code: only by its link
+await room.setAccess({ linkOnly: false })   // host only: open it to its code again
+```
+
+- `shareInvite()` shares the short link (an older server's: the `?room=CODE` one).
+- A link-only room refuses its code with `room_not_found` (what a wrong code gets), except to a
+  player who already has a seat in it, so a reload still gets back in by code. `room.linkOnly`
+  says which it is, and the `access` event says when it changes.
+
 ## Lobby: tags, room lists, parties
 
 ```js

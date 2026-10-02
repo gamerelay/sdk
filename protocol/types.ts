@@ -65,6 +65,8 @@ export interface RoomInfo {
   locked?: boolean;
   /** Listed by `listRooms` and open to quick match. Absent from older servers. */
   public?: boolean;
+  /** Joined by its link only (`room.shareLink`), not its code: players with a seat can still come back by code. Absent from older servers. */
+  linkOnly?: boolean;
   /** What room lists show, set by the host (`room.setListing`). Absent until set. */
   name?: string;
   meta?: Json;
@@ -242,6 +244,8 @@ export interface SetAccessMsg extends Base<'set_access'> {
   /** No new players; players in the room stay, and a dropped one can still resume their seat. */
   locked?: boolean;
   public?: boolean;
+  /** Joined by its link only, not its code (players with a seat can still come back by code). */
+  linkOnly?: boolean;
   /** Never below the players seated now. */
   maxPlayers?: number;
 }
@@ -265,6 +269,8 @@ export interface CreateRoomMsg extends Base<'create_room'> {
   mode?: RoomMode;
   /** Public rooms are eligible for quick match and room lists. */
   public?: boolean;
+  /** Joined by its link only (`share_link`), not its code. */
+  linkOnly?: boolean;
   tag?: string;
 }
 export interface JoinRoomMsg extends Base<'join_room'> {
@@ -276,6 +282,18 @@ export interface JoinRoomMsg extends Base<'join_room'> {
    * giving it a fresh seat.
    */
   resume?: boolean;
+}
+/**
+ * The room's short link (one per room, the same every time): reply `{ link, url }`, where `link` is
+ * its id and `url` is `https://<server>/<game's slug>/<link>`, or null when the game has no slug.
+ */
+export interface ShareLinkMsg extends Base<'share_link'> {
+  rid: number;
+}
+/** Join the room a short link is for (`link`: its id): the reply is a join's. A link-only room is joined this way. */
+export interface JoinLinkMsg extends Base<'join_link'> {
+  rid: number;
+  link: string;
 }
 export interface QuickMatchMsg extends Base<'quick_match'> {
   rid: number;
@@ -341,6 +359,8 @@ export interface TurnMsg extends Base<'turn'> {
 export type LobbyClientMessage =
   | CreateRoomMsg
   | JoinRoomMsg
+  | ShareLinkMsg
+  | JoinLinkMsg
   | QuickMatchMsg
   | LeaveRoomMsg
   | KvGetMsg
@@ -471,6 +491,8 @@ export interface ClaimResultMsg extends Base<'claim_result'> {
 export interface AccessMsg extends Base<'access'> {
   locked: boolean;
   public: boolean;
+  /** Absent from older servers. */
+  linkOnly?: boolean;
   maxPlayers: number;
   from: PlayerId;
 }
