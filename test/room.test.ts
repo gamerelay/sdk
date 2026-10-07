@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import type { JsonObject, PlayerInfo, RoomInfo } from '@gamerelay/protocol/types';
 import { looksPositional } from '../src/debug/rate';
 import { Room, type GameRelay } from '../src/index';
+import { CREATE, control } from '../src/internal';
 
 const player = (id: string, slot: number): PlayerInfo => ({ id, name: id, avatar: null, joinedAt: slot, connected: true, slot });
 
@@ -22,9 +23,10 @@ function makeRoom(me: string, info: Partial<RoomInfo>) {
     warn: (_kind: string, key: string, message: string) => (warned.push(key), messages.push(message)),
     newEntityId: (kind: string) => `${kind}:t:1`,
     request: async (m: Record<string, unknown>) => void requests.push(m),
+    left: () => {},
   } as unknown as GameRelay;
   const full: RoomInfo = { id: 'r', code: 'ABCD', mode: 'relay', maxPlayers: 8, hostId: 'pa', players: [], state: {}, stateSeq: 0, chat: [], seed: 1, claims: {}, ...info };
-  return { room: new Room(relay, full, me), queued, requests, warned, messages, clock, step: () => loops.forEach((fn) => fn()) };
+  return { room: new Room(CREATE, relay as never, full, me), queued, requests, warned, messages, clock, step: () => loops.forEach((fn) => fn()) };
 }
 
 describe('Room resync', () => {
@@ -32,7 +34,7 @@ describe('Room resync', () => {
     const stale = { $teams: { pa: 0, pb: 1, pc: 0 }, $teamCount: 2 };
     const { room, queued } = makeRoom('pb', { hostId: 'pa', players: [player('pa', 0), player('pb', 1), player('pc', 2)], state: stale });
     const fresh = { $teams: { pa: 0, pb: 1, pc: 1, pd: 0 }, $teamCount: 2 };
-    room.sync({
+    control(room).sync({
       id: 'r', code: 'ABCD', mode: 'relay', maxPlayers: 8, hostId: 'pb', stateSeq: 5, chat: [], seed: 1, claims: {},
       players: [player('pa', 0), player('pb', 1), player('pc', 2), player('pd', 3)],
       state: fresh,
@@ -137,7 +139,7 @@ test('a state patch cannot reach the state object’s prototype: __proto__, cons
   const { room } = makeRoom('pb', { hostId: 'pa', players: [player('pa', 0), player('pb', 1)] });
   // As the server delivers it: parsed JSON, where `__proto__` is an own key like any other.
   const patch = JSON.parse('{"__proto__":{"isAdmin":true},"constructor":{"name":"x"},"prototype":1,"score":3}') as JsonObject;
-  room.handle({ v: 1, t: 'state', from: 'pa', patch, seq: 1 } as never);
+  control(room).handle({ v: 1, t: 'state', from: 'pa', patch, seq: 1 } as never);
   expect(room.state.score).toBe(3);
   expect(Object.getPrototypeOf(room.state)).toBe(Object.prototype);
   expect((room.state as Record<string, unknown>).isAdmin).toBeUndefined();
@@ -225,7 +227,7 @@ describe('host controls', () => {
 
   test('once the host role moves away, the controls refuse locally', async () => {
     const { room, requests } = host();
-    room.handle({ v: 1, t: 'host_changed', hostId: 'pb', previousHostId: 'pa' });
+    control(room).handle({ v: 1, t: 'host_changed', hostId: 'pb', previousHostId: 'pa' });
     await expect(room.setAccess({ locked: true })).rejects.toMatchObject({ code: 'not_host' });
     await expect(room.kick('pb')).rejects.toMatchObject({ code: 'not_host' });
     expect(requests).toEqual([]);
@@ -243,15 +245,15 @@ describe('host controls', () => {
     const seen: unknown[] = [];
     room.on('access', (access, from) => seen.push(['access', access, from]));
     room.on('listing', (listing, from) => seen.push(['listing', listing, from]));
-    room.handle({ v: 1, t: 'access', locked: true, public: true, maxPlayers: 6, from: 'pa' });
-    room.handle({ v: 1, t: 'listing', name: 'Dunes', meta: { phase: 'racing' }, from: 'pa' });
+    control(room).handle({ v: 1, t: 'access', locked: true, public: true, maxPlayers: 6, from: 'pa' });
+    control(room).handle({ v: 1, t: 'listing', name: 'Dunes', meta: { phase: 'racing' }, from: 'pa' });
     expect([room.locked, room.isPublic, room.maxPlayers, room.name, room.meta]).toEqual([true, true, 6, 'Dunes', { phase: 'racing' }]);
     expect(seen).toEqual([
       // An older server's access doesn't say linkOnly: it has none.
       ['access', { locked: true, public: true, linkOnly: false, maxPlayers: 6 }, 'pa'],
       ['listing', { name: 'Dunes', meta: { phase: 'racing' } }, 'pa'],
     ]);
-    room.handle({ v: 1, t: 'access', locked: false, public: false, linkOnly: true, maxPlayers: 6, from: 'pa' });
+    control(room).handle({ v: 1, t: 'access', locked: false, public: false, linkOnly: true, maxPlayers: 6, from: 'pa' });
     expect(room.linkOnly).toBe(true);
     expect(seen.at(-1)).toEqual(['access', { locked: false, public: false, linkOnly: true, maxPlayers: 6 }, 'pa']);
   });
@@ -262,11 +264,11 @@ describe('host controls', () => {
     room.on('access', () => seen.push('access'));
     room.on('listing', () => seen.push('listing'));
     const info: RoomInfo = { id: 'r', code: 'ABCD', mode: 'relay', maxPlayers: 8, hostId: 'pa', players, state: {}, stateSeq: 0, chat: [], seed: 1, claims: {} };
-    room.sync(info);
+    control(room).sync(info);
     expect(seen).toEqual([]);
-    room.sync({ ...info, locked: true });
+    control(room).sync({ ...info, locked: true });
     expect(seen).toEqual(['access']);
-    room.sync({ ...info, locked: true, meta: { lap: 3 } });
+    control(room).sync({ ...info, locked: true, meta: { lap: 3 } });
     expect(seen).toEqual(['access', 'listing']);
     expect([room.locked, room.meta]).toEqual([true, { lap: 3 }]);
   });

@@ -6,6 +6,7 @@ import { describe, expect, test } from 'bun:test';
 import type { Json, PlayerInfo, RoomInfo, ServerMessage } from '@gamerelay/protocol/types';
 import { Room, type GameRelay } from '../src/index';
 import type { Wrapped } from '../src/sync/lan';
+import { CREATE, control } from '../src/internal';
 
 const player = (id: string, slot: number): PlayerInfo => ({ id, name: id, avatar: null, joinedAt: slot, connected: true, slot });
 
@@ -29,12 +30,13 @@ function lanRoom(me: string, hostId = 'pa', stateSeq = 0, opts: { lan?: boolean;
     lanForceRelay: opts.forceRelay === true,
     lanDirect: opts.direct === true ? 'party' : null,
     party: opts.party ? { code: 'PRTY', leaderId: opts.party[0], members: opts.party.map((id) => ({ id, name: id, connected: true })) } : null,
+    left: () => {},
   } as unknown as GameRelay;
   const info: RoomInfo = {
     id: 'r', code: 'ABCD', mode: 'relay', maxPlayers: 8, hostId, stateSeq, chat: [], seed: 1, claims: {}, state: {},
     players: [player('pa', 0), player('pb', 1)],
   };
-  const room = new Room(relay, info, me);
+  const room = new Room(CREATE, relay as never, info, me);
   const broadcasts = () => queued.filter((m) => m.t === 'send' && m.to === undefined).map((m) => m.d as unknown as Wrapped);
   const last = () => broadcasts().at(-1)!;
   const step = () => loops.forEach((fn) => fn());
@@ -79,7 +81,7 @@ describe('LAN shortcut in Room: what sets a barrier', () => {
 
   test('the debug overlay gets LAN stats when lan is on', () => {
     const { room } = lanRoom('pa');
-    expect(room.debugInfo().lan).toEqual({ peers: 0, lanFirst: 0, serverFirst: 0, rttMs: {} });
+    expect(control(room).debugInfo().lan).toEqual({ peers: 0, lanFirst: 0, serverFirst: 0, rttMs: {} });
     expect(room.lanPeers()).toEqual([]);
   });
 
@@ -91,7 +93,7 @@ describe('LAN shortcut in Room: what sets a barrier', () => {
     ]) {
       const { room, last } = lanRoom('pb');
       room.send(1);
-      room.handle(event);
+      control(room).handle(event);
       room.send(2);
       expect(last().b, event.t).toBe(last().n);
     }
@@ -101,7 +103,7 @@ describe('LAN shortcut in Room: what sets a barrier', () => {
     const { room, last } = lanRoom('pb');
     room.send(1);
     expect(last().s).toBeUndefined();
-    room.handle(msg({ t: 'state', from: 'pa', patch: { round: 2 }, seq: 5 }));
+    control(room).handle(msg({ t: 'state', from: 'pa', patch: { round: 2 }, seq: 5 }));
     room.send(2);
     expect(last().b).toBeUndefined();
     expect(last().s).toBe(5);
@@ -111,7 +113,7 @@ describe('LAN shortcut in Room: what sets a barrier', () => {
     const { room, last } = lanRoom('pb', 'pa', 3);
     room.send(1);
     expect(last().s).toBe(3);
-    room.sync({ id: 'r', code: 'ABCD', mode: 'relay', maxPlayers: 8, hostId: 'pa', stateSeq: 8, chat: [], seed: 1, claims: {}, state: {}, players: [player('pa', 0), player('pb', 1)] });
+    control(room).sync({ id: 'r', code: 'ABCD', mode: 'relay', maxPlayers: 8, hostId: 'pa', stateSeq: 8, chat: [], seed: 1, claims: {}, state: {}, players: [player('pa', 0), player('pb', 1)] });
     room.send(2);
     expect(last().s).toBe(8);
   });
@@ -119,7 +121,7 @@ describe('LAN shortcut in Room: what sets a barrier', () => {
   test('a relayed message from another player is not a barrier (a known limit: see PLAN.md)', () => {
     const { room, last } = lanRoom('pb');
     room.send(1);
-    room.handle(msg({ t: 'message', from: 'pa', d: 'hi', at: 1000 }));
+    control(room).handle(msg({ t: 'message', from: 'pa', d: 'hi', at: 1000 }));
     room.send(2);
     expect(last().b).toBeUndefined();
   });
@@ -132,9 +134,9 @@ describe('LAN shortcut in Room: receiving', () => {
     const { room } = lanRoom('pb');
     const got: Json[] = [];
     room.on('ping', (d: Json) => got.push(d));
-    room.handle(wrapped(1, { $gr: 'e', n: 'ping', d: 'a' }));
-    room.handle(wrapped(1, { $gr: 'e', n: 'ping', d: 'a' }));
-    room.handle(wrapped(2, { $gr: 'e', n: 'ping', d: 'b' }));
+    control(room).handle(wrapped(1, { $gr: 'e', n: 'ping', d: 'a' }));
+    control(room).handle(wrapped(1, { $gr: 'e', n: 'ping', d: 'a' }));
+    control(room).handle(wrapped(2, { $gr: 'e', n: 'ping', d: 'b' }));
     expect(got).toEqual(['a', 'b']);
   });
 
@@ -142,10 +144,10 @@ describe('LAN shortcut in Room: receiving', () => {
     const { room } = lanRoom('pb');
     const got: Json[] = [];
     room.on('ping', (d: Json) => got.push(d));
-    for (let n = 1; n <= 3; n++) room.handle(wrapped(n, { $gr: 'e', n: 'ping', d: n }));
-    room.handle(msg({ t: 'player_left', playerId: 'pa', reason: 'timeout' }));
-    room.handle(msg({ t: 'player_joined', player: player('pa', 0) }));
-    for (let n = 1; n <= 4; n++) room.handle(wrapped(n, { $gr: 'e', n: 'ping', d: n }));
+    for (let n = 1; n <= 3; n++) control(room).handle(wrapped(n, { $gr: 'e', n: 'ping', d: n }));
+    control(room).handle(msg({ t: 'player_left', playerId: 'pa', reason: 'timeout' }));
+    control(room).handle(msg({ t: 'player_joined', player: player('pa', 0) }));
+    for (let n = 1; n <= 4; n++) control(room).handle(wrapped(n, { $gr: 'e', n: 'ping', d: n }));
     expect(got).toEqual([1, 2, 3, 4]);
   });
 
@@ -153,7 +155,7 @@ describe('LAN shortcut in Room: receiving', () => {
     const { room } = lanRoom('pb');
     const got: unknown[] = [];
     room.on('message', (d: Json) => got.push(d));
-    room.handle(msg({ t: 'message', from: 'pa', at: 1000, d: { $gr: 'lan', k: 'hi' } }));
+    control(room).handle(msg({ t: 'message', from: 'pa', at: 1000, d: { $gr: 'lan', k: 'hi' } }));
     expect(got).toEqual([]);
   });
 });
@@ -188,7 +190,7 @@ describe('LAN shortcut in Room: renegotiating', () => {
       const { room, queued } = lanRoom('pb');
       await Bun.sleep(0); // the server's answer about relays (none here)
       queued.length = 0;
-      room.sync({
+      control(room).sync({
         id: 'r', code: 'ABCD', mode: 'relay', maxPlayers: 8, hostId: 'pa', stateSeq: 0, chat: [], seed: 1, claims: {}, state: {},
         players: [player('pa', 0), player('pb', 1)],
       });
@@ -207,11 +209,11 @@ describe('LAN shortcut in Room: the host’s render time', () => {
     // As a guest: host entity samples ~40 ms old, a player's ~250 ms old.
     for (let i = 0; i < 60; i++) {
       clock.now += 50;
-      room.handle(msg({ t: 'message', from: 'pa', at: clock.now, d: { $gr: 'u', t: clock.now - 40, e: [['dot:x:1', 16, []]] } }));
-      room.handle(msg({ t: 'message', from: 'pc', at: clock.now, d: { $gr: 'u', t: clock.now - 250, e: [] } }));
+      control(room).handle(msg({ t: 'message', from: 'pa', at: clock.now, d: { $gr: 'u', t: clock.now - 40, e: [['dot:x:1', 16, []]] } }));
+      control(room).handle(msg({ t: 'message', from: 'pc', at: clock.now, d: { $gr: 'u', t: clock.now - 250, e: [] } }));
     }
     const asGuest = clock.now - room.renderTime;
-    room.handle(msg({ t: 'host_changed', hostId: 'pb', previousHostId: 'pa' }));
+    control(room).handle(msg({ t: 'host_changed', hostId: 'pb', previousHostId: 'pa' }));
     const asHost = clock.now - room.renderTime;
     expect(asGuest).toBeLessThan(200);
     expect(asHost).toBeGreaterThan(250);
@@ -223,11 +225,11 @@ describe('LAN shortcut in Room: the host’s render time', () => {
     // As a guest: host entity samples ~300 ms old, a player's ~40 ms old.
     for (let i = 0; i < 60; i++) {
       clock.now += 50;
-      room.handle(msg({ t: 'message', from: 'pa', at: clock.now, d: { $gr: 'u', t: clock.now - 300, e: [['dot:x:1', 16, []]] } }));
-      room.handle(msg({ t: 'message', from: 'pc', at: clock.now, d: { $gr: 'u', t: clock.now - 40, e: [] } }));
+      control(room).handle(msg({ t: 'message', from: 'pa', at: clock.now, d: { $gr: 'u', t: clock.now - 300, e: [['dot:x:1', 16, []]] } }));
+      control(room).handle(msg({ t: 'message', from: 'pc', at: clock.now, d: { $gr: 'u', t: clock.now - 40, e: [] } }));
     }
     expect(clock.now - room.renderTime).toBeGreaterThan(300);
-    room.handle(msg({ t: 'host_changed', hostId: 'pb', previousHostId: 'pa' }));
+    control(room).handle(msg({ t: 'host_changed', hostId: 'pb', previousHostId: 'pa' }));
     expect(clock.now - room.renderTime).toBeLessThan(200);
   });
 });
@@ -330,7 +332,7 @@ describe('LAN shortcut in Room: relays', () => {
       step();
       expect(asked).toBe(2);
       await Bun.sleep(0);
-      room.handle(offerFrom('pa', 'g1'));
+      control(room).handle(offerFrom('pa', 'g1'));
       await Bun.sleep(0);
       expect(configs.at(-1)!.iceServers).toEqual([{ urls: ['turn:relay.example:3478'], username: 'first', credential: 'c' }]);
     }));
@@ -342,7 +344,7 @@ describe('LAN shortcut in Room: relays', () => {
       let asked = 0;
       const { room, clock, step } = lanRoom('pb', 'pa', 0, { request: async () => ({ ice: [answers[asked++]!] }) });
       await Bun.sleep(0);
-      room.handle(offerFrom('pa', 'g1'));
+      control(room).handle(offerFrom('pa', 'g1'));
       await Bun.sleep(0);
       live[0]!.channel.onopen?.();
       clock.now += 21 * 60 * 1000;
@@ -361,7 +363,7 @@ describe('LAN shortcut in Room: relays', () => {
       clock.now += 21 * 60 * 1000;
       step();
       expect(asked).toBe(1);
-      room.handle(offerFrom('pa', 'g1'));
+      control(room).handle(offerFrom('pa', 'g1'));
       await Bun.sleep(0);
       expect(configs.at(-1)).toEqual({ iceServers: [] });
     }));
@@ -380,7 +382,7 @@ describe('LAN shortcut in Room: relays', () => {
       for (const [opts, allowed, servers] of cases) {
         const { room } = lanRoom('pb', 'pa', 0, { ...opts, request: async () => ({ ice: relays, ...(allowed === undefined ? {} : { direct: allowed }) }) });
         await Bun.sleep(0);
-        room.handle(offerFrom('pa', 'g1'));
+        control(room).handle(offerFrom('pa', 'g1'));
         await Bun.sleep(0);
         expect(configs.at(-1)!.iceServers).toEqual(withStun.slice(0, servers));
       }
@@ -392,7 +394,7 @@ describe('LAN shortcut in Room: relays', () => {
       let allowed = true;
       const { room, queued, clock, step } = lanRoom('pb', 'pa', 0, { direct: true, party: ['pa', 'pb'], request: async () => ({ ice: relays, direct: allowed }) });
       await Bun.sleep(0);
-      room.handle(offerFrom('pa', 'g1'));
+      control(room).handle(offerFrom('pa', 'g1'));
       await Bun.sleep(0);
       expect(configs.at(-1)!.iceServers).toHaveLength(2);
       queued.length = 0;
@@ -401,7 +403,7 @@ describe('LAN shortcut in Room: relays', () => {
       step();
       await Bun.sleep(0);
       expect(lanSignals(queued)).toEqual([['pa', 'hi']]); // started over, without public addresses
-      room.handle(offerFrom('pa', 'g2'));
+      control(room).handle(offerFrom('pa', 'g2'));
       await Bun.sleep(0);
       expect(configs.at(-1)!.iceServers).toEqual(relays);
     }));
@@ -412,7 +414,7 @@ describe('LAN shortcut in Room: relays', () => {
       let asked = 0;
       const { room, queued, clock, step } = lanRoom('pb', 'pa', 0, { direct: true, party: ['pa', 'pb'], request: async () => (asked++, { ice: [], direct: allowed }) });
       await Bun.sleep(0);
-      room.handle(offerFrom('pa', 'g1'));
+      control(room).handle(offerFrom('pa', 'g1'));
       await Bun.sleep(0);
       expect(configs.at(-1)).toEqual({ iceServers: [] });
       queued.length = 0;

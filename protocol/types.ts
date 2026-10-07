@@ -6,6 +6,7 @@
  * `t` is the message type.
  */
 
+
 export const PROTOCOL_VERSION = 1 as const;
 export type ProtocolVersion = typeof PROTOCOL_VERSION;
 
@@ -133,6 +134,8 @@ export interface PartyInfo {
 
 export type ErrorCode =
   | 'bad_request'
+  /** This client is older than the server accepts; the socket closes with `CLOSE.upgradeRequired`. */
+  | 'upgrade_required'
   | 'unauthorized'
   | 'rate_limited'
   | 'too_large'
@@ -404,6 +407,10 @@ export interface WelcomeMsg extends Base<'welcome'> {
   serverTime: number;
   /** This connection's frame key, masked with `playerId` (`sign.ts`). Every client frame is signed with it. */
   k: string;
+  /** The server's version (as `/healthz` shows it). */
+  server?: string;
+  /** Things the developer should know (an SDK below the recommended version, …): shown in the console. */
+  notices?: Notice[];
 }
 /** An `RTCIceServer`, as JSON. */
 export interface IceServer {
@@ -523,6 +530,16 @@ export interface RemovedMsg extends Base<'removed'> {
 }
 export interface ServerRestartingMsg extends Base<'server_restarting'> {
   reconnectInMs: number;
+  /**
+   * Reconnect here instead (a WebSocket URL, as the token response's `wsUrl`), keeping the token
+   * and seat: another region, or a server being drained. Only sent to clients with the `moved` cap.
+   */
+  url?: string;
+}
+
+/** A notice for the developer, sent at any time (clients with the `notices` cap). */
+export interface NoticeMsg extends Base<'notice'> {
+  notice: Notice;
 }
 
 export type ServerMessage =
@@ -546,6 +563,7 @@ export type ServerMessage =
   | ListingMsg
   | PongMsg
   | ServerRestartingMsg
+  | NoticeMsg
   | PartyMsg
   | PartyRoomMsg
   | RemovedMsg
@@ -557,3 +575,17 @@ export interface ServerBatchMsg extends Base<'batch'> {
 }
 
 export type ServerMessageType = ServerMessage['t'];
+
+/**
+ * Something the developer should know about, shown in the console by SDKs with the `notices` cap:
+ * in `welcome.notices` at connect, or as a `notice` message at any time.
+ */
+export interface Notice {
+  /** Stable, e.g. `sdk_deprecated`: SDKs show each code once per page, and the docs explain it. */
+  code: string;
+  message: string;
+  /** `YYYY-MM-DD` when it stops working, if known. */
+  until?: string;
+  /** Where to read more. */
+  url?: string;
+}

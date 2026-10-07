@@ -11,7 +11,10 @@ export type WarningKind =
   | 'event_name'
   | 'request'
   | 'claims'
-  | 'set_state';
+  | 'set_state'
+  /** Something the server told the developer: an old SDK, a host it won't follow, … */
+  | 'notice'
+  | 'invite';
 
 /**
  * Every warning the SDK can print, and the llms.txt section that explains its fix. Typed
@@ -31,6 +34,8 @@ export const SECTIONS: Readonly<Record<WarningKind, string>> = {
   request: 'Requests to the host',
   claims: 'Claims: take something exactly once',
   set_state: 'State and timers',
+  notice: 'Versions',
+  invite: 'Invite links',
 };
 
 /** Console warnings written for the LLM that will read them: each key prints once, then counts. */

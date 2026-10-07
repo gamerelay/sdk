@@ -66,9 +66,10 @@ export class FakeSocket {
     this.onmessage?.({ data: JSON.stringify({ v: 1, ...msg }) });
   }
 
-  welcome(playerId = 'pa', serverTime = Date.now()): void {
+  /** `extra`: more welcome fields (`server`, `notices`, …). */
+  welcome(playerId = 'pa', serverTime = Date.now(), extra: Record<string, unknown> = {}): void {
     this.readyState = 1;
-    this.deliver({ t: 'welcome', playerId, features: {}, resumeGraceMs: LIMITS.resumeGraceMs, serverTime, k: maskKey([1, 2, 3, 4], playerId) });
+    this.deliver({ t: 'welcome', playerId, features: {}, resumeGraceMs: LIMITS.resumeGraceMs, serverTime, k: maskKey([1, 2, 3, 4], playerId), ...extra });
   }
 
   /** Answer every ping sent so far that hasn't had its pong, as a server at `serverTime` would. */

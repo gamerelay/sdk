@@ -38,14 +38,14 @@ export class Timers {
   }
 
   set(name: string, ms: number): void {
-    if (!this.#d.isHost()) throw bad(`room.timer('${name}'): only the host can start timers; check room.isHost`);
+    if (!this.#d.isHost()) throw new GameRelayError('not_host', `room.timer('${name}'): only the host can start timers; check room.isHost`);
     if (typeof name !== 'string' || !NAME.test(name)) throw bad(`room.timer: '${name}' isn't a valid timer name (a letter, then letters, digits, _ : . -)`);
     if (!(Number.isFinite(ms) && ms >= 0)) throw bad(`room.timer('${name}', ms): ms must be a number of milliseconds, 0 or more`);
     this.#d.setState({ [TIMERS_KEY]: { ...this.#all(), [name]: Math.round(this.#d.now() + ms) } });
   }
 
   clear(name: string): void {
-    if (!this.#d.isHost()) throw bad(`room.clearTimer('${name}'): only the host can clear timers`);
+    if (!this.#d.isHost()) throw new GameRelayError('not_host', `room.clearTimer('${name}'): only the host can clear timers`);
     const { [name]: _gone, ...rest } = this.#all();
     void _gone;
     this.#d.setState({ [TIMERS_KEY]: rest });

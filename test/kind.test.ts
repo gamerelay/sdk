@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import type { JsonObject, PlayerInfo, RoomInfo } from '@gamerelay/protocol/types';
 import { Room, type GameRelay } from '../src/index';
+import { CREATE, control } from '../src/internal';
 
 const player = (id: string, slot: number): PlayerInfo => ({ id, name: id, avatar: null, joinedAt: slot, connected: true, slot });
 
@@ -18,9 +19,10 @@ function makeRoom() {
     warn: (_kind: string, key: string) => warns.push(key),
     newEntityId: (kind: string) => `${kind}:t:${++seq}`,
     request: async () => undefined,
+    left: () => {},
   } as unknown as GameRelay;
   const info: RoomInfo = { id: 'r', code: 'ABCD', mode: 'relay', maxPlayers: 8, hostId: 'pa', players: [player('pa', 0)], state: {}, stateSeq: 0, chat: [], seed: 1, claims: {} };
-  return { room: new Room(relay, info, 'pa'), queued, warns };
+  return { room: new Room(CREATE, relay as never, info, 'pa'), queued, warns };
 }
 
 describe('kind handles (room.define returns one)', () => {
@@ -85,7 +87,7 @@ describe('kind handles (room.define returns one)', () => {
   test('a handle from a room you left throws, saying to define again', () => {
     const { room } = makeRoom();
     const ships = room.define('ship', { x: 'number' });
-    room.dispose();
+    control(room).dispose();
     expect(() => ships.all()).toThrow(/belongs to a room you left; call room\.define\('ship', …\) again/);
     expect(() => ships.spawn({ x: 0 })).toThrow(/belongs to a room you left/);
   });

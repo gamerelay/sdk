@@ -6,6 +6,8 @@ export const LIMITS = {
   maxBatchSize: 64,
   maxJsonDepth: 16,
   maxKvKeyLength: 128,
+  /** Saved data per player, all keys together (the stored JSON's UTF-8 bytes). */
+  maxKvBytesPerPlayer: 64 * 1024,
   maxLeaderboardNameLength: 32,
   /** Distinct leaderboards per game instance. */
   maxLeaderboards: 32,
