@@ -143,6 +143,8 @@ export class Requests {
     if (!handler) return { e: `the host has no room.onRequest('${type}', …) handler` };
     try {
       const result = await handler(data, from);
+      // `return room.reject('why')` refuses too: the natural guess, and resolving with `{ reason }` would be a silent bug.
+      if (result instanceof RequestRejection) return { e: result.reason };
       const json = JSON.stringify(result ?? null) as string | undefined;
       if (json === undefined) return { e: `the host's room.onRequest('${type}') handler returned something that isn't JSON` };
       return { d: JSON.parse(json) as Json };

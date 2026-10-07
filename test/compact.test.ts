@@ -14,7 +14,7 @@ test('a player who joins in the same batch as our join’s reply is in the room,
   done = fake.done;
   const { relay } = fake;
   const socket = fake.socket();
-  expect(socket.url).toContain('compact=1');
+  expect(socket.url).toMatch(/[?&]caps=(?:[a-z]+,)*compact\b/);
   const joining = relay.createRoom();
   await settle();
   const rid = socket.sentOf('create_room').at(-1)!.rid;

@@ -4,6 +4,68 @@ Every release of `@gamerelay/sdk`, newest first. The notes under a version's hea
 GitHub release. Until 1.0, a minor version (0.x.0) may change the API; each break is listed
 here with what to change.
 
+## 0.1.0-alpha.6 (2026-10-07)
+
+- **Versions:** `https://gamerelay.io/sdk/v0/gamerelay.js` (and `.mjs`) is the `v0` line, which only
+  changes in ways that keep games working (a rename keeps the old name as a deprecated alias for at
+  least 30 days); `/sdk/gamerelay.js` stays on `v0` forever. Pin an exact version through jsDelivr
+  (`https://cdn.jsdelivr.net/npm/@gamerelay/sdk@<version>/dist/gamerelay.js`).
+  `GameRelay.version` is the SDK's version. llms.txt: "Versions".
+- **The SDK tells the server what it is** (`sdk=js/<version>`, `caps=` on the socket URL), and shows
+  the server's notices once in the console (e.g. "this SDK version is old"). A version the server
+  no longer accepts makes `connect()` reject with `upgrade_required`, and the SDK stops retrying.
+- **Where to connect comes from the server:** the token response's `wsUrl`, and a restart notice
+  can move players to another host (same token, same seat). Only GameRelay hosts, or your own
+  server's site, are followed.
+- **`getToken` may return the whole `POST /v1/auth/token` response** (`{ token, expiresAt, wsUrl }`)
+  instead of just the token.
+- **Experimental:** `relay.serverInfo` (the server's version, for debugging).
+- **Docs:** rooms' short links are on their own host now, `https://play.gamerelay.io/<game>/<link>`
+  (alpha.5's notes said `gamerelay.io/<game>/<link>`). Nothing to change in a game: the URL comes
+  from the server.
+- **Break missed in alpha.5's notes:** `room.shareInvite()` shares the short link, so a friend
+  arrives with `?join=<link>`, not `?room=CODE`. A game that reads `?room=` itself needs
+  `relay.joinInvite()` (it reads both) to get them in.
+- **Fix:** `room.shareInvite()` in a link-only room rejects when it can't get the room's link,
+  instead of sharing the code's link (`inviteUrl()`), which gets nobody in.
+- **API freeze** (what `v0` promises; SDK_PLAN.md §5):
+  - **`relay.close()` closes everything:** the room gets `closed` (`'left'`), `room.request()` and
+    `room.claim()` still waiting settle, and no timer or listener is left. `replaced` and a refused
+    SDK version stop the same way (the room's `closed` says `'lost'`). `relay.tick()` on a closed
+    relay throws.
+  - **Every rejection is a `GameRelayError`** with a `code` (exported type `GameRelayErrorCode`):
+    offline, `connect()` rejects `disconnected` (was a `TypeError` with no code); no answer in 15 s,
+    `timeout`; `shareInvite()` without a clipboard, `unsupported`.
+  - **Reconnecting says why it can't:** `relay.on('error')` gets `at_capacity` / `quota_exceeded`
+    (it keeps trying) or `unauthorized` (a rotated key, a deleted game: it stops, and the room
+    closes `'lost'`). A server error mid-deploy (a 502) is retried quietly, no longer treated as
+    `unauthorized`.
+  - **A secret key (`gr_sk_`) as `publicKey` is refused** before anything is sent.
+  - **`return room.reject('why')`** from an `onRequest` handler refuses, like `throw` (it resolved
+    the caller with `{ reason }`).
+  - **Read-only fields:** `relay.playerId/room/party/features` and `room.hostId/players/state/seed/
+    maxPlayers/chatHistory` are getters (assigning throws, and `players`/`chatHistory` can't be
+    changed in place). Writing `room.state.x = …` warns (by the next frame): it changes only your
+    copy; the host uses `room.setState`.
+  - **Internals are out of reach:** `relay.request/queue/warn`, `room.handle/sync/closeLocal/
+    debugInfo` and the rest are gone from the objects; `new GameRelay()` and `new Room()` throw
+    (use `GameRelay.connect`); the `GameRelayRoom` global and the `setDefaultUrl` export are gone.
+  - **`GameRelay.seededRandom`** works in the npm build too (it was script-tag only).
+  - **One invite link:** `room.inviteUrl()` of a link-only room is `?join=<link>`, which gets in
+    (it was `?room=CODE`, which doesn't). The link is asked for as you enter (`joinLink` knows it
+    already); until it arrives, `inviteUrl()` warns: `await room.shareLink()` first.
+  - **Names:** `room.holder(key)` (was `claimed(key)`, which still works); the relay event
+    `party_room` (`room` still fires); `relay.listRooms({ tag, includeFull })` beside the
+    positional form; non-host `room.timer`/`clearTimer` throw `not_host` (was `bad_request`);
+    `access` and `listing` are reserved event names; `relay.on('player_joined')` and other
+    unknown relay events warn. New types: `CreateRoomOptions`, `LeaveReason`, `PartyMember`.
+  - **Experimental, outside the promise:** player to player (`p2p`, the new name of `lan`, which
+    still works; `room.p2pPeers/p2pRoute`), `relay.joinOrCreate({ maxPlayers, tag, private,
+    updateUrl })`, `relay.features`, `relay.serverInfo`, a field's `smooth`.
+  - **Soft-deprecated (JSDoc only, no warning):** `room.spawn/all/get` and `room.on('spawn' |
+    'remove', kind, …)`; use the kind handle from `room.define`.
+  - **Size:** about 32 KB gzipped (was 30).
+
 ## 0.1.0-alpha.5 (2026-10-01)
 
 - **Short links:** `room.shareLink()` is the room's link, the same for its life:

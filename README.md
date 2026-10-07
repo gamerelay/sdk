@@ -10,13 +10,14 @@ Multiplayer for browser games, without writing a server. You declare what exists
 and who owns it; the SDK sends it, smooths it for everyone else, gives it to players who join
 late, and hands the host's share to another player when the host leaves. Rooms, quick match,
 invite links, parties, chat, saved player data and leaderboards come with it. Zero dependencies,
-fully typed, about 28 KB gzipped.
+fully typed, about 32 KB gzipped.
 
 **Docs:** [gamerelay.io/docs](https://gamerelay.io/docs) · **Guide for AI tools:**
 [gamerelay.io/llms.txt](https://gamerelay.io/llms.txt) (also in this package as `llms.txt`) ·
 **Demo:** [gamerelay.io/demo](https://gamerelay.io/demo/)
 
-> **Alpha.** The API may still change between `0.x` releases.
+> **Alpha.** Within `0.x` (the `v0` line), nothing is removed or renamed without a deprecation
+> first: the old name keeps working, and warns, for at least 30 days. See [Versions](#versions).
 
 ## Install
 
@@ -82,9 +83,19 @@ history.replaceState(null, '', room.inviteUrl()); // the address bar is now the 
 ```
 
 `room.shareInvite()` opens the share sheet on phones and copies the link elsewhere. It shares
-the room's short link, `https://gamerelay.io/<game>/<link>` once the game has a slug (set in the
-dashboard), which previews with the room's name and the game's cover image; `joinInvite()` joins
+the room's short link, `https://play.gamerelay.io/<game>/<link>` once the game has a slug and a
+play URL (set in the dashboard), which previews with the room's name and the game's cover image; `joinInvite()` joins
 it (`?join=`). `createRoom({ linkOnly: true })` makes a room that only its link gets into.
+
+## Versions
+
+`https://gamerelay.io/sdk/v0/gamerelay.js` (and `.mjs`) is the `v0` line and updates in place;
+`/sdk/gamerelay.js` is the same line, forever. To pin one exact version, load it from npm through
+jsDelivr: `https://cdn.jsdelivr.net/npm/@gamerelay/sdk@0.1.0-alpha.6/dist/gamerelay.js`.
+`GameRelay.version` is the running version. The server may print a notice in the console
+(`[gamerelay] …`) when a version gets old; one it no longer accepts makes `connect()` reject with
+`upgrade_required`. Every rejection is a `GameRelayError` with a `code`. What changed in each
+release, and what to change in a game, is in [CHANGELOG.md](https://github.com/gamerelay/sdk/blob/main/CHANGELOG.md).
 
 ## Everything else
 

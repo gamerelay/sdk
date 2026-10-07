@@ -167,6 +167,6 @@ describe('claims shared with the other docs', () => {
     expect(ROOM_EVENTS).toContain('player_joined');
     expect(ROOM_EVENTS).toContain('host');
     expect(RELAY_EVENTS).toContain('replaced');
-    expect(INTERNAL).toContain('debugInfo');
+    expect([...INTERNAL]).toEqual(['constructor']); // the rest is out of reach (src/internal.ts)
   });
 });

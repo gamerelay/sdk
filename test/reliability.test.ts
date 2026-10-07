@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, jest, spyOn, test } from 'bun:test';
 import { GameRelayError } from '../src/index';
 import { FakeSocket, advance, answerRoom, connectFake, settle } from './fakeRelay';
+import { linkOf } from '../src/internal';
 
 /** The SDK's REPLY_TIMEOUT_MS. */
 const REPLY_TIMEOUT_MS = 10_000;
@@ -243,8 +244,8 @@ describe('the outbox while offline', () => {
     const { relay, socket, reopen } = await setup();
     socket().drop();
     await settle();
-    for (let i = 0; i < 250; i++) relay.queue({ t: 'send', d: i });
-    for (let i = 0; i < 20; i++) relay.queue({ t: 'heartbeat' }); // a host's, while its rejoin waits
+    for (let i = 0; i < 250; i++) linkOf(relay).queue({ t: 'send', d: i });
+    for (let i = 0; i < 20; i++) linkOf(relay).queue({ t: 'heartbeat' }); // a host's, while its rejoin waits
     await advance(100);
     const back = await reopen();
     await advance(3000); // (more than the rate limit's burst: some of it waits for the budget)
@@ -256,7 +257,7 @@ describe('the outbox while offline', () => {
     const { relay, socket, reopen } = await setup();
     socket().drop();
     await settle();
-    for (let i = 0; i < 300; i++) relay.queue({ t: 'send', d: i });
+    for (let i = 0; i < 300; i++) linkOf(relay).queue({ t: 'send', d: i });
     await advance(100);
     const back = await reopen();
     await advance(3000);
@@ -269,8 +270,8 @@ describe("the server's rate limit", () => {
     const { relay, socket } = await setup();
     const s = socket();
     for (let i = 0; i < 300; i++) {
-      relay.queue({ t: 'send', d: i });
-      if (i % 15 === 0) relay.queue({ t: 'send', d: `pos${i}`, r: false }); // plain entity updates
+      linkOf(relay).queue({ t: 'send', d: i });
+      if (i % 15 === 0) linkOf(relay).queue({ t: 'send', d: `pos${i}`, r: false }); // plain entity updates
     }
     await advance(20);
     expect(s.dropped).toEqual([]);
@@ -283,7 +284,7 @@ describe("the server's rate limit", () => {
 
   test('within the budget, everything goes out at once, unreliable sends included', async () => {
     const { relay, socket } = await setup();
-    for (let i = 0; i < 100; i++) relay.queue({ t: 'send', d: i, r: i % 2 === 0 ? false : undefined });
+    for (let i = 0; i < 100; i++) linkOf(relay).queue({ t: 'send', d: i, r: i % 2 === 0 ? false : undefined });
     await advance(20);
     expect(socket().sentOf('send').length).toBe(100);
   });
@@ -297,9 +298,9 @@ describe('sends from a relay.tick step', () => {
     let step = 0;
     relay.tick(60, (_dt, n) => {
       step = n;
-      relay.queue({ t: 'send', d: `a${n}` });
+      linkOf(relay).queue({ t: 'send', d: `a${n}` });
     });
-    relay.tick(60, (_dt, n) => relay.queue({ t: 'send', d: `b${n}` }));
+    relay.tick(60, (_dt, n) => linkOf(relay).queue({ t: 'send', d: `b${n}` }));
     // Timer by timer up to the first step, so the frame flush's timer hasn't run yet.
     for (let i = 0; i < 100 && step === 0; i++) jest.advanceTimersToNextTimer();
     await settle();

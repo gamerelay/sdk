@@ -5,6 +5,9 @@
 import { LIMITS } from '@gamerelay/protocol/limits';
 import { normalizeChat, normalizeLine } from '@gamerelay/protocol/chat';
 import { signFrame, unmaskKey, type FrameKey } from '@gamerelay/protocol/sign';
+import { CLOSE, type Notice } from '@gamerelay/protocol/clients';
+import { SDK_VERSION } from './version';
+import { followable } from './core/hosts';
 import { attempt, safeStorage } from '@gamerelay/protocol/util';
 import {
   PLAN_FEATURES,
@@ -19,15 +22,16 @@ import {
   type LeaderboardSubmitResult,
   type LeaveReason,
   type PartyInfo,
+  type PartyMember,
   type PlanFeatures,
   type PlayerId,
   type RoomListing,
   type PlayerInfo,
-  type RoomClientMessage,
   type RoomInfo,
   type ServerMessage,
 } from '@gamerelay/protocol/types';
-import { GameRelayError } from './errors';
+import { GameRelayError, type GameRelayErrorCode } from './errors';
+import { CREATE, DEBUG, defaults, relays, rooms, type Outgoing, type RelayLink, type Request, type RoomControl, type RoomDebugInfo } from './internal';
 import { Ticker, pickScheduler } from './core/ticker';
 import { MAX_BATCH, PACE_PER_SECOND, SendBudget } from './core/budget';
 import type { FieldInput } from './core/codec';
@@ -45,9 +49,10 @@ import { RequestRejection, Requests } from './sync/requests';
 import { TEAMS_KEY, TEAM_COUNT_KEY, balanceTeams } from './sync/teams';
 import { Timers } from './sync/timers';
 import type { SyncTransport } from './sync/transport';
-import { Lan, isSignal, isWrapped, type LanStats } from './sync/lan';
+import { Lan, isSignal, isWrapped } from './sync/lan';
 
 export { GameRelayError };
+export type { GameRelayErrorCode };
 export type { Entity, EntityBase, RemoveReason, DefineOptions, SpawnOptions } from './sync/entities';
 export type { Kind, KindEntity, FieldValues } from './sync/kind';
 export type { FieldInput, FieldType } from './core/codec';
@@ -67,7 +72,23 @@ export type {
   LeaderboardOrder,
   LeaderboardPage,
   LeaderboardSubmitResult,
+  LeaveReason,
+  PartyMember,
 };
+
+/** What `POST /v1/auth/token` (and `/v1/auth/anonymous`) answer with; `getToken` may return it whole. */
+export interface TokenResponse {
+  token: string;
+  expiresAt?: number;
+  /** Where to connect (`wss://…/ws`). */
+  wsUrl?: string;
+}
+
+/** What the server says about itself in `welcome` (for debugging). Experimental. */
+export interface ServerInfo {
+  /** The server's version. */
+  version: string | null;
+}
 
 export interface ConnectOptions {
   /** Your instance's public key (`gr_pub_…`). Required unless `getToken` is given. */
@@ -80,8 +101,12 @@ export interface ConnectOptions {
   playerAvatar?: string;
   /** Server origin. Defaults to the origin the SDK script was loaded from, else https://gamerelay.io */
   url?: string;
-  /** Supply tokens minted by your own backend (secret key) instead of anonymous ones. */
-  getToken?: () => Promise<string>;
+  /**
+   * Supply tokens minted by your own backend (secret key) instead of anonymous ones. Return the
+   * token, or simply the whole response `POST /v1/auth/token` gave your backend
+   * (`{ token, expiresAt, wsUrl }`): then the SDK also connects where the server said.
+   */
+  getToken?: () => Promise<string | TokenResponse>;
   /**
    * Development only: simulate a bad network. `latency` is extra round-trip ms (half each way),
    * `jitter` ± ms per message (order is kept, as on a real socket), `loss` the share (0–1) of
@@ -91,18 +116,25 @@ export interface ConnectOptions {
   /** Show a small overlay (ping, smoothing, traffic, entities, warnings). For development. */
   debug?: boolean;
   /**
-   * Experimental, on by default: players also send broadcasts straight to each other over WebRTC,
-   * racing the server's copy, so each pair takes its best route: directly on the same network, else
-   * through the server's nearest TURN relay, when it has relays. Everything still goes through the
-   * server as well. Nobody sees another player's public address. `false` turns it off. `{ forceRelay: true }`: through the relay only, even on
-   * one network (for testing the relay). `{ direct: 'party' }` (experimental): members of your party
-   * may also connect straight to each other over the internet, which shows each of them the
-   * other's public IP address; everyone else still goes through the relay. It also needs the
-   * instance's "Direct connections" setting on (dashboard; off by default). Ask each player first,
-   * and don't use it in games children under 13 may play.
+   * Player to player, on by default. Experimental: outside the API promise, it may change in a
+   * minor release. Players also send broadcasts straight to each other over WebRTC, racing the
+   * server's copy, so each pair takes its best route: directly on the same network, else through
+   * the server's nearest TURN relay, when it has relays. Everything still goes through the server
+   * as well. Nobody sees another player's public address. `false` turns it off.
+   * `{ forceRelay: true }`: through the relay only, even on one network (for testing the relay).
+   * `{ direct: 'party' }`: members of your party may also connect straight to each other over the
+   * internet, which shows each of them the other's public IP address; everyone else still goes
+   * through the relay. It also needs the instance's "Direct connections" setting on (dashboard;
+   * off by default). Ask each player first, and don't use it in games children under 13 may play.
+   * @experimental
    */
-  lan?: boolean | { forceRelay?: boolean; direct?: 'party' };
+  p2p?: P2POptions;
+  /** @deprecated The old name of `p2p` (it isn't LAN-only); still works. */
+  lan?: P2POptions;
 }
+
+/** `connect({ p2p })`: on (the default), off, or how. Experimental. */
+export type P2POptions = boolean | { forceRelay?: boolean; direct?: 'party' };
 
 export interface NetworkSimulation {
   latency?: number;
@@ -114,6 +146,30 @@ export interface RoomOptions {
   maxPlayers?: number;
   /** Matchmaking pool, e.g. a game mode. Quick match only pairs rooms with the same tag. */
   tag?: string;
+}
+
+/** `relay.createRoom(options)`. */
+export interface CreateRoomOptions extends RoomOptions {
+  /** Listed by `relay.listRooms` and open to quick match. */
+  public?: boolean;
+  /** Joined by its invite link only (`room.inviteUrl()`, `room.shareLink()`), not its code. */
+  linkOnly?: boolean;
+}
+
+/** `relay.joinOrCreate(options)`. Experimental. */
+export interface JoinOrCreateOptions extends RoomOptions {
+  /** With no invite in the URL: a new unlisted room (friends join with its code or invite), not quick match. */
+  private?: boolean;
+  /** Write the room's invite into the address bar (`history.replaceState`), so copying the URL invites. */
+  updateUrl?: boolean;
+}
+
+/** `relay.listRooms(options)`. */
+export interface ListRoomsOptions {
+  /** Only rooms with this tag (`createRoom({ tag })`). */
+  tag?: string;
+  /** Add full and locked rooms, for a server browser. */
+  includeFull?: boolean;
 }
 
 /** Who may join a room (`room.setAccess`, the `access` event). */
@@ -166,6 +222,7 @@ const EVENT_ALIASES: Record<string, string> = {
   hostChanged: 'host_changed', host_change: 'host_changed', newHost: 'host_changed',
   stateChanged: 'state', state_changed: 'state', stateChange: 'state',
   playerDisconnected: 'player_disconnected', playerReconnected: 'player_reconnected',
+  becameHost: 'host', onHost: 'host', host_gained: 'host',
 };
 const ALIAS_WHAT: Record<string, string> = {
   player_joined: 'a player arriving',
@@ -174,6 +231,7 @@ const ALIAS_WHAT: Record<string, string> = {
   state: 'a state change',
   player_disconnected: 'a player dropping',
   player_reconnected: 'a player coming back',
+  host: 'becoming the host',
 };
 type CustomHandler = (data: Json, from: PlayerId, meta: MessageMeta) => void;
 type EntityHandler = (entity: Entity, reason: RemoveReason) => void;
@@ -214,8 +272,12 @@ export type RelayEvents = {
   /** Your party changed (`null` = not in a party any more). */
   party: (party: PartyInfo | null) => void;
   /** Your party leader moved you into a room. */
+  party_room: (room: Room) => void;
+  /** @deprecated The old name of `party_room`; still fires. */
   room: (room: Room) => void;
 };
+
+const RELAY_EVENTS = new Set<string>(['disconnected', 'reconnected', 'server_restarting', 'replaced', 'error', 'party', 'party_room', 'room']);
 
 export type CloseReason = 'left' | 'lost' | 'kicked' | 'closed';
 
@@ -260,8 +322,6 @@ interface Pending {
   ts?: number;
 }
 
-type Outgoing = { [K in RoomClientMessage['t']]: Omit<Extract<RoomClientMessage, { t: K }>, 'v'> }[RoomClientMessage['t']];
-type Request = { t: string; [key: string]: Json | undefined };
 
 /** Stay under the server's 16 KB message limit, with room for the batch wrapper and signature. */
 const MAX_FRAME_BYTES = 15_000;
@@ -275,6 +335,26 @@ const MAX_QUEUED = 256;
 const REPLY_TIMEOUT_MS = 10_000;
 /** Timed-out requests remembered, so a late answer is dropped instead of reported as an error. */
 const MAX_EXPIRED = 64;
+/** A connect (the token, then the socket's welcome) that takes longer than this fails with `timeout`. */
+const CONNECT_TIMEOUT_MS = 15_000;
+/** Reconnect failures that retrying can't fix: the relay stops (and says why, through `error`). */
+const FINAL_CODES = new Set<string>(['unauthorized', 'upgrade_required']);
+
+/** A secret key (`gr_sk_`) where a page would hold it. */
+const secretKey = () => new GameRelayError('unauthorized', "That's your SECRET key (gr_sk_): never put it in a page. Rotate it now in the dashboard; pages use the public key (gr_pub_)");
+
+/**
+ * The error code for a failed token request: the server's own where it says one, `unauthorized` for
+ * a key it refuses, and `disconnected` (try again) for anything else (a proxy's 502 mid-deploy).
+ */
+function authCode(status: number, error: string | undefined): GameRelayErrorCode {
+  if (error === 'at_capacity' || error === 'quota_exceeded' || error === 'rate_limited') return error;
+  if (status === 429) return 'rate_limited';
+  if (status === 401 || status === 403 || error === 'unauthorized' || error === 'origin_not_allowed') return 'unauthorized';
+  if (status === 400) return 'bad_request';
+  return 'disconnected';
+}
+
 /** How often the connection's upkeep runs (`#watch`). */
 const WATCH_MS = 1000;
 /**
@@ -298,13 +378,6 @@ const CLOCK_SAMPLES = 8;
 const monotonic = () => performance.timeOrigin + performance.now();
 /** The LAN shortcut asks for fresh relay credentials this often (they last an hour on the server). */
 const ICE_REFRESH_MS = 20 * 60 * 1000;
-const DEFAULT_URL = 'https://gamerelay.io';
-let defaultUrl = DEFAULT_URL;
-
-/** @internal Used by the `<script>` build to default to the origin it was loaded from. */
-export function setDefaultUrl(url: string): void {
-  defaultUrl = url;
-}
 
 /** Delays callbacks by half the simulated latency ± jitter, never reordering them. */
 function lane({ latency = 0, jitter = 0 }: NetworkSimulation): (fn: () => void) => void {
@@ -348,33 +421,68 @@ function pageUrl(): string {
 const session = safeStorage('session');
 
 export class GameRelay extends Emitter<RelayEvents> {
+  #playerId = '';
+  #room: Room | null = null;
+  #party: PartyInfo | null = null;
+  #features = Object.fromEntries(PLAN_FEATURES.map((f) => [f, false])) as unknown as PlanFeatures;
+  #serverInfo: ServerInfo = { version: null };
+
+  /** This SDK's version, e.g. `0.1.0-alpha.6`. */
+  static readonly version: string = SDK_VERSION;
+
+  /**
+   * A small, fast, seeded random number generator: the same seed gives every player the same
+   * sequence. `const rand = GameRelay.seededRandom(room.seed)`; `rand()` is in [0, 1).
+   */
+  static readonly seededRandom: (seed: number) => () => number = seededRandom;
+
   /** Your player id (stable across reloads of the same tab for anonymous players). */
-  playerId = '';
+  get playerId(): PlayerId {
+    return this.#playerId;
+  }
+
   /** The room you are in, if any. */
-  room: Room | null = null;
+  get room(): Room | null {
+    return this.#room;
+  }
+
   /** Your party, if any. When its leader enters a room, every member follows. */
-  party: PartyInfo | null = null;
+  get party(): PartyInfo | null {
+    return this.#party;
+  }
+
   /**
    * What this game's plan includes, from the server when you connect (all off until then). For
    * features that need a paid plan, such as voice chat, once they ship.
+   * @experimental
    */
-  features = Object.fromEntries(PLAN_FEATURES.map((f) => [f, false])) as unknown as PlanFeatures;
+  get features(): Readonly<PlanFeatures> {
+    return this.#features;
+  }
+
+  /**
+   * What the server said about itself when this connection opened, for debugging.
+   * @experimental
+   */
+  get serverInfo(): Readonly<ServerInfo> {
+    return this.#serverInfo;
+  }
 
   /** Per-player persisted key/value data. */
-  readonly storage = {
+  readonly storage = Object.freeze({
     get: <T extends Json = Json>(key: string): Promise<T | null> =>
-      this.request({ t: 'kv_get', key }).then((d) => (d ?? null) as T | null),
-    set: (key: string, value: Json): Promise<void> => this.request({ t: 'kv_set', key, value }).then(() => undefined),
-  };
+      this.#request({ t: 'kv_get', key }).then((d) => (d ?? null) as T | null),
+    set: (key: string, value: Json): Promise<void> => this.#request({ t: 'kv_set', key, value }).then(() => undefined),
+  });
 
   /** Per-game high score boards. Each player keeps their best score per board. */
-  readonly leaderboard = {
+  readonly leaderboard = Object.freeze({
     /** `order` is fixed by a board's first submit: `desc` (default) for points, `asc` for times. */
     submit: (board: string, score: number, options: { order?: LeaderboardOrder } = {}): Promise<LeaderboardSubmitResult> =>
-      this.request({ t: 'lb_submit', board, score, order: options.order }).then((d) => d as LeaderboardSubmitResult),
+      this.#request({ t: 'lb_submit', board, score, order: options.order }).then((d) => d as LeaderboardSubmitResult),
     top: (board: string, options: { limit?: number } = {}): Promise<LeaderboardPage> =>
-      this.request({ t: 'lb_top', board, limit: options.limit }).then((d) => d as LeaderboardPage),
-  };
+      this.#request({ t: 'lb_top', board, limit: options.limit }).then((d) => d as LeaderboardPage),
+  });
 
   #ws: WebSocket | null = null;
   /** This connection's frame key and sequence (signed frames); private so the console can't read it. */
@@ -398,6 +506,15 @@ export class GameRelay extends Emitter<RelayEvents> {
   readonly #opts: ConnectOptions;
   readonly #base: string;
   #token: { value: string; expiresAt: number } | null = null;
+  /** Where the token response said to connect (`wsUrl`), if it said and it's `followable`. */
+  #wsUrl: string | null = null;
+  /**
+   * Where a restart notice said to reconnect (its `url`): tried before `#wsUrl` until a connection
+   * there fails or a later notice says otherwise. A failed connect to either falls back to `#base`.
+   */
+  #movedTo: string | null = null;
+  /** The last connect to `#movedTo`/`#wsUrl` failed before welcome: the next one tries `#base`. */
+  #fallBack = false;
   #rid = 0;
   readonly #pending = new Map<number, Pending>();
   /** Pings waiting for their pong, by `ts`: the rid they were sent with. */
@@ -412,7 +529,14 @@ export class GameRelay extends Emitter<RelayEvents> {
   #flushRetry: ReturnType<typeof setTimeout> | null = null;
   #attempts = 0;
   #reconnectHintMs: number | null = null;
+  #reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The code of the last reconnect failure reported through `error`: each new one once per outage. */
+  #reported: string | null = null;
   #stopped = false;
+  /** Everything stopped (`#shutdown`): close, replaced, too old, or a key the server refuses. */
+  #shut = false;
+  /** Fails the connect waiting for its welcome (`#open`), if one is. */
+  #abortOpen: ((err: GameRelayError) => void) | null = null;
   /** Between reconnecting and re-entering the room: room messages must wait. */
   #resuming = false;
   #lastRoomInfo: RoomInfo | null = null;
@@ -432,12 +556,52 @@ export class GameRelay extends Emitter<RelayEvents> {
   #debugPing: ReturnType<typeof setInterval> | null = null;
   /** Entity ids: one session per connection, so another client (or a reload) never collides. */
   readonly #ids = createIdAllocator();
+  /** What this relay's rooms may ask of it (`internal.ts`). */
+  readonly #link: RelayLink;
 
-  private constructor(opts: ConnectOptions) {
+  private constructor(token: typeof CREATE, options: ConnectOptions) {
+    if (token !== CREATE) throw new GameRelayError('bad_request', 'Use `await GameRelay.connect({ publicKey })`, not `new GameRelay()`');
     super();
+    const opts = (options ?? {}) as ConnectOptions;
     this.#opts = opts;
-    this.#base = (opts.url ?? defaultUrl).replace(/\/$/, '');
-    if (!opts.publicKey && !opts.getToken) throw new Error('GameRelay.connect needs publicKey or getToken');
+    this.#base = (opts.url ?? defaults.url).replace(/\/$/, '');
+    if (!opts.publicKey && !opts.getToken) throw new GameRelayError('bad_request', 'GameRelay.connect needs publicKey (your gr_pub_ key) or getToken');
+    if (typeof opts.publicKey === 'string' && opts.publicKey.startsWith('gr_sk_')) throw secretKey();
+    const relay = this;
+    this.#link = {
+      get connected() {
+        return relay.connected;
+      },
+      get serverReady() {
+        return relay.connected && !relay.#resuming;
+      },
+      get party() {
+        return relay.#party;
+      },
+      get lanEnabled() {
+        return relay.#p2p !== false;
+      },
+      get lanForceRelay() {
+        const p2p = relay.#p2p;
+        return typeof p2p === 'object' && p2p.forceRelay === true;
+      },
+      get lanDirect() {
+        const p2p = relay.#p2p;
+        return typeof p2p === 'object' && p2p.direct === 'party' ? 'party' : null;
+      },
+      queue: (m) => this.#queue(m),
+      request: (m) => this.#request(m),
+      now: () => this.now(),
+      writeTime: () => this.#writeTime(),
+      tick: (rate, fn) => this.tick(rate, fn),
+      warn: (kind, key, message) => this.#warnings.warn(kind, key, message),
+      newEntityId: (kind, owner) => this.#ids(kind, owner),
+      lanWithinRate: () => this.#budget.allows(this.#outbox.length, performance.now()),
+      left: (room) => {
+        if (this.#room === room) this.#room = null;
+      },
+    };
+    relays.set(this, this.#link);
     if (opts.simulate) {
       console.warn('[gamerelay] simulating a bad network', opts.simulate);
       this.#out = lane(opts.simulate);
@@ -445,7 +609,7 @@ export class GameRelay extends Emitter<RelayEvents> {
     }
     this.#ticker = new Ticker({
       schedule: pickScheduler(() =>
-        this.warn('worker', 'worker', "tick loop fell back to setInterval (a worker was blocked by the page's security settings); hidden tabs will tick slowly"),
+        this.#warn('worker', 'worker', "tick loop fell back to setInterval (a worker was blocked by the page's security settings); hidden tabs will tick slowly"),
       ),
     });
     this.#watchTimer = setInterval(() => this.#watch(), WATCH_MS);
@@ -461,28 +625,44 @@ export class GameRelay extends Emitter<RelayEvents> {
     };
   }
 
+  /** Connect to GameRelay. Rejects with a `GameRelayError` (check `err.code`) if it can't. */
   static async connect(options: ConnectOptions): Promise<GameRelay> {
-    const relay = new GameRelay(options);
-    await relay.#open();
+    const relay = new GameRelay(CREATE, options);
+    try {
+      await relay.#open();
+    } catch (err) {
+      relay.#shutdown();
+      throw err;
+    }
     if (options.debug) relay.#startDebug();
     return relay;
+  }
+
+  /** Player to player (`p2p`, or its old name `lan`). */
+  get #p2p(): P2POptions | undefined {
+    return this.#opts.p2p ?? this.#opts.lan;
   }
 
   get connected(): boolean {
     return this.#ws?.readyState === 1 && this.#frameKey !== null;
   }
 
-  /** @internal Connected and back in the room: what we queue now goes straight to the server. */
-  get serverReady(): boolean {
-    return this.connected && !this.#resuming;
+  /** Subscribe to a connection event; returns an unsubscribe function. */
+  override on<K extends keyof RelayEvents>(event: K, handler: RelayEvents[K]): () => void {
+    const name: string = event;
+    if (!RELAY_EVENTS.has(name)) {
+      const where = ROOM_EVENTS.has(name) || ['host', 'spawn', 'remove', 'timer'].includes(name) ? `; it's a room event: room.on('${event}', …)` : '';
+      this.#warnings.warn('event_name', `relay_event:${event}`, `relay.on('${event}') never fires: relay events are ${[...RELAY_EVENTS].filter((e) => e !== 'room').join(', ')}${where}`);
+    }
+    return super.on(event, handler);
   }
 
   /**
    * A new room, with you in it. `public`: listed by `listRooms` and open to quick match. `linkOnly`:
-   * joined by its short link (`room.shareLink()`) only, not by its code, so nobody gets in by
+   * joined by its invite link (`room.inviteUrl()`) only, not by its code, so nobody gets in by
    * guessing one; players with a seat can still come back by code (a reload).
    */
-  createRoom(options: RoomOptions & { public?: boolean; linkOnly?: boolean } = {}): Promise<Room> {
+  createRoom(options: CreateRoomOptions = {}): Promise<Room> {
     return this.#enter({ t: 'create_room', maxPlayers: options.maxPlayers, public: options.public, linkOnly: options.linkOnly || undefined, tag: options.tag });
   }
   joinRoom(code: string): Promise<Room> {
@@ -493,7 +673,7 @@ export class GameRelay extends Emitter<RelayEvents> {
    * link-only room is joined this way. Rejects with `room_not_found` once the room has closed.
    */
   joinLink(link: string): Promise<Room> {
-    return this.#enter({ t: 'join_link', link: link.trim() });
+    return this.#enter({ t: 'join_link', link: link.trim() }, link.trim());
   }
   /**
    * Join the room in an invite: a short link's `?join=<link>` (`room.shareLink()`) or an invite
@@ -513,30 +693,57 @@ export class GameRelay extends Emitter<RelayEvents> {
   }
 
   /**
+   * The usual start, in one call: join the room in the page's invite link (`?room=` or `?join=`);
+   * if there's none, or that room has closed, quick-match (or, with `private`, create a room that
+   * isn't listed or quick-matched: friends join with its code or invite). A full, locked or banning room still rejects (`room_full`, `locked`,
+   * `banned`): say so to the player. `updateUrl` writes the room's invite into the address bar.
+   * @experimental
+   */
+  async joinOrCreate(options: JoinOrCreateOptions = {}): Promise<Room> {
+    const { maxPlayers, tag } = options;
+    let room: Room | null = null;
+    if (typeof location !== 'undefined') {
+      room = await this.joinInvite().catch((err: unknown) => {
+        if (err instanceof GameRelayError && err.code === 'room_not_found') return null;
+        throw err;
+      });
+    }
+    room ??= options.private ? await this.createRoom({ maxPlayers, tag }) : await this.quickMatch({ maxPlayers, tag });
+    if (options.updateUrl && typeof history !== 'undefined' && typeof location !== 'undefined') {
+      history.replaceState(history.state, '', room.inviteUrl());
+    }
+    return room;
+  }
+
+  /**
    * Public rooms with free seats, oldest first (up to 50). `includeFull` adds full and locked ones,
    * for a server browser: each listing's `players`, `maxPlayers` and `locked` say which.
+   * `listRooms({ tag, includeFull })`, or the older `listRooms(tag, { includeFull })`.
    */
-  async listRooms(tag?: string, options: { includeFull?: boolean } = {}): Promise<RoomListing[]> {
-    return ((await this.request({ t: 'list_rooms', tag, includeFull: options.includeFull || undefined })) ?? []) as RoomListing[];
+  async listRooms(options?: ListRoomsOptions): Promise<RoomListing[]>;
+  async listRooms(tag?: string, options?: { includeFull?: boolean }): Promise<RoomListing[]>;
+  async listRooms(a?: string | ListRoomsOptions, b: { includeFull?: boolean } = {}): Promise<RoomListing[]> {
+    const { tag, includeFull } = typeof a === 'object' && a !== null ? a : { tag: a, includeFull: b.includeFull };
+    return ((await this.#request({ t: 'list_rooms', tag, includeFull: includeFull || undefined })) ?? []) as RoomListing[];
   }
 
   /** How many players are online in this game right now (everyone connected, in a room or not). */
   async online(): Promise<{ players: number }> {
-    const data = (await this.request({ t: 'online' })) as { players?: number } | undefined;
+    const data = (await this.#request({ t: 'online' })) as { players?: number } | undefined;
     return { players: data?.players ?? 0 };
   }
 
   /** Start a party; share `party.code` with friends. */
   async createParty(): Promise<PartyInfo> {
-    await this.request({ t: 'party_create' });
-    return this.party as PartyInfo;
+    await this.#request({ t: 'party_create' });
+    return this.#party as PartyInfo;
   }
   async joinParty(code: string): Promise<PartyInfo> {
-    await this.request({ t: 'party_join', code: code.trim().toUpperCase() });
-    return this.party as PartyInfo;
+    await this.#request({ t: 'party_join', code: code.trim().toUpperCase() });
+    return this.#party as PartyInfo;
   }
   async leaveParty(): Promise<void> {
-    await this.request({ t: 'party_leave' });
+    await this.#request({ t: 'party_leave' });
   }
 
   /** Round-trip time in ms. */
@@ -546,7 +753,7 @@ export class GameRelay extends Emitter<RelayEvents> {
     // Pongs are matched by `ts`, so concurrent pings in the same millisecond need distinct ones.
     let ts = Math.floor(start);
     while (this.#pongs.has(ts)) ts++;
-    const serverTime = await this.request({ t: 'ping', ts });
+    const serverTime = await this.#request({ t: 'ping', ts });
     const rtt = monotonic() - start;
     this.#lastRtt = rtt;
     if (typeof serverTime === 'number') this.#clockSample(serverTime - (start + rtt / 2), rtt);
@@ -567,6 +774,7 @@ export class GameRelay extends Emitter<RelayEvents> {
    * Returns a function that stops the loop.
    */
   tick(rate: number, fn: (dt: number, tick: number) => void): () => void {
+    if (this.#shut) throw new GameRelayError('disconnected', 'relay.tick: this connection was closed; connect again (GameRelay.connect) and tick on the new one');
     return this.#ticker.add(rate, (dt, tick) => {
       try {
         fn(dt, tick);
@@ -576,41 +784,13 @@ export class GameRelay extends Emitter<RelayEvents> {
     });
   }
 
-  /** @internal The server-clock moment of the running `tick` step (see `SyncTransport.writeTime`), else now. */
-  writeTime(): number {
+  /** The server-clock moment of the running `tick` step (see `SyncTransport.writeTime`), else now. */
+  #writeTime(): number {
     const at = this.#ticker.stepTime();
     return at === null ? this.now() : this.now() - (performance.now() - at);
   }
 
-  /** @internal A broadcast queued now gets through the server's rate limit: its LAN copy may race. */
-  lanWithinRate(): boolean {
-    return this.#budget.allows(this.#outbox.length, performance.now());
-  }
-
-  /** @internal The experimental LAN shortcut is on (the default; `connect({ lan: false })` turns it off). */
-  get lanEnabled(): boolean {
-    return this.#opts.lan !== false;
-  }
-
-  /** @internal The LAN shortcut through the relay only (`lan: { forceRelay: true }`). */
-  get lanForceRelay(): boolean {
-    const lan = this.#opts.lan;
-    return typeof lan === 'object' && lan.forceRelay === true;
-  }
-
-  /** @internal Direct connections over the internet, with party members (`lan: { direct: 'party' }`). */
-  get lanDirect(): 'party' | null {
-    const lan = this.#opts.lan;
-    return typeof lan === 'object' && lan.direct === 'party' ? 'party' : null;
-  }
-
-  /** @internal */
-  newEntityId(kind: string, owner: PlayerId): string {
-    return this.#ids(kind, owner);
-  }
-
-  /** @internal Print a warning once per kind (and list it in the debug overlay). */
-  warn(kind: WarningKind, key: string, message: string): void {
+  #warn(kind: WarningKind, key: string, message: string): void {
     this.#warnings.warn(kind, key, message);
   }
 
@@ -620,7 +800,7 @@ export class GameRelay extends Emitter<RelayEvents> {
       const now = Date.now();
       const secs = Math.max(0.001, (now - last.at) / 1000);
       const rate = (k: 'msgsIn' | 'msgsOut' | 'bytesIn' | 'bytesOut') => Math.round((this.#stats[k] - last[k]) / secs);
-      const info = this.room?.debugInfo() ?? { delayMs: 0, entities: {}, lan: undefined };
+      const info = this.#roomControl()?.debugInfo() ?? { delayMs: 0, entities: {}, lan: undefined };
       const stats: OverlayStats = {
         ping: this.#lastRtt,
         delayMs: info.delayMs,
@@ -629,7 +809,7 @@ export class GameRelay extends Emitter<RelayEvents> {
         msgsOut: rate('msgsOut'),
         bytesIn: rate('bytesIn'),
         bytesOut: rate('bytesOut'),
-        host: this.room?.isHost ?? false,
+        host: this.#room?.isHost ?? false,
         lan: info.lan,
         warnings: this.#warnings.list(),
       };
@@ -639,22 +819,52 @@ export class GameRelay extends Emitter<RelayEvents> {
     this.#debugPing = setInterval(() => void this.ping().catch(() => {}), 2000);
   }
 
+  /**
+   * Disconnect for good: your room closes (`closed` with `'left'`), whatever was waiting rejects
+   * with `disconnected`, and every timer stops. To play again, `GameRelay.connect` anew.
+   */
   close(): void {
+    this.#shutdown('left');
+  }
+
+  /**
+   * The one way everything stops (`close()`, `replaced`, an SDK too old, a key the server refuses):
+   * the room closes with `reason`, pending calls reject, and no timer or listener is left running.
+   */
+  #shutdown(reason: 'left' | 'lost' = 'lost'): void {
+    if (this.#shut) return;
+    this.#shut = true;
     this.#stopped = true;
-    this.room?.closeLan();
-    this.#ws?.close(1000);
+    const room = this.#room;
+    this.#room = null;
+    // A connect waiting for its welcome fails now, not never.
+    this.#abortOpen?.(new GameRelayError('disconnected', 'This connection was closed'));
+    const ws = this.#ws;
+    this.#ws = null;
+    if (ws) attempt(() => ws.close(1000));
+    this.#frameKey = null;
     this.#ticker.stop();
     this.#unmountOverlay?.();
     if (this.#debugPing) clearInterval(this.#debugPing);
     clearInterval(this.#watchTimer);
+    if (this.#flushRetry) clearTimeout(this.#flushRetry);
+    if (this.#reconnectTimer) clearTimeout(this.#reconnectTimer);
+    this.#flushRetry = this.#reconnectTimer = null;
+    this.#outbox = [];
     this.#unwatchPage();
     this.#failPending();
+    // Last, with the connection gone: a `closed` handler that calls the relay is told it's closed.
+    if (room) rooms.get(room)?.close(reason);
+  }
+
+  #roomControl(): RoomControl | undefined {
+    return this.#room ? rooms.get(this.#room) : undefined;
   }
 
   // ---------------------------------------------------------------------------
 
-  /** @internal */
-  queue(message: Outgoing): void {
+  #queue(message: Outgoing): void {
+    if (this.#shut) return;
     this.#outbox.push(message);
     if (!this.#flushScheduled) {
       this.#flushScheduled = true;
@@ -662,9 +872,8 @@ export class GameRelay extends Emitter<RelayEvents> {
     }
   }
 
-  /** @internal */
-  request(message: Request): Promise<Json | undefined> {
-    if (!this.connected) return Promise.reject(new GameRelayError('disconnected', 'Not connected'));
+  #request(message: Request): Promise<Json | undefined> {
+    if (!this.connected) return Promise.reject(new GameRelayError('disconnected', this.#shut ? 'This connection was closed; connect again' : 'Not connected'));
     // What was queued first goes first, leaving the budget a token for the request itself.
     if (!this.#resuming) this.#flush(1);
     const rid = ++this.#rid;
@@ -726,21 +935,30 @@ export class GameRelay extends Emitter<RelayEvents> {
     this.#probe();
   }
 
-  async #enter(message: Request): Promise<Room> {
-    const data = await this.request(message);
+  /** `link`: the short link's id, when that's how we got in (`joinLink`). */
+  async #enter(message: Request, link?: string): Promise<Room> {
+    const data = await this.#request(message);
     const info = this.#lastRoomInfo;
     if (!info || typeof data !== 'object' || data === null || Array.isArray(data) || info.id !== data.roomId) {
       throw new GameRelayError('internal', 'Room snapshot missing');
     }
-    const old = this.room;
+    const old = this.#room;
     // Leaving a room closes it; re-entering the same one replaces the object, so stop the old one's loop.
-    if (old && old.id !== info.id) old.closeLocal('left');
-    else old?.dispose();
-    this.room = new Room(this, info, this.playerId);
-    // In a page, the room's short link now: shareInvite() must share in the tap that asks for it
-    // (iOS refuses a share or a copy that waits on the network first).
-    if (typeof location !== 'undefined') void this.room.shareLink().catch(() => {});
-    return this.room;
+    if (old && old.id !== info.id) rooms.get(old)?.close('left');
+    else if (old) rooms.get(old)?.dispose();
+    return this.#adopt(info, link);
+  }
+
+  /**
+   * The Room for the room the server has us in. Its short link is asked for now, in a page or for
+   * a link-only room (whose invite it is), without waiting: the game gets the room at once, so it
+   * hears every event. shareInvite() must share in the tap that asks for it (iOS refuses a share or
+   * a copy that waits on the network first).
+   */
+  #adopt(info: RoomInfo, link?: string): Room {
+    const room = (this.#room = new Room(CREATE, this.#link, info, this.#playerId, link));
+    if (typeof location !== 'undefined' || (room.linkOnly && !link)) void room.shareLink().catch(() => {});
+    return room;
   }
 
   /**
@@ -841,38 +1059,100 @@ export class GameRelay extends Emitter<RelayEvents> {
   }
 
   async #getToken(): Promise<string> {
-    if (this.#opts.getToken) return this.#opts.getToken();
+    if (this.#opts.getToken) {
+      let got: string | TokenResponse;
+      try {
+        got = await this.#opts.getToken();
+      } catch (err) {
+        if (err instanceof GameRelayError) throw err;
+        // Your backend failed (maybe for a moment): connect rejects, a reconnect tries again.
+        throw new GameRelayError('disconnected', `getToken failed: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
+      }
+      const token = typeof got === 'string' ? got : got?.token;
+      if (typeof token !== 'string' || !token) throw new GameRelayError('unauthorized', 'getToken must return a token, or the response of POST /v1/auth/token');
+      if (token.startsWith('gr_sk_')) throw secretKey();
+      if (typeof got === 'object') this.#wsUrl = this.#checked(got.wsUrl);
+      return token;
+    }
     if (this.#token && this.#token.expiresAt - Date.now() > 60_000) return this.#token.value;
     const storeKey = `gamerelay:${this.#opts.publicKey}`;
-    const res = await fetch(`${this.#base}/v1/auth/anonymous`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        publicKey: this.#opts.publicKey,
-        playerName: this.#opts.playerName,
-        playerAvatar: this.#opts.playerAvatar,
-        previousToken: this.#token?.value ?? session.get(storeKey) ?? undefined,
-      }),
-    });
-    // A proxy error page isn't JSON: treat it like any other failed response.
-    const body: { token?: string; expiresAt?: number; error?: string; message?: string } = await res.json().catch(() => ({}));
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), CONNECT_TIMEOUT_MS);
+    let res: Response;
+    let body: { token?: string; expiresAt?: number; wsUrl?: string; error?: string; message?: string };
+    try {
+      res = await fetch(`${this.#base}/v1/auth/anonymous`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          publicKey: this.#opts.publicKey,
+          playerName: this.#opts.playerName,
+          playerAvatar: this.#opts.playerAvatar,
+          previousToken: this.#token?.value ?? session.get(storeKey) ?? undefined,
+        }),
+        signal: abort.signal,
+      });
+      // A proxy error page isn't JSON: treat it like any other failed response.
+      const parsed: unknown = await res.json().catch(() => null);
+      body = parsed && typeof parsed === 'object' ? parsed : {};
+    } catch (err) {
+      // Offline, DNS, CORS, or no answer in time: not the key's fault, so a reconnect tries again.
+      const late = abort.signal.aborted;
+      throw new GameRelayError(late ? 'timeout' : 'disconnected', late ? `No answer from ${this.#base} in ${CONNECT_TIMEOUT_MS / 1000} s` : `Can't reach ${this.#base}: are you online?`, { cause: err });
+    } finally {
+      clearTimeout(timer);
+    }
     if (!res.ok || !body.token || !body.expiresAt) {
-      const code = body.error === 'at_capacity' || body.error === 'quota_exceeded' ? body.error : res.status === 429 ? 'rate_limited' : 'unauthorized';
-      throw new GameRelayError(code, body.message ?? 'Auth failed');
+      throw new GameRelayError(authCode(res.status, body.error), body.message ?? `Auth failed (${res.status})`);
     }
     this.#token = { value: body.token, expiresAt: body.expiresAt };
     session.set(storeKey, body.token);
+    this.#wsUrl = this.#checked(body.wsUrl);
     return body.token;
+  }
+
+  /** A server notice for the developer (an old SDK, …): once per code, through the warning catalog. */
+  #notice(notice: Notice): void {
+    if (!notice || typeof notice.message !== 'string') return;
+    const text = notice.message.replace(/[.!?]\s*$/, '');
+    const until = notice.until ? ` (until ${notice.until})` : '';
+    const more = notice.url ? ` More: ${notice.url}` : '';
+    this.#warn('notice', `notice:${typeof notice.code === 'string' ? notice.code : notice.message}`, `${text}${until}.${more}`);
+  }
+
+  /** `url` if the SDK may connect there (`followable`), else null (with a warning when there was one). */
+  #checked(url: string | undefined): string | null {
+    if (typeof url !== 'string' || !url) return null;
+    if (followable(url, this.#base)) return url;
+    this.#warn('notice', `host:${url}`, `the server pointed this game at ${url}, which isn't a GameRelay host; staying on ${this.#base}`);
+    return null;
   }
 
   async #open(): Promise<void> {
     const token = await this.#getToken();
     // close() may have been called while a reconnect waited on the token.
     if (this.#stopped) throw new GameRelayError('disconnected', 'Closed');
-    // `lan=1`: we know the shortcut's wire format (the server unwraps it for SDKs that don't).
-    // `compact=1`: relayed messages in their short form (`CompactMessageMsg`).
-    const url = `${this.#base.replace(/^http/, 'ws')}/ws?token=${encodeURIComponent(token)}&compact=1${this.lanEnabled ? '&lan=1' : ''}`;
-    await new Promise<void>((resolve, reject) => {
+    // Who we are (`sdk`) and what we understand (`caps`, @gamerelay/protocol/clients): `compact`,
+    // relayed messages in their short form; `lan`, the shortcut's wire format (the server unwraps it
+    // for SDKs that don't know it); `moved`, a restart notice's `url`; `notices`, shown in the console.
+    const caps = ['compact', ...(this.#link.lanEnabled ? ['lan'] : []), 'moved', 'notices'].join(',');
+    const base = `${this.#base.replace(/^http/, 'ws')}/ws`;
+    const target = this.#fallBack ? base : (this.#movedTo ?? this.#wsUrl ?? base);
+    this.#fallBack = false;
+    // `compact=1` and `lan=1` too, for servers from before `caps` (until alpha.7).
+    const url = `${target}?token=${encodeURIComponent(token)}&sdk=js/${encodeURIComponent(SDK_VERSION)}&caps=${caps}&compact=1${this.#link.lanEnabled ? '&lan=1' : ''}`;
+    await new Promise<void>((resolveOpen, rejectOpen) => {
+      let late: ReturnType<typeof setTimeout> | undefined;
+      const resolve = () => {
+        this.#abortOpen = null;
+        resolveOpen();
+      };
+      const reject = (err: GameRelayError) => {
+        this.#abortOpen = null;
+        clearTimeout(late);
+        rejectOpen(err);
+      };
+      this.#abortOpen = reject;
       const ws = new WebSocket(url, 'gamerelay.v1.json');
       this.#ws = ws;
       this.#frameKey = null;
@@ -880,6 +1160,18 @@ export class GameRelay extends Emitter<RelayEvents> {
       this.#heardAt = performance.now();
       this.#probeAt = null;
       let welcomed = false;
+      // No welcome in time (a socket stuck connecting): give up on it, as if it had closed.
+      late = setTimeout(() => {
+        if (welcomed || this.#ws !== ws) return;
+        this.#ws = null;
+        attempt(() => ws.close());
+        this.#token = null;
+        if (target !== base) {
+          this.#fallBack = true;
+          this.#movedTo = null;
+        }
+        reject(new GameRelayError('timeout', `No answer from ${target} in ${CONNECT_TIMEOUT_MS / 1000} s`));
+      }, CONNECT_TIMEOUT_MS);
       const receive = (ev: MessageEvent) => {
         // (A delayed message can arrive after its socket was replaced.)
         if (this.#ws !== ws) return;
@@ -890,12 +1182,15 @@ export class GameRelay extends Emitter<RelayEvents> {
         if (!msg) return;
         if (msg.t === 'welcome') {
           welcomed = true;
+          clearTimeout(late);
           // The server made this connection's bucket before it said welcome, and nothing is sent
           // before it (frames are signed with its key), so ours starts now and never runs ahead.
           this.#budget.reset(performance.now());
-          this.playerId = msg.playerId;
+          this.#playerId = msg.playerId;
           // An older server sends no features: everything stays off.
-          if (msg.features) this.features = { ...this.features, ...msg.features };
+          if (msg.features) this.#features = Object.freeze({ ...this.#features, ...msg.features });
+          this.#serverInfo = Object.freeze({ version: msg.server ?? null });
+          for (const notice of msg.notices ?? []) this.#notice(notice);
           this.#frameKey = unmaskKey(msg.k, msg.playerId);
           // A rough clock until the pings below (and any the game sends) refine it. The old samples
           // stay in use until then, so the clock doesn't jump back to this rough one.
@@ -910,8 +1205,22 @@ export class GameRelay extends Emitter<RelayEvents> {
       ws.onclose = (ev) => {
         if (this.#ws !== ws) return;
         this.#ws = null;
+        clearTimeout(late);
         if (!welcomed) {
+          if (ev.code === CLOSE.upgradeRequired) {
+            // Too old for this server (its `upgrade_required` error came first, as an `error`
+            // event): retrying can't help, so stop instead of reconnecting forever.
+            reject(new GameRelayError('upgrade_required', 'This version of the GameRelay SDK is no longer accepted: load https://gamerelay.io/sdk/v0/gamerelay.js or update @gamerelay/sdk'));
+            this.#shutdown();
+            return;
+          }
           this.#token = null; // maybe expired/revoked: mint a fresh one next time
+          // A host the server sent us to that doesn't answer: once back to the base URL, and
+          // forget a restart notice's host (the token's `wsUrl` comes back with the next token).
+          if (target !== base) {
+            this.#fallBack = true;
+            this.#movedTo = null;
+          }
           reject(new GameRelayError('disconnected', `Connection failed (${ev.code})`));
           return;
         }
@@ -923,11 +1232,13 @@ export class GameRelay extends Emitter<RelayEvents> {
   #onDisconnect(code: number): void {
     this.#failPending();
     if (this.#stopped) return;
-    if (code === 4001) {
+    if (code === CLOSE.upgradeRequired) return this.#shutdown();
+    if (code === CLOSE.replaced) {
+      // Another tab took over: this one stops (its p2p copies would speak for the new one). The
+      // game hears why first, then its room's `closed` ('lost').
       this.#stopped = true;
-      this.room?.closeLan(); // another tab took over: this one's LAN copies would speak for it
       this.fire('replaced');
-      return;
+      return this.#shutdown();
     }
     this.fire('disconnected');
     this.#scheduleReconnect();
@@ -941,17 +1252,30 @@ export class GameRelay extends Emitter<RelayEvents> {
     const delay = hint === null ? backoff : hint * (0.5 + Math.random());
     this.#reconnectHintMs = null;
     this.#attempts++;
-    setTimeout(() => void this.#reconnect(), delay);
+    this.#reconnectTimer = setTimeout(() => {
+      this.#reconnectTimer = null;
+      void this.#reconnect();
+    }, delay);
   }
 
   async #reconnect(): Promise<void> {
     if (this.#stopped) return;
     try {
       await this.#open();
-    } catch {
+    } catch (err) {
+      if (this.#stopped) return; // closed meanwhile, or too old (`#open` stopped everything)
+      const code = err instanceof GameRelayError ? err.code : 'disconnected';
+      // Why it can't get back in, once per reason: a game showing "Reconnecting…" can say more.
+      if (code !== 'disconnected' && code !== 'timeout' && code !== this.#reported) {
+        this.#reported = code;
+        this.fire('error', err as GameRelayError);
+      }
+      // A rotated key or a deleted game: no retry will work, so stop (the room closes as lost).
+      if (FINAL_CODES.has(code)) return this.#shutdown();
       return this.#scheduleReconnect();
     }
     this.#attempts = 0;
+    this.#reported = null;
     // Hold queued room messages until we are back in the party and room.
     this.#resuming = true;
     // A 'disconnected' failure means the connection dropped again, and a 'timeout' that it went
@@ -962,16 +1286,16 @@ export class GameRelay extends Emitter<RelayEvents> {
       return err.code !== 'disconnected' && err.code !== 'timeout';
     };
     try {
-      const party = this.party;
-      if (party) await this.request({ t: 'party_join', code: party.code }).catch((err) => gone(err) && this.#setParty(null));
-      const room = this.room;
+      const party = this.#party;
+      if (party) await this.#request({ t: 'party_join', code: party.code }).catch((err) => gone(err) && this.#setParty(null));
+      const room = this.#room;
       if (room) {
         // `resume`: if we were kicked while away, the server says so (`removed`) instead of seating us afresh.
-        await this.request({ t: 'join_room', code: room.code, resume: true }).catch((err) => {
+        await this.#request({ t: 'join_room', code: room.code, resume: true }).catch((err) => {
           if (!gone(err)) return;
-          if (this.room !== room) return; // closed already (kicked, or the game moved on)
-          this.room = null;
-          room.closeLocal('lost');
+          if (this.#room !== room) return; // closed already (kicked, or the game moved on)
+          this.#room = null;
+          rooms.get(room)?.close('lost');
         });
       }
     } finally {
@@ -1003,7 +1327,7 @@ export class GameRelay extends Emitter<RelayEvents> {
    */
   #seat(msg: Extract<ServerMessage, { t: 'player_joined' | 'player_left' }>): void {
     const info = this.#lastRoomInfo;
-    const pending = info !== null && this.room?.id !== info.id;
+    const pending = info !== null && this.#room?.id !== info.id;
     if (msg.t === 'player_joined') {
       this.#slots.set(msg.player.slot, msg.player.id);
       if (pending) info.players = [...info.players.filter((p) => p.id !== msg.player.id), msg.player];
@@ -1014,8 +1338,8 @@ export class GameRelay extends Emitter<RelayEvents> {
   }
 
   #setParty(party: PartyInfo | null): void {
-    this.party = party;
-    this.room?.lanPartyChanged();
+    this.#party = party;
+    this.#roomControl()?.lanPartyChanged();
     this.fire('party', party);
   }
 
@@ -1053,7 +1377,7 @@ export class GameRelay extends Emitter<RelayEvents> {
       case 'player_joined':
       case 'player_left':
         this.#seat(msg);
-        this.room?.handle(msg);
+        this.#roomControl()?.handle(msg);
         return;
       case 'welcome':
         return;
@@ -1066,63 +1390,67 @@ export class GameRelay extends Emitter<RelayEvents> {
       case 'error': {
         const err = new GameRelayError(msg.code, msg.message);
         if (msg.code === 'rate_limited') {
-          this.warn('rate_limited', 'rate_limited', 'the server dropped messages: this player sent more than 120 per second; send less often (check emit and setState rates)');
-          this.room?.lanPause();
+          this.#warn('rate_limited', 'rate_limited', 'the server dropped messages: this player sent more than 120 per second; send less often (check emit and setState rates)');
+          this.#roomControl()?.lanPause();
         }
         if (msg.rid !== undefined && (this.#settle(msg.rid, (p) => p.reject(err)) || this.#expired.has(msg.rid))) return;
         this.fire('error', err);
         return;
       }
+      case 'notice':
+        this.#notice(msg.notice);
+        return;
       case 'server_restarting':
         this.#reconnectHintMs = msg.reconnectInMs;
+        // Somewhere else to reconnect (another region, a server being drained), same token and seat;
+        // a notice without one means back to where the token said.
+        this.#movedTo = this.#checked(msg.url);
         this.fire('server_restarting');
         return;
       case 'room':
         this.#lastRoomInfo = msg.room;
         this.#slots = new Map(msg.room.players.map((p) => [p.slot, p.id]));
-        if (this.room?.id === msg.room.id) this.room.sync(msg.room);
+        if (this.#room?.id === msg.room.id) this.#roomControl()?.sync(msg.room);
         return;
       case 'party':
         return this.#setParty(msg.party);
       case 'removed': {
         // Kicked or closed by the owner: forget the room so a reconnect doesn't try to rejoin it.
-        const room = this.room;
+        const room = this.#room;
         if (!room || room.id !== msg.roomId) return;
-        this.room = null;
-        room.closeLocal(msg.reason, msg.message);
+        this.#room = null;
+        rooms.get(room)?.close(msg.reason, msg.message);
         return;
       }
       case 'party_room': {
         const info = this.#lastRoomInfo;
         if (!info || info.id !== msg.roomId) return;
-        this.room?.closeLocal('left');
-        this.room = new Room(this, info, this.playerId);
-        this.fire('room', this.room);
+        this.#roomControl()?.close('left');
+        const room = this.#adopt(info);
+        this.fire('party_room', room);
+        this.fire('room', room);
         return;
       }
       default:
-        this.room?.handle(msg);
+        this.#roomControl()?.handle(msg);
     }
   }
 }
 
 export class Room extends Emitter<RoomEvents> {
-  readonly id: string;
-  readonly code: string;
-  /** Seats in the room. The host can change it (`setAccess`). */
-  maxPlayers: number;
-  hostId: PlayerId;
-  players: PlayerInfo[];
-  state: JsonObject;
-  /** Recent chat, oldest first (the last 20 when you joined, then everything you receive, capped). */
-  chatHistory: ChatMessage[];
-  /**
-   * A random 32-bit seed the server picked for this room, the same for everyone. Use it for dice,
-   * shuffles and spawns (`seededRandom(room.seed)`) so the host can't reroll until it wins.
-   */
-  seed: number;
+  readonly #id: string;
+  readonly #code: string;
+  readonly #me: PlayerId;
+  #maxPlayers: number;
+  #hostId: PlayerId;
+  #players: PlayerInfo[];
+  #state: JsonObject;
+  /** `#state`'s top level as the SDK last set it, to notice the game writing to it (`#checkState`). */
+  #stateSeen: { of: JsonObject; values: Map<string, Json> } | null = null;
+  #chatHistory: ChatMessage[];
+  #seed: number;
 
-  readonly #relay: GameRelay;
+  readonly #relay: RelayLink;
   readonly #entities: EntityStore;
   readonly #messages: Messages;
   readonly #custom = new Map<string, Set<CustomHandler>>();
@@ -1155,26 +1483,26 @@ export class Room extends Emitter<RoomEvents> {
   /** The room's short link, once asked for (it's the same for the room's life), and once it's here. */
   #shareLink: Promise<string> | null = null;
   #shareUrl: string | null = null;
+  /** The short link's id (`?join=<id>`), once it's here. */
+  #linkId: string | null = null;
   #name: string | null;
   #meta: Json | null;
 
-  /** @internal */
-  constructor(
-    relay: GameRelay,
-    info: RoomInfo,
-    /** Your player id. */
-    readonly me: PlayerId,
-  ) {
+  /** @internal Rooms come from the relay (`createRoom`, `joinRoom`, …). */
+  constructor(token: typeof CREATE, relay: RelayLink, info: RoomInfo, me: PlayerId, link?: string) {
+    if (token !== CREATE) throw new GameRelayError('bad_request', 'Rooms come from the relay: `await relay.createRoom()`, `relay.joinRoom(code)` or `relay.quickMatch()`, not `new Room()`');
     super();
     this.#relay = relay;
-    this.id = info.id;
-    this.code = info.code;
-    this.maxPlayers = info.maxPlayers;
-    this.hostId = info.hostId;
-    this.players = info.players;
-    this.state = info.state;
-    this.chatHistory = info.chat ?? [];
-    this.seed = info.seed;
+    this.#me = me;
+    this.#linkId = link ?? null;
+    this.#id = info.id;
+    this.#code = info.code;
+    this.#maxPlayers = info.maxPlayers;
+    this.#hostId = info.hostId;
+    this.#players = frozen(info.players);
+    this.#state = info.state;
+    this.#chatHistory = frozen(info.chat ?? []);
+    this.#seed = info.seed;
     this.#locked = info.locked ?? false;
     this.#public = info.public ?? false;
     this.#linkOnly = info.linkOnly ?? false;
@@ -1186,11 +1514,21 @@ export class Room extends Emitter<RoomEvents> {
       send: (data, o) => this.#queueSend(data, o.to, o.reliable, o.host || this.#timers.firing, o.supersedable),
       now: () => relay.now(),
       writeTime: () => relay.writeTime(),
-      player: (id) => this.players.find((p) => p.id === id),
-      hostId: () => this.hostId,
+      player: (id) => this.#players.find((p) => p.id === id),
+      hostId: () => this.#hostId,
       ready: () => relay.connected,
     };
     const warn: Warn = (kind, key, message) => relay.warn(kind, key, message);
+    rooms.set(this, {
+      handle: (msg) => this.#handle(msg),
+      sync: (next) => this.#sync(next),
+      close: (reason, message) => this.#closeLocal(reason, message),
+      dispose: () => this.#dispose(),
+      closeLan: () => this.#lan.close(),
+      lanPause: () => this.#lan.pause(),
+      lanPartyChanged: () => this.#lan.directChanged(),
+      debugInfo: () => this.#debugInfo(),
+    });
     this.#entities = new EntityStore(transport, {
       onSpawn: (e) => this.#fireEntity(this.#spawnHandlers, e),
       onRemove: (e, reason) => this.#fireEntity(this.#removeHandlers, e, reason),
@@ -1209,7 +1547,7 @@ export class Room extends Emitter<RoomEvents> {
       batch: (fn) => this.#batchState(fn),
       now: () => relay.now(),
       isHost: () => this.isHost,
-      state: () => this.state,
+      state: () => this.#state,
       setState: (patch) => this.#writeState(patch),
       fire: (name) => this.#fireTimer(name),
     });
@@ -1231,8 +1569,8 @@ export class Room extends Emitter<RoomEvents> {
       enabled: relay.lanEnabled,
       signal: (to, data) => relay.queue({ t: 'send', d: data, to }),
       now: () => relay.now(),
-      hostId: () => this.hostId,
-      players: () => this.players.map((p) => p.id),
+      hostId: () => this.#hostId,
+      players: () => this.#players.map((p) => p.id),
       serverReady: () => relay.serverReady,
       withinRate: () => relay.lanWithinRate(),
       relay: { only: relay.lanForceRelay },
@@ -1241,7 +1579,7 @@ export class Room extends Emitter<RoomEvents> {
       log: (m) => console.info(`[gamerelay] ${m}`),
     });
     this.#lan.stateAt(info.stateSeq);
-    for (const p of this.players) this.#lan.add(p.id);
+    for (const p of this.#players) this.#lan.add(p.id);
     this.#fetchIce();
     this.#stopLoop = relay.tick(60, () => {
       // Fresh credentials, and the owner's current say on direct connections (even without relays).
@@ -1253,6 +1591,7 @@ export class Room extends Emitter<RoomEvents> {
       this.#requests.tick();
       this.#claims.tick();
       this.#inputs.tick();
+      this.#checkState();
     });
     if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
       const report = () => this.#health.visibility(document.hidden);
@@ -1262,9 +1601,82 @@ export class Room extends Emitter<RoomEvents> {
     }
   }
 
+  /** The room's id (stable for its life). */
+  get id(): string {
+    return this.#id;
+  }
+
+  /** The join code friends type (`relay.joinRoom(code)`). */
+  get code(): string {
+    return this.#code;
+  }
+
+  /** Your player id. */
+  get me(): PlayerId {
+    return this.#me;
+  }
+
+  /** Seats in the room. The host can change it (`setAccess`). */
+  get maxPlayers(): number {
+    return this.#maxPlayers;
+  }
+
+  /** The host's player id. */
+  get hostId(): PlayerId {
+    return this.#hostId;
+  }
+
+  /** Everyone in the room, you included, in join order. */
+  get players(): PlayerInfo[] {
+    return this.#players;
+  }
+
+  /**
+   * The shared room state (read it; the host changes it with `setState`). Writing a key here
+   * changes only your copy, so it warns: use `room.setState({ key: value })`.
+   */
+  get state(): JsonObject {
+    return this.#state;
+  }
+
+  /**
+   * Once a frame: did the game write to `room.state` itself? (A plain object, not a Proxy, so the
+   * game can still clone it, post it to a worker, or store it.)
+   */
+  #checkState(): void {
+    const state = this.#state;
+    const seen = this.#stateSeen;
+    if (seen?.of !== state) {
+      this.#stateSeen = { of: state, values: new Map(Object.entries(state)) };
+      return;
+    }
+    let changed = Object.keys(state).length !== seen.values.size;
+    if (!changed) for (const [k, v] of seen.values) if (state[k] !== v) changed = true;
+    if (!changed) return;
+    this.#stateSeen = { of: state, values: new Map(Object.entries(state)) };
+    this.#stateWrite();
+  }
+
+  /** Recent chat, oldest first (the last 20 when you joined, then everything you receive, capped). */
+  get chatHistory(): ChatMessage[] {
+    return this.#chatHistory;
+  }
+
+  /**
+   * A random 32-bit seed the server picked for this room, the same for everyone. Use it for dice,
+   * shuffles and spawns (`GameRelay.seededRandom(room.seed)`) so the host can't reroll until it wins.
+   */
+  get seed(): number {
+    return this.#seed;
+  }
+
+  #stateWrite(): void {
+    this.#relay.warn('set_state', 'state_write', 'room.state.x = … changes only your copy: the host changes state for everyone with room.setState({ x: … }); others ask it (room.request)');
+  }
+
   /** True if you run the simulation. Re-check on `host_changed`. */
   get isHost(): boolean {
-    return this.hostId === this.me;
+    return this.#hostId === this.#me;
   }
 
   /** The host locked the room (`setAccess`): nobody new can join. */
@@ -1316,8 +1728,8 @@ export class Room extends Emitter<RoomEvents> {
     if (maxPlayers !== undefined && (!Number.isInteger(maxPlayers) || maxPlayers < 1 || maxPlayers > LIMITS.maxPlayersPerRoom)) {
       throw new GameRelayError('bad_request', `room.setAccess: maxPlayers must be a whole number from 1 to ${LIMITS.maxPlayersPerRoom}`);
     }
-    if (maxPlayers !== undefined && maxPlayers < this.players.length) {
-      throw new GameRelayError('bad_request', `room.setAccess: maxPlayers ${maxPlayers} is below the ${this.players.length} players in the room`);
+    if (maxPlayers !== undefined && maxPlayers < this.#players.length) {
+      throw new GameRelayError('bad_request', `room.setAccess: maxPlayers ${maxPlayers} is below the ${this.#players.length} players in the room`);
     }
     await this.#hostRequest({ t: 'set_access', locked: access.locked, public: access.public, linkOnly: access.linkOnly, maxPlayers });
   }
@@ -1362,15 +1774,27 @@ export class Room extends Emitter<RoomEvents> {
     await this.#relay.request(message);
   }
 
-  /** This page's URL with `?room=CODE`. A friend who opens it gets in with `relay.joinInvite()`. */
+  /**
+   * The room's invite on this page: its URL with `?room=CODE`, or, for a link-only room (whose
+   * code gets nobody in), `?join=<link>`. A friend who opens it gets in with `relay.joinInvite()`.
+   * Same origin as the page, so `history.replaceState(null, '', room.inviteUrl())` works.
+   */
   inviteUrl(base?: string): string {
     const url = new URL(base ?? pageUrl());
-    url.searchParams.set(INVITE_PARAM, this.code);
+    url.searchParams.delete(INVITE_PARAM);
+    url.searchParams.delete(LINK_PARAM);
+    if (this.#linkOnly && this.#linkId) url.searchParams.set(LINK_PARAM, this.#linkId);
+    else {
+      if (this.#linkOnly) {
+        this.#relay.warn('invite', 'invite_link_only', "room.inviteUrl(): this room is link-only and its link hasn't arrived yet, so the code's link won't get anyone in; await room.shareLink() first");
+      }
+      url.searchParams.set(INVITE_PARAM, this.#code);
+    }
     return url.href;
   }
 
   /**
-   * The room's short link: `https://gamerelay.io/<game>/<link>` when the game has a slug (set in
+   * The room's short link: `https://play.gamerelay.io/<game>/<link>` when the game has a slug (set in
    * the dashboard), which previews with the room's name and the game's cover image and sends
    * players to the game's play URL with `?join=<link>`; otherwise this page's URL with
    * `?join=<link>`. Either way `relay.joinInvite()` joins it. The same link for the room's life,
@@ -1381,6 +1805,7 @@ export class Room extends Emitter<RoomEvents> {
       (data) => {
         const { link, url } = (data ?? {}) as { link?: string; url?: string | null };
         if (!link) throw new GameRelayError('internal', 'room.shareLink: the server sent no link');
+        this.#linkId = link;
         if (url) return (this.#shareUrl = url);
         const page = new URL(pageUrl());
         page.searchParams.delete(INVITE_PARAM);
@@ -1398,12 +1823,18 @@ export class Room extends Emitter<RoomEvents> {
   /**
    * Share the invite: the room's short link (`shareLink`, fetched when you entered the room), or
    * its code's (`inviteUrl`) from a server without short links. The share sheet on phones, the clipboard elsewhere. Resolves with
-   * what happened (`'cancelled'` if the player closed the share sheet).
+   * what happened (`'cancelled'` if the player closed the share sheet). Rejects for a link-only
+   * room whose link it couldn't get: its code gets nobody in.
    */
   async shareInvite(text = 'Join my game'): Promise<'shared' | 'copied' | 'cancelled'> {
     // The link fetched on entering the room, so the share stays in the tap; only if it isn't here
     // yet (or the server has no short links) does this wait, or fall back to the code's link.
-    const url = this.#shareUrl ?? (await this.shareLink().catch(() => this.inviteUrl()));
+    const url =
+      this.#shareUrl ??
+      (await this.shareLink().catch((err: unknown) => {
+        if (this.#linkOnly) throw err;
+        return this.inviteUrl();
+      }));
     if (typeof navigator.share === 'function' && matchMedia('(pointer: coarse)').matches) {
       try {
         await navigator.share({ title: document.title, text, url });
@@ -1413,7 +1844,11 @@ export class Room extends Emitter<RoomEvents> {
         // Share refused (no user gesture, permissions): copy instead.
       }
     }
-    await navigator.clipboard.writeText(url);
+    try {
+      await navigator.clipboard.writeText(url);
+    } catch (err) {
+      throw new GameRelayError('unsupported', `room.shareInvite: this page can't copy (${err instanceof Error ? err.message : 'no clipboard'}); show room.inviteUrl() for the player to copy`, { cause: err });
+    }
     return 'copied';
   }
 
@@ -1441,7 +1876,7 @@ export class Room extends Emitter<RoomEvents> {
    * Everything else the room sends goes out here. What others will see (state, claims, chat, seed,
    * a step down) is a barrier for the LAN shortcut: no later broadcast's LAN copy may overtake it.
    */
-  #queue(m: Parameters<GameRelay['queue']>[0]): void {
+  #queue(m: Outgoing): void {
     if (m.t !== 'heartbeat' && m.t !== 'visibility') this.#lan.barrier();
     this.#relay.queue(m);
   }
@@ -1477,35 +1912,32 @@ export class Room extends Emitter<RoomEvents> {
       .catch((err: GameRelayError) => none(err.message));
   }
 
-  /** @internal Our party changed: direct connections follow who's in it (`lan: { direct: 'party' }`). */
-  lanPartyChanged(): void {
-    this.#lan.directChanged();
-  }
-
-  /** @internal The connection is closed or replaced: close the LAN channels too. */
-  closeLan(): void {
-    this.#lan.close();
-  }
-
-  /** @internal The server rate-limited us: LAN copies pause too (see `Lan.pause`). */
-  lanPause(): void {
-    this.#lan.pause();
-  }
-
   /**
-   * Experimental (`connect({ lan: true })`): the players you have a direct LAN channel with. Their
-   * broadcasts reach you over it as well as through the server, and you keep whichever comes first.
+   * The players you have a player-to-player channel with (`connect({ p2p })`). Their broadcasts
+   * reach you over it as well as through the server, and you keep whichever comes first.
+   * @experimental
    */
-  lanPeers(): PlayerId[] {
+  p2pPeers(): PlayerId[] {
     return this.#lan.peers();
   }
 
   /**
-   * Experimental: how the LAN shortcut's channel with a player goes: `'direct'` (the same network)
-   * or `'relay'` (through our TURN relay). `null`: no channel, or not known yet.
+   * How the player-to-player channel with a player goes: `'direct'` (the same network, or a party
+   * member over the internet) or `'relay'` (through a TURN relay). `null`: no channel, or not known yet.
+   * @experimental
    */
-  lanRoute(playerId: PlayerId): 'direct' | 'relay' | null {
+  p2pRoute(playerId: PlayerId): 'direct' | 'relay' | null {
     return this.#lan.route(playerId);
+  }
+
+  /** @deprecated The old name of `p2pPeers`. */
+  lanPeers(): PlayerId[] {
+    return this.p2pPeers();
+  }
+
+  /** @deprecated The old name of `p2pRoute`. */
+  lanRoute(playerId: PlayerId): 'direct' | 'relay' | null {
+    return this.p2pRoute(playerId);
   }
 
   /** Host only. Shallow-merges `patch` into the shared, persisted room state (`null` deletes a key). */
@@ -1520,7 +1952,7 @@ export class Room extends Emitter<RoomEvents> {
   /** Apply and send a state patch (or add it to the running batch). The SDK's own writes use this. */
   #writeState(patch: JsonObject): void {
     if (!this.isHost) throw new GameRelayError('not_host', 'Only the host can set state');
-    this.state = applyPatch(this.state, patch);
+    this.#state = applyPatch(this.#state, patch);
     if (this.#batchPatch) Object.assign(this.#batchPatch, patch);
     else this.#queue({ t: 'set_state', patch });
   }
@@ -1583,7 +2015,10 @@ export class Room extends Emitter<RoomEvents> {
     });
   }
 
-  /** Create an entity you own. Write its fields every frame; the SDK sends changes (~20/s). */
+  /**
+   * Create an entity you own. Write its fields every frame; the SDK sends changes (~20/s).
+   * @deprecated Use the kind's handle: `const ships = room.define('ship', …)`, then `ships.spawn(…)`.
+   */
   spawn(kind: string, initial: Record<string, unknown>, options?: SpawnOptions): Entity {
     return this.#entities.spawn(kind, initial, options);
   }
@@ -1622,6 +2057,11 @@ export class Room extends Emitter<RoomEvents> {
   }
 
   /** Who holds `key`, or null. */
+  holder(key: string): PlayerId | null {
+    return this.#claims.holder(key);
+  }
+
+  /** Who holds `key`, or null. @deprecated The old name of `holder` (it reads like the `claimed` event). */
   claimed(key: string): PlayerId | null {
     return this.#claims.holder(key);
   }
@@ -1668,10 +2108,10 @@ export class Room extends Emitter<RoomEvents> {
    */
   assignTeams(n: number, options: { rebalance?: boolean } = {}): void {
     if (!this.isHost) throw new GameRelayError('not_host', 'room.assignTeams: only the host assigns teams; check room.isHost');
-    if (!Number.isInteger(n) || n < 1 || n > this.maxPlayers) {
-      throw new GameRelayError('bad_request', `room.assignTeams(n): n must be a whole number from 1 to ${this.maxPlayers} (the room's maxPlayers)`);
+    if (!Number.isInteger(n) || n < 1 || n > this.#maxPlayers) {
+      throw new GameRelayError('bad_request', `room.assignTeams(n): n must be a whole number from 1 to ${this.#maxPlayers} (the room's maxPlayers)`);
     }
-    const teams = balanceTeams(this.players.map((p) => p.id), this.#teams(), n, options.rebalance === true);
+    const teams = balanceTeams(this.#players.map((p) => p.id), this.#teams(), n, options.rebalance === true);
     this.#writeState({ [TEAMS_KEY]: teams, [TEAM_COUNT_KEY]: n });
   }
 
@@ -1682,24 +2122,28 @@ export class Room extends Emitter<RoomEvents> {
   }
 
   #teams(): Record<PlayerId, number> {
-    const raw = this.state[TEAMS_KEY];
+    const raw = this.#state[TEAMS_KEY];
     return raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<PlayerId, number>) : {};
   }
 
   /** On the host, while teams are on: place newcomers and drop leavers (nobody else moves). */
   #keepTeams(): void {
-    const n = this.state[TEAM_COUNT_KEY];
+    const n = this.#state[TEAM_COUNT_KEY];
     if (!this.isHost || typeof n !== 'number') return;
     const current = this.#teams();
-    const next = balanceTeams(this.players.map((p) => p.id), current, n, false);
+    const next = balanceTeams(this.#players.map((p) => p.id), current, n, false);
     if (JSON.stringify(next) !== JSON.stringify(current)) this.#writeState({ [TEAMS_KEY]: next });
   }
 
-  /** Every entity of a kind: yours live, everyone else's smoothed about 100 ms in the past. */
+  /**
+   * Every entity of a kind: yours live, everyone else's smoothed about 100 ms in the past.
+   * @deprecated Use the kind's handle: `ships.all()` (from `room.define`).
+   */
   all(kind: string): Entity[] {
     return this.#entities.all(kind);
   }
 
+  /** @deprecated Use the kind's handle: `ships.get(id)` (from `room.define`). */
   get(id: string): Entity | undefined {
     return this.#entities.get(id);
   }
@@ -1716,13 +2160,14 @@ export class Room extends Emitter<RoomEvents> {
    * facts go in entities or room state. Nothing is kept for players who join later.
    */
   emit(type: string, data: Json = null, options: { to?: PlayerId | 'host'; echo?: boolean } = {}): void {
-    const to = options.to === 'host' ? this.hostId : options.to;
+    const to = options.to === 'host' ? this.#hostId : options.to;
     this.#messages.emit(type, data, { to, echo: options.echo });
   }
 
   override on<K extends keyof RoomEvents>(event: K, handler: RoomEvents[K]): () => void;
-  /** An entity of `kind` appears. Doesn't replay ones already here: loop over `room.all(kind)` for those. */
+  /** @deprecated Use the kind's handle: `ships.on('spawn', …)` (from `room.define`). */
   override on(event: 'spawn', kind: string, handler: (entity: Entity) => void): () => void;
+  /** @deprecated Use the kind's handle: `ships.on('remove', …)` (from `room.define`). */
   override on(event: 'remove', kind: string, handler: (entity: Entity, reason: RemoveReason) => void): () => void;
   /** Runs on the host when the timer falls due. */
   override on(event: 'timer', name: string, handler: () => void): () => void;
@@ -1778,13 +2223,12 @@ export class Room extends Emitter<RoomEvents> {
     this.#custom.get(event)?.delete(a as CustomHandler);
   }
 
-  /** @internal For the debug overlay. */
-  debugInfo(): {
-    delayMs: number;
-    entities: Record<string, number>;
-    hosted: Record<string, number>;
-    lan: LanStats | undefined;
-  } {
+  /** @internal For the debug overlay, the eval scorer and e2e tests (`room[Symbol.for('gamerelay.debug')]()`): not part of the API. */
+  [DEBUG](): RoomDebugInfo {
+    return this.#debugInfo();
+  }
+
+  #debugInfo(): RoomDebugInfo {
     const lan = this.#relay.lanEnabled ? this.#lan.stats() : undefined;
     return { delayMs: this.#entities.delayMs, entities: this.#entities.counts(), hosted: this.#entities.hostedCounts(), lan };
   }
@@ -1811,8 +2255,8 @@ export class Room extends Emitter<RoomEvents> {
 
   /** The host role moved: hand entities over first, then tell the game. */
   #hostMoved(hostId: PlayerId, previous: PlayerId): void {
-    const was = this.hostId; // our own view decides whether we just gained or lost the role
-    this.hostId = hostId;
+    const was = this.#hostId; // our own view decides whether we just gained or lost the role
+    this.#hostId = hostId;
     this.#entities.hostChanged(hostId, was);
     this.#requests.hostChanged();
     this.#inputs.hostChanged();
@@ -1831,14 +2275,16 @@ export class Room extends Emitter<RoomEvents> {
     }
   }
 
+  /** Leave the room (you get `closed` with `'left'`). */
   async leave(): Promise<void> {
-    if (this.#relay.room === this) this.#relay.room = null;
-    this.closeLocal('left');
+    if (!this.#live) return;
+    this.#relay.left(this);
+    this.#closeLocal('left');
     await this.#relay.request({ t: 'leave_room' }).catch(() => undefined);
   }
 
-  /** @internal Stop this object's work without a `closed` event (it was replaced by a new one). */
-  dispose(): void {
+  /** Stop this object's work without a `closed` event (it was replaced by a new one). */
+  #dispose(): void {
     this.#live = false;
     this.#claims.close();
     this.#requests.close();
@@ -1847,8 +2293,8 @@ export class Room extends Emitter<RoomEvents> {
     this.#unwatchVisibility();
   }
 
-  /** @internal */
-  closeLocal(reason: CloseReason, message?: string): void {
+  #closeLocal(reason: CloseReason, message?: string): void {
+    if (!this.#live) return;
     this.#live = false;
     this.#claims.close();
     this.#requests.close();
@@ -1858,14 +2304,14 @@ export class Room extends Emitter<RoomEvents> {
     this.fire('closed', reason, message);
   }
 
-  /** @internal Resync after a reconnect, emitting events for anything that changed. */
-  sync(info: RoomInfo): void {
+  /** Resync after a reconnect, emitting events for anything that changed. */
+  #sync(info: RoomInfo): void {
     this.#lan.resync(); // the server doesn't replay what we missed: held LAN copies' server copies aren't coming
     this.#lan.stateAt(info.stateSeq);
     this.#fetchIce();
-    const before = new Map(this.players.map((p) => [p.id, p]));
+    const before = new Map(this.#players.map((p) => [p.id, p]));
     const after = new Set(info.players.map((p) => p.id));
-    this.players = info.players;
+    this.#players = frozen(info.players);
     for (const p of info.players) {
       if (before.has(p.id)) continue;
       this.#entities.playerJoined(p.id);
@@ -1881,29 +2327,29 @@ export class Room extends Emitter<RoomEvents> {
     }
     // State first: becoming host here must work from the room's current state, not our stale copy
     // (teams, timers), or it would write the stale values back.
-    this.state = info.state;
-    if (info.hostId !== this.hostId) this.#hostMoved(info.hostId, this.hostId);
+    this.#state = info.state;
+    if (info.hostId !== this.#hostId) this.#hostMoved(info.hostId, this.#hostId);
     this.fire('state', this.state, info.state, info.hostId);
     this.#claims.sync(info.claims);
     this.#keepTeams();
-    if (info.seed !== this.seed) {
-      this.seed = info.seed;
+    if (info.seed !== this.#seed) {
+      this.#seed = info.seed;
       this.fire('seed', info.seed, info.hostId);
     }
     // Host controls that changed while we were away.
     const access: RoomAccess = { locked: info.locked ?? false, public: info.public ?? false, linkOnly: info.linkOnly ?? false, maxPlayers: info.maxPlayers };
-    if (access.locked !== this.#locked || access.public !== this.#public || access.linkOnly !== this.#linkOnly || access.maxPlayers !== this.maxPlayers) this.#setAccess(access, info.hostId);
+    if (access.locked !== this.#locked || access.public !== this.#public || access.linkOnly !== this.#linkOnly || access.maxPlayers !== this.#maxPlayers) this.#setAccess(access, info.hostId);
     const listing: RoomListingInfo = { name: info.name ?? null, meta: info.meta ?? null };
     if (listing.name !== this.#name || JSON.stringify(listing.meta) !== JSON.stringify(this.#meta)) this.#setListing(listing, info.hostId);
     // Deliver chat that arrived while we were reconnecting.
-    const seen = new Set(this.chatHistory.map((m) => m.id));
+    const seen = new Set(this.#chatHistory.map((m) => m.id));
     for (const m of info.chat ?? []) if (!seen.has(m.id)) this.#receiveChat(m);
     // Whatever LAN signalling went on while we were away went nowhere: start again.
     this.#lan.reconnect();
   }
 
   #receiveChat(message: ChatMessage): void {
-    this.chatHistory = [...this.chatHistory, message].slice(-LIMITS.chatHistory * 5);
+    this.#chatHistory = frozen([...this.#chatHistory, message].slice(-LIMITS.chatHistory * 5));
     this.fire('chat', message);
   }
 
@@ -1913,8 +2359,7 @@ export class Room extends Emitter<RoomEvents> {
     this.fire('message', d, from, { at });
   }
 
-  /** @internal */
-  handle(msg: ServerMessage): void {
+  #handle(msg: ServerMessage): void {
     // An event the server sent everyone (a host change, a join, a claim): a reaction we broadcast
     // to it must not reach a LAN peer before the event itself does. A state patch carries a number
     // instead (`Lan.stateAt`), which a LAN peer checks for itself: no barrier, no wait.
@@ -1925,22 +2370,22 @@ export class Room extends Emitter<RoomEvents> {
         if (isWrapped(msg.d)) return this.#lan.receiveServer(msg.from, msg.d, msg.at);
         return this.#receive(msg.d, msg.from, msg.at);
       case 'seed':
-        this.seed = msg.seed;
+        this.#seed = msg.seed;
         return this.fire('seed', msg.seed, msg.from);
       case 'chat':
         return this.#receiveChat(msg.message);
       case 'state':
-        this.state = applyPatch(this.state, msg.patch);
+        this.#state = applyPatch(this.#state, msg.patch);
         this.fire('state', this.state, msg.patch, msg.from);
         return this.#lan.stateAt(msg.seq); // after the handlers: what it frees comes after the patch
       case 'player_joined':
-        this.players = [...this.players.filter((p) => p.id !== msg.player.id), msg.player];
+        this.#players = frozen([...this.#players.filter((p) => p.id !== msg.player.id), msg.player]);
         this.#entities.playerJoined(msg.player.id);
         this.#lan.add(msg.player.id, false); // the newcomer starts
         this.#keepTeams();
         return this.fire('player_joined', msg.player);
       case 'player_left':
-        this.players = this.players.filter((p) => p.id !== msg.playerId);
+        this.#players = frozen(this.#players.filter((p) => p.id !== msg.playerId));
         this.#entities.playerLeft(msg.playerId);
         this.#inputs.playerLeft(msg.playerId);
         this.#lan.remove(msg.playerId);
@@ -1949,7 +2394,7 @@ export class Room extends Emitter<RoomEvents> {
       case 'player_disconnected':
       case 'player_reconnected': {
         const connected = msg.t === 'player_reconnected';
-        this.players = this.players.map((p) => (p.id === msg.playerId ? { ...p, connected } : p));
+        this.#players = frozen(this.#players.map((p) => (p.id === msg.playerId ? { ...p, connected } : p)));
         return this.fire(msg.t, msg.playerId);
       }
       case 'host_changed':
@@ -1970,7 +2415,9 @@ export class Room extends Emitter<RoomEvents> {
     this.#public = access.public;
     // An older server's `access` doesn't say: it has no link-only rooms.
     this.#linkOnly = access.linkOnly ?? false;
-    this.maxPlayers = access.maxPlayers;
+    // Its invite is its short link now (`inviteUrl`): the host, who made it so, has it ready.
+    if (this.#linkOnly && !this.#linkId && this.#live && this.isHost) void this.shareLink().catch(() => {});
+    this.#maxPlayers = access.maxPlayers;
     this.fire('access', { locked: access.locked, public: access.public, linkOnly: this.#linkOnly, maxPlayers: access.maxPlayers }, from);
   }
 
@@ -1979,6 +2426,11 @@ export class Room extends Emitter<RoomEvents> {
     this.#meta = listing.meta;
     this.fire('listing', { name: listing.name, meta: listing.meta }, from);
   }
+}
+
+/** A list the game reads but can't change in place (`room.players`, `room.chatHistory`). */
+function frozen<T>(list: T[]): T[] {
+  return Object.freeze(list) as T[];
 }
 
 /** Keys a patch may not set: assigning them would change the state object's prototype, not its data. */

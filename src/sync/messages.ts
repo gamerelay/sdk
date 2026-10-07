@@ -23,6 +23,8 @@ export const RESERVED_EVENTS = new Set([
   'timer',
   'claimed',
   'released',
+  'access',
+  'listing',
 ]);
 const NAME = /^[A-Za-z][\w:.-]{0,63}$/;
 const RATE_WARN = 30;

@@ -1,6 +1,6 @@
 {
   "name": "@gamerelay/sdk",
-  "version": "0.1.0-alpha.5",
+  "version": "0.1.0-alpha.6",
   "description": "Multiplayer for browser games without a server: rooms, entity sync with smoothing, host migration, chat and leaderboards. Zero dependencies.",
   "private": true,
   "type": "module",
