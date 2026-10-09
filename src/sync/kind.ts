@@ -61,7 +61,7 @@ export interface KindHost {
 export function makeKind<F>(name: string, host: KindHost): Kind<F> {
   const check = () => {
     if (!host.live()) {
-      throw new GameRelayError('bad_request', `\`${name}\` belongs to a room you left; call room.define('${name}', …) again in the new room`);
+      throw new GameRelayError('disconnected', `\`${name}\` belongs to a room you left; call room.define('${name}', …) again in the new room`);
     }
   };
   const kind = {

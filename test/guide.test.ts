@@ -93,7 +93,7 @@ describe('llms.txt starters', () => {
       const block = guide.slice(at).match(/```html\n([\s\S]*?)```/)?.[1] ?? '';
       expect(block).toContain("publicKey: 'gr_pub_…'");
       expect(block).toContain('maxPlayers: 4');
-      expect(block).toContain('<script src="https://gamerelay.io/sdk/gamerelay.js"></script>');
+      expect(block).toContain('<script src="https://gamerelay.io/sdk/v0/gamerelay.js"></script>');
     }
   });
 });
@@ -169,4 +169,13 @@ describe('claims shared with the other docs', () => {
     expect(RELAY_EVENTS).toContain('replaced');
     expect([...INTERNAL]).toEqual(['constructor']); // the rest is out of reach (src/internal.ts)
   });
+});
+
+test('jsDelivr links name files the npm package has: they sit at its root, not under dist/', async () => {
+  for (const f of ['llms.txt', 'README.md', 'CHANGELOG.md']) {
+    const text = await Bun.file(new URL(`../${f}`, import.meta.url)).text();
+    for (const [url] of text.matchAll(/https:\/\/cdn\.jsdelivr\.net\/npm\/@gamerelay\/sdk@[^\s`)]+/g)) {
+      expect(url).toMatch(/@gamerelay\/sdk@[^/]+\/gamerelay\.m?js$/);
+    }
+  }
 });

@@ -4,12 +4,39 @@ Every release of `@gamerelay/sdk`, newest first. The notes under a version's hea
 GitHub release. Until 1.0, a minor version (0.x.0) may change the API; each break is listed
 here with what to change.
 
+## 0.1.0-alpha.7 (2026-10-09)
+
+- **Fix:** messages the server sent right after a join's answer, in the same frame (a state
+  change, a new host, entity updates), were lost, or went to the room you were leaving. They reach
+  the new room now. Their events fire before `await relay.joinRoom()` returns, like anything that
+  happened before you joined; `room.state`, `room.players` and entities are right.
+- **Change:** a room that's closed (left, kicked, lost, or replaced by joining it again) sends
+  nothing, instead of reaching the room you're in now. `send`, `emit`, `setState`, `chat`,
+  `reseed`, `assignTeams`, `timer`, `clearTimer`, `input` and `release` on it are dropped with a
+  console warning that says why it closed, host or not. `request`, `shareLink` and the host
+  controls reject with `disconnected`, as a request still waiting at the close does. `claim`
+  resolves `false` (with the warning), and `spawn` (a kind's too) throws `disconnected`. What the
+  old room sends while a `joinRoom`, `createRoom` or `quickMatch` waits for its answer is held: it's
+  dropped if you get in, and sent to the room you're still in if the join fails. Moving to another
+  room (yours or your party leader's) fires the old room's `closed` once the server's message is
+  handled, so a handler there may enter a room; `party_room` and `room` fire after it. Stop a
+  room's loop on `room.on('closed')`.
+- **Fix:** a field's `precision` that isn't a power of ten keeps its own steps: `precision: 0.25`
+  sends quarters (it sent tenths: 0.25 went out as 0.3).
+- **Change:** `precision` must be a finite number above 0. A string such as `'0.1'` (which worked
+  by accident) or `Infinity` now throws at `room.define`; pass a number.
+
+- **Fix:** `simulate: { latency, jitter }` could send two messages out of order, and the server
+  drops a message that arrives after a later one: a call such as `quickMatch()` then got no answer
+  (`timeout`), and enough of them closed the connection. The simulated network keeps order now.
+  Without `simulate`, nothing changes.
+
 ## 0.1.0-alpha.6 (2026-10-07)
 
 - **Versions:** `https://gamerelay.io/sdk/v0/gamerelay.js` (and `.mjs`) is the `v0` line, which only
   changes in ways that keep games working (a rename keeps the old name as a deprecated alias for at
   least 30 days); `/sdk/gamerelay.js` stays on `v0` forever. Pin an exact version through jsDelivr
-  (`https://cdn.jsdelivr.net/npm/@gamerelay/sdk@<version>/dist/gamerelay.js`).
+  (`https://cdn.jsdelivr.net/npm/@gamerelay/sdk@<version>/gamerelay.js`).
   `GameRelay.version` is the SDK's version. llms.txt: "Versions".
 - **The SDK tells the server what it is** (`sdk=js/<version>`, `caps=` on the socket URL), and shows
   the server's notices once in the console (e.g. "this SDK version is old"). A version the server

@@ -54,7 +54,8 @@ export interface RoomControl {
   /** Resync after a reconnect, with events for whatever changed. */
   sync(info: RoomInfo): void;
   /** Out of the room: stop, and fire `closed`. */
-  close(reason: 'left' | 'lost' | 'kicked' | 'closed', message?: string): void;
+  /** `later`: fire `closed` a microtask from now (it's closing while a server batch is handled). */
+  close(reason: 'left' | 'lost' | 'kicked' | 'closed', message?: string, later?: boolean): void;
   /** Stop without a `closed` event (a new object replaces this one). */
   dispose(): void;
   /** The connection is closed or replaced: close the p2p channels too. */

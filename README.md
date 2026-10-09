@@ -28,7 +28,7 @@ npm i @gamerelay/sdk
 Or without a build step:
 
 ```html
-<script src="https://gamerelay.io/sdk/gamerelay.js"></script>
+<script src="https://gamerelay.io/sdk/v0/gamerelay.js"></script>
 <!-- exposes window.GameRelay -->
 ```
 
@@ -78,7 +78,10 @@ field doesn't compile.
 To play with friends, put the room in the page URL and send the link:
 
 ```js
-const room = (await relay.joinInvite().catch(() => null)) ?? (await relay.createRoom({ maxPlayers: 4 }));
+// Came in through an invite link? Join that room; otherwise make a new one.
+const room =
+  (await relay.joinInvite().catch(() => null)) ??
+  (await relay.createRoom({ maxPlayers: 4 }));
 history.replaceState(null, '', room.inviteUrl()); // the address bar is now the invite link
 ```
 
@@ -91,7 +94,9 @@ it (`?join=`). `createRoom({ linkOnly: true })` makes a room that only its link 
 
 `https://gamerelay.io/sdk/v0/gamerelay.js` (and `.mjs`) is the `v0` line and updates in place;
 `/sdk/gamerelay.js` is the same line, forever. To pin one exact version, load it from npm through
-jsDelivr: `https://cdn.jsdelivr.net/npm/@gamerelay/sdk@0.1.0-alpha.6/dist/gamerelay.js`.
+jsDelivr: `https://cdn.jsdelivr.net/npm/@gamerelay/sdk@0.1.0-alpha.7/gamerelay.js`. Until the SDK
+reaches 1.0, a pinned alpha may be asked to update: new server features can need the newest alpha,
+and old alphas stop being accepted sooner than they will after 1.0.
 `GameRelay.version` is the running version. The server may print a notice in the console
 (`[gamerelay] …`) when a version gets old; one it no longer accepts makes `connect()` reject with
 `upgrade_required`. Every rejection is a `GameRelayError` with a `code`. What changed in each

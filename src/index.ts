@@ -7,6 +7,7 @@ import { normalizeChat, normalizeLine } from '@gamerelay/protocol/chat';
 import { signFrame, unmaskKey, type FrameKey } from '@gamerelay/protocol/sign';
 import { CLOSE, type Notice } from '@gamerelay/protocol/clients';
 import { SDK_VERSION } from './version';
+import { lane } from './core/lane';
 import { followable } from './core/hosts';
 import { attempt, safeStorage } from '@gamerelay/protocol/util';
 import {
@@ -379,15 +380,6 @@ const monotonic = () => performance.timeOrigin + performance.now();
 /** The LAN shortcut asks for fresh relay credentials this often (they last an hour on the server). */
 const ICE_REFRESH_MS = 20 * 60 * 1000;
 
-/** Delays callbacks by half the simulated latency ± jitter, never reordering them. */
-function lane({ latency = 0, jitter = 0 }: NetworkSimulation): (fn: () => void) => void {
-  let at = 0;
-  return (fn) => {
-    const now = Date.now();
-    at = Math.max(at, now + latency / 2 + (Math.random() * 2 - 1) * jitter);
-    setTimeout(fn, at - now);
-  };
-}
 
 /**
  * Sends are batched into one frame, but never wait on a frame that won't come: background tabs
@@ -521,6 +513,13 @@ export class GameRelay extends Emitter<RelayEvents> {
   readonly #pongs = new Map<number, number>();
   readonly #expired = new Set<number>();
   #outbox: Outgoing[] = [];
+  /**
+   * While a join is waiting for its answer, what the current room queues (and what it had queued)
+   * waits here: the server would handle it after the join, in the new room. A join that gets in
+   * drops it, as the room it was for is closed; one that fails sends it, as we're still there.
+   */
+  #held: Outgoing[] | null = null;
+  #entering = 0;
   /** The server's rate limit for this connection, charged as it charges (see `lanWithinRate`). */
   readonly #budget = new SendBudget(performance.now());
   #flushScheduled = false;
@@ -851,6 +850,7 @@ export class GameRelay extends Emitter<RelayEvents> {
     if (this.#reconnectTimer) clearTimeout(this.#reconnectTimer);
     this.#flushRetry = this.#reconnectTimer = null;
     this.#outbox = [];
+    this.#held = null;
     this.#unwatchPage();
     this.#failPending();
     // Last, with the connection gone: a `closed` handler that calls the relay is told it's closed.
@@ -865,6 +865,7 @@ export class GameRelay extends Emitter<RelayEvents> {
 
   #queue(message: Outgoing): void {
     if (this.#shut) return;
+    if (this.#held) return void this.#held.push(message);
     this.#outbox.push(message);
     if (!this.#flushScheduled) {
       this.#flushScheduled = true;
@@ -872,12 +873,23 @@ export class GameRelay extends Emitter<RelayEvents> {
     }
   }
 
-  #request(message: Request): Promise<Json | undefined> {
+  /** `then`: runs on the reply as it is handled, before the rest of its batch; its result is what resolves. */
+  #request(message: Request): Promise<Json | undefined>;
+  #request<T>(message: Request, then: (data: Json | undefined) => T): Promise<T>;
+  #request(message: Request, then?: (data: Json | undefined) => unknown): Promise<unknown> {
     if (!this.connected) return Promise.reject(new GameRelayError('disconnected', this.#shut ? 'This connection was closed; connect again' : 'Not connected'));
     // What was queued first goes first, leaving the budget a token for the request itself.
     if (!this.#resuming) this.#flush(1);
     const rid = ++this.#rid;
-    return new Promise((resolve, reject) => {
+    return new Promise((done, reject) => {
+      const resolve = (data: Json | undefined) => {
+        if (!then) return done(data);
+        try {
+          done(then(data));
+        } catch (err) {
+          reject(err);
+        }
+      };
       const timer = setTimeout(() => {
         if (!this.#settle(rid, () => {})) return;
         // Its answer may still come: drop it then, as nobody is waiting for it any more.
@@ -935,18 +947,48 @@ export class GameRelay extends Emitter<RelayEvents> {
     this.#probe();
   }
 
-  /** `link`: the short link's id, when that's how we got in (`joinLink`). */
-  async #enter(message: Request, link?: string): Promise<Room> {
-    const data = await this.#request(message);
-    const info = this.#lastRoomInfo;
-    if (!info || typeof data !== 'object' || data === null || Array.isArray(data) || info.id !== data.roomId) {
-      throw new GameRelayError('internal', 'Room snapshot missing');
+  /**
+   * `link`: the short link's id, when that's how we got in (`joinLink`). The Room is made as the
+   * reply is handled, not after an await: the server sends the reply and the room's next messages
+   * in one batch, and those are for the new Room, not the old one or none. Their effects (state,
+   * players, entities) land; their events fire before the game has the Room to listen on, as they
+   * would for anything that happened before it joined.
+   */
+  #enter(message: Request, link?: string): Promise<Room> {
+    const entering = this.#request(message, (data) => {
+      const info = this.#lastRoomInfo;
+      if (!info || typeof data !== 'object' || data === null || Array.isArray(data) || info.id !== data.roomId) {
+        throw new GameRelayError('internal', 'Room snapshot missing');
+      }
+      this.#entered(true);
+      const old = this.#room;
+      // The new Room first: if making it throws, the old one is still ours.
+      const room = this.#adopt(info, link);
+      // Leaving a room closes it; re-entering the same one replaces the object, so stop the old one's loop.
+      if (old && old.id !== info.id) rooms.get(old)?.close('left', undefined, true);
+      else if (old) rooms.get(old)?.dispose();
+      return room;
+    });
+    // After #request sent the join (and flushed what it could before it): the rest waits.
+    if (this.#entering++ === 0 && this.connected) {
+      this.#held = this.#outbox;
+      this.#outbox = [];
     }
-    const old = this.#room;
-    // Leaving a room closes it; re-entering the same one replaces the object, so stop the old one's loop.
-    if (old && old.id !== info.id) rooms.get(old)?.close('left');
-    else if (old) rooms.get(old)?.dispose();
-    return this.#adopt(info, link);
+    return entering.catch((err: unknown) => {
+      this.#entered(false);
+      throw err;
+    });
+  }
+
+  /** A join got its answer: `inside`, it got in (what was held was for the room we left). */
+  #entered(inside: boolean): void {
+    if (this.#entering === 0) return;
+    if (--this.#entering > 0 && !inside) return;
+    const held = this.#held ?? [];
+    this.#held = null;
+    if (inside) return;
+    this.#entering = 0;
+    for (const m of held) this.#queue(m);
   }
 
   /**
@@ -957,7 +999,9 @@ export class GameRelay extends Emitter<RelayEvents> {
    */
   #adopt(info: RoomInfo, link?: string): Room {
     const room = (this.#room = new Room(CREATE, this.#link, info, this.#playerId, link));
-    if (typeof location !== 'undefined' || (room.linkOnly && !link)) void room.shareLink().catch(() => {});
+    // A microtask later: this runs while a batch is handled, and asking flushes the outbox, which
+    // should wait for the batch's own messages.
+    if (typeof location !== 'undefined' || (room.linkOnly && !link)) queueMicrotask(() => void room.shareLink().catch(() => {}));
     return room;
   }
 
@@ -1322,7 +1366,7 @@ export class GameRelay extends Emitter<RelayEvents> {
 
   /**
    * A player joined or left the room the server has us in. Before its Room exists (we're still
-   * awaiting the join's reply, in the same batch), the Room will be made from `#lastRoomInfo`, so
+   * between the room's snapshot and the join's reply), the Room will be made from `#lastRoomInfo`, so
    * that is kept up to date too.
    */
   #seat(msg: Extract<ServerMessage, { t: 'player_joined' | 'player_left' }>): void {
@@ -1425,10 +1469,15 @@ export class GameRelay extends Emitter<RelayEvents> {
       case 'party_room': {
         const info = this.#lastRoomInfo;
         if (!info || info.id !== msg.roomId) return;
-        this.#roomControl()?.close('left');
+        // As in #enter: the new Room first, then the old one closed now with its `closed` fired
+        // once this batch is handled; the new room's events after that, as before.
+        const old = this.#roomControl();
         const room = this.#adopt(info);
-        this.fire('party_room', room);
-        this.fire('room', room);
+        old?.close('left', undefined, true);
+        queueMicrotask(() => {
+          this.fire('party_room', room);
+          this.fire('room', room);
+        });
         return;
       }
       default:
@@ -1477,6 +1526,8 @@ export class Room extends Emitter<RoomEvents> {
   readonly #sendRate = new Rate(20);
   /** False once this room object was left, closed or replaced: kind handles then throw. */
   #live = true;
+  /** Why it stopped being live: a `closed` reason, or replaced by a new object for the same room. */
+  #closedAs: CloseReason | 'replaced' | null = null;
   #locked: boolean;
   #public: boolean;
   #linkOnly: boolean;
@@ -1522,7 +1573,7 @@ export class Room extends Emitter<RoomEvents> {
     rooms.set(this, {
       handle: (msg) => this.#handle(msg),
       sync: (next) => this.#sync(next),
-      close: (reason, message) => this.#closeLocal(reason, message),
+      close: (reason, message, later) => this.#closeLocal(reason, message, later),
       dispose: () => this.#dispose(),
       closeLan: () => this.#lan.close(),
       lanPause: () => this.#lan.pause(),
@@ -1757,7 +1808,34 @@ export class Room extends Emitter<RoomEvents> {
     await this.#hostRequest({ t: 'transfer_host', playerId });
   }
 
+  /**
+   * A closed Room (left, kicked, lost, or replaced by a new object for the same room) sends
+   * nothing: the relay may be in another room now, and its players would get this one's messages.
+   * A game loop that runs a frame after the close shouldn't crash, so sends are dropped with a
+   * warning, not thrown; calls that answer with a promise reject (`claim` resolves false).
+   */
+  #gone(): boolean {
+    if (this.#live) return false;
+    this.#relay.warn('left_room', 'left_room', `${this.#closedWhy()}, so nothing was sent: stop using it on room.on('closed'), and use the room the relay gives you next (createRoom, joinRoom, quickMatch)`);
+    return true;
+  }
+
+  /** Why this Room is closed, for warnings and errors. */
+  #closedWhy(): string {
+    const why = { left: 'you left it', kicked: 'you were removed from it', closed: 'it was closed', lost: 'the connection to it was lost', replaced: 'entering it again gave you a new room object' }[this.#closedAs ?? 'left'];
+    return `room ${this.#code} is closed (${why}) but was still used`;
+  }
+
+  /** Null while the room is open; the error a call on it rejects with once closed. */
+  #closedError(call: string): GameRelayError | null {
+    // 'disconnected', as for a request still waiting when the room closed.
+    return this.#live ? null : new GameRelayError('disconnected', `${call}: ${this.#closedWhy()}; use the room the relay gives you next`);
+  }
+
+  /** Host controls on a closed room reject as closed (`disconnected`), whoever was host. */
   #hostOnly(call: string): void {
+    const closed = this.#closedError(call);
+    if (closed) throw closed;
     if (!this.isHost) throw new GameRelayError('not_host', `${call}: only the host can do this; check room.isHost`);
   }
 
@@ -1801,6 +1879,9 @@ export class Room extends Emitter<RoomEvents> {
    * and the way into a link-only room.
    */
   shareLink(): Promise<string> {
+    // The server makes the link for the room we're in now, which a closed room isn't.
+    const closed = this.#shareLink ? null : this.#closedError('room.shareLink');
+    if (closed) return Promise.reject(closed);
     this.#shareLink ??= this.#relay.request({ t: 'share_link' }).then(
       (data) => {
         const { link, url } = (data ?? {}) as { link?: string; url?: string | null };
@@ -1854,6 +1935,7 @@ export class Room extends Emitter<RoomEvents> {
 
   /** Relay any JSON value to everyone else, or to one player with `{ to }`. */
   send(data: Json, options: SendOptions = {}): void {
+    if (this.#gone()) return;
     const h = this.#timers.firing ? true : undefined; // a timer's effects: dropped if we're no longer the host
     if (looksPositional(data) && this.#sendRate.hit(this.#relay.now())) {
       this.#relay.warn('send_positions', 'send_positions', "room.send() of x/y more than 20×/s: you're hand-writing sync; use entities (room.define(kind, fields), then its .spawn()) and the SDK smooths it, sends it to late joiners and cleans up after players who leave");
@@ -1866,6 +1948,7 @@ export class Room extends Emitter<RoomEvents> {
    * races to LAN peers; the server still gets (and relays) every message as before.
    */
   #queueSend(data: Json, to: PlayerId | undefined, reliable: boolean, host: boolean, supersedable = false): void {
+    if (!this.#live) return; // the SDK's own late sends (entities, timers): the game's calls warn first
     const broadcast = to === undefined && this.#lan.enabled;
     const d = broadcast ? (this.#lan.wrap(data, host, supersedable) as unknown as Json) : data;
     if (!broadcast) this.#lan.barrier();
@@ -1877,6 +1960,7 @@ export class Room extends Emitter<RoomEvents> {
    * a step down) is a barrier for the LAN shortcut: no later broadcast's LAN copy may overtake it.
    */
   #queue(m: Outgoing): void {
+    if (!this.#live) return; // the SDK's own late sends (batched state, claim retries, heartbeats)
     if (m.t !== 'heartbeat' && m.t !== 'visibility') this.#lan.barrier();
     this.#relay.queue(m);
   }
@@ -1942,6 +2026,7 @@ export class Room extends Emitter<RoomEvents> {
 
   /** Host only. Shallow-merges `patch` into the shared, persisted room state (`null` deletes a key). */
   setState(patch: JsonObject): void {
+    if (this.#gone()) return; // before the local write, so a closed room's state stays what was sent
     if (!this.isHost) throw new GameRelayError('not_host', 'Only the host can set state');
     // Only the game's own calls count toward the rate warning; timers and teams write state too.
     if (this.#batchPatch) this.#batchCounted = true;
@@ -1980,12 +2065,14 @@ export class Room extends Emitter<RoomEvents> {
 
   /** Host only: ask the server for a new `room.seed` (a new round). Everyone gets a `seed` event. */
   reseed(): void {
+    if (this.#gone()) return;
     if (!this.isHost) throw new GameRelayError('not_host', 'Only the host can pick a new seed');
     this.#queue({ t: 'reseed' });
   }
 
   /** Send a chat line to the room (max 120 characters, single line). Arrives as a `chat` event for everyone, you included. */
   chat(text: string): void {
+    if (this.#gone()) return;
     const checked = normalizeChat(text);
     if (!checked.ok) {
       throw checked.reason === 'empty'
@@ -2020,6 +2107,9 @@ export class Room extends Emitter<RoomEvents> {
    * @deprecated Use the kind's handle: `const ships = room.define('ship', …)`, then `ships.spawn(…)`.
    */
   spawn(kind: string, initial: Record<string, unknown>, options?: SpawnOptions): Entity {
+    // It returns the entity, so it can't just drop: it throws, as a kind's spawn does.
+    const closed = this.#closedError('room.spawn');
+    if (closed) throw closed;
     return this.#entities.spawn(kind, initial, options);
   }
 
@@ -2029,11 +2119,13 @@ export class Room extends Emitter<RoomEvents> {
    * the server clock, so everyone can show `room.timeLeft(name)`.
    */
   timer(name: string, ms: number): void {
+    if (this.#gone()) return; // before the local state write, as setState
     this.#timers.set(name, ms);
   }
 
   /** Host only: cancel a timer. */
   clearTimer(name: string): void {
+    if (this.#gone()) return;
     this.#timers.clear(name);
   }
 
@@ -2048,11 +2140,14 @@ export class Room extends Emitter<RoomEvents> {
    * entity id of a power-up) so two players can't both pick it up.
    */
   claim(key: string): Promise<boolean> {
+    // Closed: we don't get it (as a pending claim on close), and the warning says why.
+    if (this.#gone()) return Promise.resolve(false);
     return this.#claims.claim(key);
   }
 
   /** Let go of a claim you hold (the host may release any). Everyone gets a `released` event. */
   release(key: string): void {
+    if (this.#gone()) return;
     this.#claims.release(key);
   }
 
@@ -2072,6 +2167,8 @@ export class Room extends Emitter<RoomEvents> {
    * doesn't answer in 5 s (`timeout`).
    */
   request(type: string, data: Json = null): Promise<Json> {
+    const closed = this.#closedError('room.request');
+    if (closed) return Promise.reject(closed);
     return this.#requests.request(type, data);
   }
 
@@ -2088,6 +2185,7 @@ export class Room extends Emitter<RoomEvents> {
    * axes as numbers). The SDK sends the latest to the host ~20×/s, and a press is never lost.
    */
   input(state: Record<string, Json>): void {
+    if (this.#gone()) return;
     this.#inputs.set(state);
   }
 
@@ -2107,6 +2205,7 @@ export class Room extends Emitter<RoomEvents> {
    * `{ rebalance: true }` between rounds to even things out. Read teams with `room.teamOf(id)`.
    */
   assignTeams(n: number, options: { rebalance?: boolean } = {}): void {
+    if (this.#gone()) return;
     if (!this.isHost) throw new GameRelayError('not_host', 'room.assignTeams: only the host assigns teams; check room.isHost');
     if (!Number.isInteger(n) || n < 1 || n > this.#maxPlayers) {
       throw new GameRelayError('bad_request', `room.assignTeams(n): n must be a whole number from 1 to ${this.#maxPlayers} (the room's maxPlayers)`);
@@ -2160,6 +2259,7 @@ export class Room extends Emitter<RoomEvents> {
    * facts go in entities or room state. Nothing is kept for players who join later.
    */
   emit(type: string, data: Json = null, options: { to?: PlayerId | 'host'; echo?: boolean } = {}): void {
+    if (this.#gone()) return;
     const to = options.to === 'host' ? this.#hostId : options.to;
     this.#messages.emit(type, data, { to, echo: options.echo });
   }
@@ -2285,6 +2385,7 @@ export class Room extends Emitter<RoomEvents> {
 
   /** Stop this object's work without a `closed` event (it was replaced by a new one). */
   #dispose(): void {
+    this.#closedAs ??= 'replaced';
     this.#live = false;
     this.#claims.close();
     this.#requests.close();
@@ -2293,15 +2394,18 @@ export class Room extends Emitter<RoomEvents> {
     this.#unwatchVisibility();
   }
 
-  #closeLocal(reason: CloseReason, message?: string): void {
+  #closeLocal(reason: CloseReason, message?: string, later = false): void {
     if (!this.#live) return;
+    this.#closedAs = reason;
     this.#live = false;
     this.#claims.close();
     this.#requests.close();
     this.#lan.close();
     this.#stopLoop();
     this.#unwatchVisibility();
-    this.fire('closed', reason, message);
+    // Closed now (nothing more goes out), but a handler that enters another room waits for the batch.
+    if (later) queueMicrotask(() => this.fire('closed', reason, message));
+    else this.fire('closed', reason, message);
   }
 
   /** Resync after a reconnect, emitting events for anything that changed. */
@@ -2416,7 +2520,8 @@ export class Room extends Emitter<RoomEvents> {
     // An older server's `access` doesn't say: it has no link-only rooms.
     this.#linkOnly = access.linkOnly ?? false;
     // Its invite is its short link now (`inviteUrl`): the host, who made it so, has it ready.
-    if (this.#linkOnly && !this.#linkId && this.#live && this.isHost) void this.shareLink().catch(() => {});
+    // A microtask later, as in #adopt: this can run mid-batch, and asking flushes the outbox.
+    if (this.#linkOnly && !this.#linkId && this.#live && this.isHost) queueMicrotask(() => void this.shareLink().catch(() => {}));
     this.#maxPlayers = access.maxPlayers;
     this.fire('access', { locked: access.locked, public: access.public, linkOnly: this.#linkOnly, maxPlayers: access.maxPlayers }, from);
   }

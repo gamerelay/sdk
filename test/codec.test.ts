@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { FULL, compileSchema, checkValue, decodeChanges, encodeChanges, isEntry, roundTo } from '../src/core/codec';
+import { FULL, compileSchema, checkValue, decimalsOf, decodeChanges, encodeChanges, isEntry, roundTo } from '../src/core/codec';
 
 const ship = () => compileSchema('ship', { x: 'number', h: 'angle', alive: 'flag', name: 'text', inv: 'value' });
 
@@ -69,6 +69,31 @@ test('roundTo', () => {
   expect(roundTo(1.23456, 0.01)).toBe(1.23);
   expect(roundTo(0.1 + 0.2, 0.01)).toBe(0.3);
   expect(roundTo(17.6, 1)).toBe(18);
+  // Precisions that aren't a power of ten keep their own grid (review: 0.25 used to give 0.3).
+  expect(roundTo(0.25, 0.25)).toBe(0.25);
+  expect(roundTo(0.8, 0.25)).toBe(0.75);
+  expect(roundTo(0.375, 0.125)).toBe(0.375);
+  expect(roundTo(7, 5)).toBe(5);
+  expect(roundTo(1.23456789, 1e-7)).toBe(1.2345679);
+  expect(roundTo(5.2e-22, 1e-22)).toBeCloseTo(5e-22, 30); // finer than toFixed's 20 decimals: not 0
+  // Past what value / precision can hold, the value stays rather than becoming Infinity (null on the wire).
+  expect(roundTo(Number.MAX_VALUE, 0.01)).toBe(Number.MAX_VALUE);
+});
+
+test('a field works out its decimals once, and its updates go out on its own steps', () => {
+  const s = compileSchema('ship', { x: { type: 'number', precision: 0.25 }, y: 'number', z: { type: 'number', precision: 1e-22 } });
+  expect(s.fields.map((f) => f.decimals)).toEqual([2, 2, -1]);
+  expect(decimalsOf(0.125)).toBe(3);
+  expect(decimalsOf(5)).toBe(0);
+  const { pairs } = encodeChanges(s, [0.8, 1.23456, 5.2e-22], [], false);
+  expect(pairs.slice(0, 4)).toEqual([0, 0.75, 1, 1.23]);
+  expect(pairs[5]).toBeCloseTo(5e-22, 30);
+});
+
+test('precision must be a finite number above 0', () => {
+  for (const precision of [0, -1, Infinity, Number.NaN, '0.1' as unknown as number]) {
+    expect(() => compileSchema('ship', { x: { type: 'number', precision } })).toThrow('precision');
+  }
 });
 
 describe('encodeChanges / decodeChanges', () => {
