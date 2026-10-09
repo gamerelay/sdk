@@ -8,6 +8,8 @@ export interface FieldSpec {
   name: string;
   type: FieldType;
   precision: number;
+  /** Decimals that write `precision` exactly (`decimalsOf`), worked out once here. */
+  decimals: number;
   smooth?: false | SmoothFn;
 }
 export interface KindSchema {
@@ -73,8 +75,10 @@ export function compileSchema(kind: string, fields: Record<string, FieldInput>, 
       throw bad(`room.define('${kind}'): field '${name}' needs a type: 'number', 'angle', 'flag', 'text' or 'value'`);
     }
     const precision = 'precision' in o && o.precision !== undefined ? o.precision : 0.01;
-    if (!(precision > 0)) throw bad(`room.define('${kind}'): precision for '${name}' must be above 0`);
-    return { name, type: o.type, precision, smooth: 'smooth' in o ? o.smooth : undefined };
+    if (!(typeof precision === 'number' && Number.isFinite(precision) && precision > 0)) {
+      throw bad(`room.define('${kind}'): precision for '${name}' must be a number above 0, like 0.01`);
+    }
+    return { name, type: o.type, precision, decimals: decimalsOf(precision), smooth: 'smooth' in o ? o.smooth : undefined };
   });
   // One entity's full update must fit in a message: messages split between entities, not inside one.
   const worst = specs.reduce((sum, f) => sum + WORST_FIELD_BYTES[f.type] + f.name.length, 100);
@@ -130,13 +134,27 @@ export function checkValue(kind: string, field: FieldSpec, value: unknown): void
   }
 }
 
-export function roundTo(value: number, precision: number): number {
-  const decimals = Math.min(10, Math.max(0, Math.ceil(-Math.log10(precision))));
-  return Number((Math.round(value / precision) * precision).toFixed(decimals));
+/** Decimals that write `precision` exactly (0.25: 2, 0.125: 3); -1 past `toFixed`'s 20. */
+export function decimalsOf(precision: number): number {
+  let d = 0;
+  while (d <= 20 && Math.abs(Number(precision.toFixed(d)) - precision) > precision * 1e-9) d++;
+  return d > 20 ? -1 : d;
+}
+
+/**
+ * `value` to the nearest multiple of `precision`, without float noise (0.1 + 0.2 stays 0.3).
+ * `d`: `decimalsOf(precision)`, which a field works out once.
+ */
+export function roundTo(value: number, precision: number, d = decimalsOf(precision)): number {
+  const snapped = Math.round(value / precision) * precision;
+  // Too fine for toFixed: the multiple as it is (float noise there is far below the precision anyway).
+  const rounded = d < 0 ? snapped : Number(snapped.toFixed(d));
+  // Near the largest numbers, value / precision overflows: those keep their value.
+  return Number.isFinite(rounded) ? rounded : value;
 }
 
 function wire(f: FieldSpec, v: unknown): Json {
-  return f.type === 'number' || f.type === 'angle' ? roundTo(v as number, f.precision) : (v as Json);
+  return f.type === 'number' || f.type === 'angle' ? roundTo(v as number, f.precision, f.decimals) : (v as Json);
 }
 
 /**

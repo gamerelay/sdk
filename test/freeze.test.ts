@@ -289,14 +289,17 @@ describe('event names', () => {
     expect(() => room.emit('listing', 1)).toThrow(/reserved/);
   });
 
-  test('a party leader moving you fires party_room, and the old name room too', async () => {
+  test('a party leader moving you fires the old room’s closed, then party_room, and the old name room too', async () => {
     const { relay, socket } = await inRoom();
     const seen: string[] = [];
+    relay.room!.on('closed', (reason) => seen.push(`closed:${reason}`));
     relay.on('party_room', () => seen.push('party_room'));
     relay.on('room', () => seen.push('room'));
     socket().deliver({ t: 'room', room: { ...(await import('./fakeRelay')).roomInfo('pa'), id: 'r2', code: 'WXYZ' }, you: 'pa' });
     socket().deliver({ t: 'party_room', roomId: 'r2' });
-    expect(seen).toEqual(['party_room', 'room']);
+    expect(seen).toEqual([]); // after the server's message is handled, not during it
+    await Promise.resolve();
+    expect(seen).toEqual(['closed:left', 'party_room', 'room']);
     expect(relay.room?.code).toBe('WXYZ');
   });
 });

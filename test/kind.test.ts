@@ -90,6 +90,8 @@ describe('kind handles (room.define returns one)', () => {
     control(room).dispose();
     expect(() => ships.all()).toThrow(/belongs to a room you left; call room\.define\('ship', …\) again/);
     expect(() => ships.spawn({ x: 0 })).toThrow(/belongs to a room you left/);
+    // The same code as every other call on a closed room.
+    expect(() => ships.spawn({ x: 0 })).toThrow(expect.objectContaining({ code: 'disconnected' }));
   });
 
   test('field types check out in TypeScript (test/types/kind.types.ts)', () => {

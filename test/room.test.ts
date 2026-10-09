@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import type { JsonObject, PlayerInfo, RoomInfo } from '@gamerelay/protocol/types';
 import { looksPositional } from '../src/debug/rate';
-import { Room, type GameRelay } from '../src/index';
+import { GameRelayError, Room, type GameRelay } from '../src/index';
 import { CREATE, control } from '../src/internal';
 
 const player = (id: string, slot: number): PlayerInfo => ({ id, name: id, avatar: null, joinedAt: slot, connected: true, slot });
@@ -272,4 +272,164 @@ describe('host controls', () => {
     expect(seen).toEqual(['access', 'listing']);
     expect([room.locked, room.meta]).toEqual([true, { lap: 3 }]);
   });
+});
+
+describe('a closed room (SDK review, 2026-10-09)', () => {
+  const two = (me: string) => makeRoom(me, { hostId: 'pa', players: [player('pa', 0), player('pb', 1)] });
+
+  test('sends nothing: each of the game’s void calls is dropped with a warning, not thrown', async () => {
+    const { room, queued, requests, warned } = two('pa');
+    await room.leave();
+    const left = queued.length;
+    const asked = requests.length;
+    room.send({ hi: 1 });
+    room.emit('fire', null, { echo: false });
+    room.setState({ round: 2 });
+    room.assignTeams(2);
+    room.chat('still here?');
+    room.reseed();
+    expect(queued.length).toBe(left);
+    expect(requests.length).toBe(asked);
+    expect(warned.filter((k) => k === 'left_room').length).toBe(6);
+  });
+
+  test('setState is dropped before the local write: the closed room’s state stays what everyone had', async () => {
+    const { room } = two('pa');
+    room.setState({ round: 1 });
+    await room.leave();
+    room.setState({ round: 2 });
+    room.assignTeams(2);
+    expect(room.state).toEqual({ round: 1 });
+  });
+
+  test('host-only calls are dropped for a non-host too, not refused with not_host', () => {
+    const { room, queued, warned } = two('pb');
+    control(room).close('kicked');
+    expect(() => room.setState({ round: 2 })).not.toThrow();
+    expect(() => room.reseed()).not.toThrow();
+    expect(() => room.assignTeams(2)).not.toThrow();
+    expect(queued.length).toBe(0);
+    expect(warned.filter((k) => k === 'left_room').length).toBe(3);
+  });
+
+  test('emit on a closed room doesn’t run its own handler either', async () => {
+    const { room } = two('pa');
+    let echoed = 0;
+    room.on('fire', () => echoed++);
+    await room.leave();
+    room.emit('fire');
+    expect(echoed).toBe(0);
+  });
+
+  test('promise calls reject with disconnected (as one waiting at the close does); claim resolves false with a warning', async () => {
+    const { room, requests, warned } = two('pa');
+    await room.leave();
+    const asked = requests.length;
+    for (const call of [() => room.request('buy'), () => room.kick('pb'), () => room.shareLink()]) {
+      const err = await call().then(
+        () => null,
+        (e: GameRelayError) => e,
+      );
+      expect(err?.code).toBe('disconnected');
+      expect(err?.message).toContain('room ABCD is closed (you left it)');
+    }
+    expect(await room.claim('flag')).toBe(false);
+    expect(warned).toContain('left_room');
+    expect(requests.length).toBe(asked);
+  });
+
+  test('the warning names why it closed', () => {
+    const cases: [(r: Room) => void, string][] = [
+      [(r) => control(r).close('kicked'), '(you were removed from it)'],
+      [(r) => control(r).close('closed'), '(it was closed)'],
+      [(r) => control(r).close('lost'), '(the connection to it was lost)'],
+      [(r) => control(r).dispose(), '(entering it again gave you a new room object)'],
+    ];
+    for (const [close, why] of cases) {
+      const { room, messages } = two('pa');
+      close(room);
+      room.send(1);
+      expect(messages.at(-1)).toContain(why);
+    }
+  });
+
+  test('the SDK’s own sends after a close are dropped quietly: the warning is only for the game’s calls', () => {
+    const { room, queued, warned, clock, step } = two('pa');
+    // A timer handler that leaves: its batched setState is queued by the SDK after the close.
+    room.on('timer', 'end', () => {
+      room.setState({ over: true });
+      control(room).close('left');
+    });
+    room.timer('end', 10);
+    clock.now += 20;
+    const before = queued.length;
+    step();
+    expect(queued.slice(before).filter((m) => m.t === 'set_state')).toEqual([]);
+    expect(warned).not.toContain('left_room');
+  });
+
+  test('a close asked for with later fires closed a microtask later, already closed before then', async () => {
+    const { room, queued } = two('pa');
+    const fired: string[] = [];
+    room.on('closed', (reason) => fired.push(reason));
+    control(room).close('left', undefined, true);
+    expect(fired).toEqual([]);
+    room.send(1);
+    expect(queued.length).toBe(0);
+    await Promise.resolve();
+    expect(fired).toEqual(['left']);
+  });
+});
+
+describe('a closed room, the rest of its calls (SDK review, 2026-10-09)', () => {
+  const two = (me: string) => makeRoom(me, { hostId: 'pa', players: [player('pa', 0), player('pb', 1)] });
+
+  test('timer and clearTimer are dropped before they write the deadline into room.state', async () => {
+    const { room, queued, warned } = two('pa');
+    room.timer('round', 5000);
+    const state = room.state;
+    await room.leave();
+    const left = queued.length;
+    room.timer('next', 5000);
+    room.clearTimer('round');
+    expect(room.state).toEqual(state);
+    expect(room.timeLeft('next')).toBeNull();
+    expect(queued.length).toBe(left);
+    expect(warned.filter((k) => k === 'left_room').length).toBe(2);
+  });
+
+  test('input and release are dropped with the warning; spawn throws, as a kind’s spawn does', async () => {
+    const { room, queued, warned } = two('pa');
+    room.define('dot', { x: 'number' });
+    await room.leave();
+    const left = queued.length;
+    room.input({ left: true });
+    room.release('flag');
+    expect(queued.length).toBe(left);
+    expect(warned.filter((k) => k === 'left_room').length).toBe(2);
+    expect(() => room.spawn('dot', { x: 1 })).toThrow('room ABCD is closed');
+  });
+
+  test('host controls reject as closed (disconnected) before the host check, for whoever calls them', async () => {
+    for (const me of ['pa', 'pb']) {
+      const { room } = two(me);
+      control(room).close('kicked');
+      const calls = [() => room.kick(me === 'pa' ? 'pb' : 'pa'), () => room.setAccess({ locked: true }), () => room.setListing({ name: 'x' }), () => room.transferHost(me === 'pa' ? 'pb' : 'pa')];
+      for (const call of calls) {
+        const err = await call().then(
+          () => null,
+          (e: GameRelayError) => e,
+        );
+        expect(err?.code).toBe('disconnected');
+      }
+    }
+  });
+});
+
+test('a link-only access change asks for the share link a microtask later, not while its batch is handled', async () => {
+  const { room, requests } = makeRoom('pa', { hostId: 'pa', players: [player('pa', 0)] });
+  control(room).handle({ v: 1, t: 'access', from: 'pa', locked: false, public: false, linkOnly: true, maxPlayers: 8 } as never);
+  expect(requests.filter((r) => r.t === 'share_link')).toEqual([]);
+  await Promise.resolve();
+  expect(requests.filter((r) => r.t === 'share_link').length).toBe(1);
 });
