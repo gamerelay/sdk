@@ -66,7 +66,7 @@ the page. Until it's filled in, `connect()` rejects with `unauthorized`.
 updates in place, and within `v0` nothing is removed or renamed without a deprecation first (the
 old name keeps working and warns in the console for at least 30 days). `/sdk/gamerelay.js` is the
 same `v0` line, forever. To pin one exact version instead, load it from npm through jsDelivr:
-`https://cdn.jsdelivr.net/npm/@gamerelay/sdk@0.1.0-alpha.7/gamerelay.js` (any published
+`https://cdn.jsdelivr.net/npm/@gamerelay/sdk@0.1.0-alpha.8/gamerelay.js` (any published
 version: `npm view @gamerelay/sdk versions`). Until the SDK reaches 1.0, a pinned alpha may be
 asked to update: new server features can need the newest alpha, and old alphas stop being
 accepted sooner than they will after 1.0.
@@ -482,7 +482,10 @@ try {
 - Keep what the host decides in `room.state` (or host entities), not in variables: when the host
   changes, the next host has the state but not the old host's variables.
 - The same request (same name and data) while one is waiting returns the same promise.
-- The host's own requests run its handler directly.
+- The host's own requests run its handler directly, with the same 5 s timeout; a host change
+  doesn't fail them (the handler ran as host, so its answer stands).
+- Answer within 5 s (an awaited fetch included): a caller that times out may ask again, and a
+  handler still running would then run twice.
 
 ## Claims: take something exactly once
 
@@ -788,7 +791,10 @@ const { token, expiresAt, wsUrl } = await res.json();
 
 // your game: getToken is called again whenever the SDK (re)connects, so return a fresh token.
 // Return the whole response (then the SDK also connects where the server said), or just the token.
-const relay = await GameRelay.connect({ getToken: () => fetch('/my/gamerelay-token').then((r) => r.json()) });
+// connect() waits for it as long as it takes (sign the player in first if you need to; reject it to
+// give up). A reconnect gives it 15 s, then tries again later. `signal` aborts when that wait ends or
+// relay.close() is called: pass it to fetch, or close your sign-in prompt.
+const relay = await GameRelay.connect({ getToken: (signal) => fetch('/my/gamerelay-token', { signal }).then((r) => r.json()) });
 ```
 
 ## Player data
@@ -798,8 +804,9 @@ await relay.storage.set('best', { score: 1200 }); // per player, per game, persi
 const best = await relay.storage.get('best');     // null if unset
 ```
 
-Any JSON value, up to 256 keys per player (keys up to 128 characters). Needs the "Persisted
-data" setting (on by default).
+Any JSON value, up to 256 keys and 64 KB per player (keys up to 128 characters); each game also
+has a total from its plan. A save that would go over a limit fails with `too_large`; deleting,
+shrinking or overwriting with a value no bigger always works. Needs the "Persisted data" setting (on by default).
 
 ## Chat
 

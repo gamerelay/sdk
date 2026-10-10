@@ -1923,4 +1923,109 @@ describe('LAN shortcut: copies that lose to the server stop (performance)', () =
     expect(copies()).toBe(50);
     l.close();
   });
+
+  test('a copy too big for the LAN doesn’t use up a skipping peer’s probe (review of #24)', async () => {
+    const { l, sent, receive } = await pair({ t: 0 });
+    const copies = () => sent.filter((t) => t.startsWith('{"$gr":"l"')).length;
+    receive({ $gr: 'slow' });
+    for (let i = 1; i < PROBE_EVERY; i++) l.wrap(i, false); // skipped
+    l.wrap('x'.repeat(5000), false); // server only: not counted
+    l.wrap('probe', false); // the PROBE_EVERYth that counts: sent
+    expect(copies()).toBe(1);
+    expect(sent.at(-1)).toContain('"probe"');
+    l.close();
+  });
+});
+
+describe('LAN shortcut: above the size cap (SDK review #12)', () => {
+  const nine = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i'];
+
+  test('a peer we already have keeps its signalling when the room grows past the cap', async () => {
+    const players = ['a', 'b'];
+    const { l, peers, sent } = signalling('a', players, { timing: { restartMs: 0 } });
+    await l.signal('b', hi);
+    peers[0]!.channel.onopen?.();
+    players.push(...nine.slice(2)); // nine players: past the cap
+    await l.signal('b', hi); // b starts over (a relay refresh, a reload): still answered
+    expect(peers).toHaveLength(2);
+    expect(sent.filter((s) => s.k === 'offer')).toHaveLength(2);
+  });
+
+  test('a new player past the cap gets nothing', async () => {
+    const { l, peers, sent } = signalling('a', [...nine]);
+    l.add('c');
+    await l.signal('c', hi);
+    expect(peers).toHaveLength(0);
+    expect(sent).toEqual([]);
+  });
+
+  test('back within the cap, the answerer says hello to the players the cap turned away, once; the offerer waits', async () => {
+    const players = [...nine];
+    const h = signalling('h', players, { timing: { connectMs: 30 } });
+    const a = signalling('a', players, { timing: { connectMs: 30 } });
+    for (const id of nine) h.l.add(id, false); // noted as they joined: past the cap, turned away
+    for (const id of nine) a.l.add(id, false);
+    players.splice(players.indexOf('i'), 1);
+    h.l.playerLeft('i');
+    a.l.playerLeft('i');
+    // h answers everyone before it; a offers to everyone, so it waits for their hellos.
+    expect(h.sent.map((s) => `${s.to}:${s.k}`).sort()).toEqual(['a:hi', 'b:hi', 'c:hi', 'd:hi', 'e:hi', 'f:hi', 'g:hi']);
+    expect(a.sent).toEqual([]);
+    players.splice(players.indexOf('g'), 1);
+    h.l.playerLeft('g');
+    expect(h.sent).toHaveLength(7); // no second round: they were started
+    await a.l.signal('h', hi); // h's hello arrives: a offers
+    expect(a.sent.filter((s) => s.to === 'h' && s.k === 'offer')).toHaveLength(1);
+    await Bun.sleep(50);
+    // The others' hellos never came (in this test): a asks them; not h (its hello started a
+    // connection) and not g (gone meanwhile).
+    expect(a.sent.filter((s) => s.k === 'ask').map((s) => s.to).sort()).toEqual(['b', 'c', 'd', 'e', 'f']);
+    h.l.close();
+    a.l.close();
+  });
+
+  test('a shrink starts nobody the cap never turned away: a room that was never over, or a pair that gave up', () => {
+    const players = ['a', 'b', 'c', 'd'];
+    const { l, sent } = signalling('d', players);
+    for (const id of players) l.add(id, false);
+    l.add('e'); // e isn't in the room: not a cap refusal
+    players.splice(players.indexOf('c'), 1);
+    l.playerLeft('c');
+    expect(sent).toEqual([]);
+    l.close();
+  });
+
+  test('a player the cap turned away, started by our reconnect, isn’t started again by a later leave (review of #12)', async () => {
+    const players = [...nine];
+    const { l, peers, sent } = signalling('h', players);
+    for (const id of nine) l.add(id, false); // past the cap: all turned away
+    // Two leave while we're away: the reconnect's sync forgets them, then starts with everyone.
+    players.splice(players.indexOf('i'), 1);
+    players.splice(players.indexOf('g'), 1);
+    l.remove('i');
+    l.remove('g');
+    l.reconnect();
+    expect(sent.filter((s) => s.to === 'a').map((s) => s.k)).toEqual(['hi']);
+    await l.signal('a', { $gr: 'lan', k: 'offer', g: 'g1', sdp: 'o' });
+    peers[0]!.channel.onopen?.();
+    const before = sent.length;
+    players.splice(players.indexOf('b'), 1);
+    l.playerLeft('b');
+    // A second hello would make a (the offerer) tear down the channel that just opened.
+    expect(sent.slice(before)).toEqual([]);
+    expect(peers[0]!.closed).toBe(false);
+    l.close();
+  });
+
+  test('a join then a leave doesn’t say hello twice to the newcomer (review of #12)', () => {
+    const players = ['a', 'b', 'c'];
+    const { l, sent } = signalling('c', players);
+    players.push('d');
+    l.add('d'); // we're not the newcomer here, but say we start: one hello
+    const first = sent.filter((s) => s.to === 'd').length;
+    players.splice(players.indexOf('a'), 1);
+    l.playerLeft('a');
+    expect(sent.filter((s) => s.to === 'd').length).toBe(first);
+    l.close();
+  });
 });

@@ -94,7 +94,7 @@ it (`?join=`). `createRoom({ linkOnly: true })` makes a room that only its link 
 
 `https://gamerelay.io/sdk/v0/gamerelay.js` (and `.mjs`) is the `v0` line and updates in place;
 `/sdk/gamerelay.js` is the same line, forever. To pin one exact version, load it from npm through
-jsDelivr: `https://cdn.jsdelivr.net/npm/@gamerelay/sdk@0.1.0-alpha.7/gamerelay.js`. Until the SDK
+jsDelivr: `https://cdn.jsdelivr.net/npm/@gamerelay/sdk@0.1.0-alpha.8/gamerelay.js`. Until the SDK
 reaches 1.0, a pinned alpha may be asked to update: new server features can need the newest alpha,
 and old alphas stop being accepted sooner than they will after 1.0.
 `GameRelay.version` is the running version. The server may print a notice in the console

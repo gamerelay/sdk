@@ -1,7 +1,22 @@
 import { LIMITS, TokenBucket } from '@gamerelay/protocol/limits';
+import { PROTOCOL_VERSION as V } from '@gamerelay/protocol/types';
 
 /** The most messages the SDK batches into one frame. */
 export const MAX_BATCH = 64;
+
+const ITEM_OPEN = `{"v":${V},`;
+/** How a batch of `batchItem`s starts on the wire; it ends `]}`. */
+export const BATCH_OPEN = `{"v":${V},"t":"batch","m":[`;
+
+/**
+ * A queued message as it goes on the wire, with `v`: `{"v":1,` spliced onto its own JSON, so it
+ * isn't copied to add `v`. One that has no fields, or a `v` of its own, is copied after all (the
+ * splice would write `{"v":1,}` or a second `v`, and the server would refuse the frame).
+ */
+export function batchItem(m: object): string {
+  const json = JSON.stringify(m);
+  return json.length > 2 && !('v' in m) ? `${ITEM_OPEN}${json.slice(1)}` : JSON.stringify({ ...m, v: V });
+}
 
 /**
  * What the SDK lets itself spend: a little under the server's limit. The server charges frames as

@@ -34,7 +34,8 @@ import {
 import { GameRelayError, type GameRelayErrorCode } from './errors';
 import { CREATE, DEBUG, defaults, relays, rooms, type Outgoing, type RelayLink, type Request, type RoomControl, type RoomDebugInfo } from './internal';
 import { Ticker, pickScheduler } from './core/ticker';
-import { MAX_BATCH, PACE_PER_SECOND, SendBudget } from './core/budget';
+import { fitsUtf8, utf8Length } from '@gamerelay/protocol/bytes';
+import { BATCH_OPEN, MAX_BATCH, PACE_PER_SECOND, SendBudget, batchItem } from './core/budget';
 import type { FieldInput } from './core/codec';
 import { mountOverlay, type OverlayStats } from './debug/overlay';
 import { Rate, looksPositional } from './debug/rate';
@@ -106,8 +107,11 @@ export interface ConnectOptions {
    * Supply tokens minted by your own backend (secret key) instead of anonymous ones. Return the
    * token, or simply the whole response `POST /v1/auth/token` gave your backend
    * (`{ token, expiresAt, wsUrl }`): then the SDK also connects where the server said.
+   * `connect()` waits for it as long as it takes (a sign-in first is fine); a reconnect gives it
+   * 15 s, then tries again later. `signal` aborts when that wait ends or `relay.close()` is called:
+   * pass it to your `fetch`, or close a sign-in prompt, and the late answer is ignored.
    */
-  getToken?: () => Promise<string | TokenResponse>;
+  getToken?: (signal: AbortSignal) => Promise<string | TokenResponse>;
   /**
    * Development only: simulate a bad network. `latency` is extra round-trip ms (half each way),
    * `jitter` ± ms per message (order is kept, as on a real socket), `loss` the share (0–1) of
@@ -326,7 +330,6 @@ interface Pending {
 
 /** Stay under the server's 16 KB message limit, with room for the batch wrapper and signature. */
 const MAX_FRAME_BYTES = 15_000;
-const utf8 = new TextEncoder();
 const MAX_QUEUED = 256;
 /**
  * A request the server hasn't answered in this long fails with `timeout`. The server answers in
@@ -534,7 +537,7 @@ export class GameRelay extends Emitter<RelayEvents> {
   #stopped = false;
   /** Everything stopped (`#shutdown`): close, replaced, too old, or a key the server refuses. */
   #shut = false;
-  /** Fails the connect waiting for its welcome (`#open`), if one is. */
+  /** Fails the connect stage now waiting (the token, or the socket's welcome), if one is: `close()` uses it. */
   #abortOpen: ((err: GameRelayError) => void) | null = null;
   /** Between reconnecting and re-entering the room: room messages must wait. */
   #resuming = false;
@@ -628,7 +631,7 @@ export class GameRelay extends Emitter<RelayEvents> {
   static async connect(options: ConnectOptions): Promise<GameRelay> {
     const relay = new GameRelay(CREATE, options);
     try {
-      await relay.#open();
+      await relay.#open(false);
     } catch (err) {
       relay.#shutdown();
       throw err;
@@ -1044,19 +1047,20 @@ export class GameRelay extends Emitter<RelayEvents> {
       this.#outbox = this.#trim(items.slice(left), MAX_QUEUED);
       items = items.slice(0, left);
     }
-    // Batch by count and by size: the server rejects frames over its message limit.
-    let chunk: unknown[] = [];
+    // Batch by count and by size: the server rejects frames over its message limit. Each message
+    // is written once, as text, and the batch is put together from those (as the server's outbox does).
+    let chunk: string[] = [];
     let size = 0;
     const send = () => {
-      if (chunk.length > 0) this.#raw(chunk.length === 1 ? chunk[0] : { v: V, t: 'batch', m: chunk });
+      if (chunk.length > 0) this.#rawText(chunk.length === 1 ? chunk[0]! : `${BATCH_OPEN}${chunk.join(',')}]}`, chunk.length);
       chunk = [];
       size = 0;
     };
     for (const m of items) {
-      const item = { ...m, v: V };
-      const n = utf8.encode(JSON.stringify(item)).byteLength + 1;
+      const text = batchItem(m);
+      const n = utf8Length(text) + 1;
       if (chunk.length >= MAX_BATCH || (chunk.length > 0 && size + n > MAX_FRAME_BYTES)) send();
-      chunk.push(item);
+      chunk.push(text);
       size += n;
     }
     send();
@@ -1090,23 +1094,30 @@ export class GameRelay extends Emitter<RelayEvents> {
     return (m.t === 'send' && m.r === false) || m.t === 'heartbeat';
   }
 
+  /** One message (batches go out through `#flush`, as text). */
   #raw(message: unknown): void {
+    this.#rawText(JSON.stringify(message), 1);
+  }
+
+  /** Send `text`, one message or a batch of `count`, as a signed frame. */
+  #rawText(text: string, count: number): void {
     const ws = this.#ws;
     if (!ws || !this.#frameKey) return;
-    const frame = signFrame(this.#frameKey, ++this.#frameSeq, JSON.stringify(message));
+    const frame = signFrame(this.#frameKey, ++this.#frameSeq, text);
     this.#stats.msgsOut++;
     this.#stats.bytesOut += frame.length;
-    const m = message as { t?: string; m?: unknown[] };
-    this.#budget.sent(m.t === 'batch' && m.m ? Math.max(1, m.m.length) : 1, performance.now());
+    this.#budget.sent(count, performance.now());
     if (this.#out) this.#out(() => ws.readyState === 1 && ws.send(frame));
     else ws.send(frame);
   }
 
-  async #getToken(): Promise<string> {
+  async #getToken(reconnecting: boolean): Promise<string> {
     if (this.#opts.getToken) {
       let got: string | TokenResponse;
       try {
-        got = await this.#opts.getToken();
+        // The first connect waits for your game (a sign-in may come first); a reconnect, nobody
+        // waits on, is bounded, or a backend that hangs would keep it from ever trying again.
+        got = await this.#tokenStage('getToken', (signal) => this.#opts.getToken!(signal), reconnecting);
       } catch (err) {
         if (err instanceof GameRelayError) throw err;
         // Your backend failed (maybe for a moment): connect rejects, a reconnect tries again.
@@ -1120,32 +1131,28 @@ export class GameRelay extends Emitter<RelayEvents> {
     }
     if (this.#token && this.#token.expiresAt - Date.now() > 60_000) return this.#token.value;
     const storeKey = `gamerelay:${this.#opts.publicKey}`;
-    const abort = new AbortController();
-    const timer = setTimeout(() => abort.abort(), CONNECT_TIMEOUT_MS);
-    let res: Response;
-    let body: { token?: string; expiresAt?: number; wsUrl?: string; error?: string; message?: string };
-    try {
-      res = await fetch(`${this.#base}/v1/auth/anonymous`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          publicKey: this.#opts.publicKey,
-          playerName: this.#opts.playerName,
-          playerAvatar: this.#opts.playerAvatar,
-          previousToken: this.#token?.value ?? session.get(storeKey) ?? undefined,
-        }),
-        signal: abort.signal,
-      });
-      // A proxy error page isn't JSON: treat it like any other failed response.
-      const parsed: unknown = await res.json().catch(() => null);
-      body = parsed && typeof parsed === 'object' ? parsed : {};
-    } catch (err) {
-      // Offline, DNS, CORS, or no answer in time: not the key's fault, so a reconnect tries again.
-      const late = abort.signal.aborted;
-      throw new GameRelayError(late ? 'timeout' : 'disconnected', late ? `No answer from ${this.#base} in ${CONNECT_TIMEOUT_MS / 1000} s` : `Can't reach ${this.#base}: are you online?`, { cause: err });
-    } finally {
-      clearTimeout(timer);
-    }
+    const { res, body } = await this.#tokenStage(this.#base, async (signal) => {
+      try {
+        const res = await fetch(`${this.#base}/v1/auth/anonymous`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            publicKey: this.#opts.publicKey,
+            playerName: this.#opts.playerName,
+            playerAvatar: this.#opts.playerAvatar,
+            previousToken: this.#token?.value ?? session.get(storeKey) ?? undefined,
+          }),
+          signal,
+        });
+        // A proxy error page isn't JSON: treat it like any other failed response.
+        const parsed: unknown = await res.json().catch(() => null);
+        const body: { token?: string; expiresAt?: number; wsUrl?: string; error?: string; message?: string } = parsed && typeof parsed === 'object' ? parsed : {};
+        return { res, body };
+      } catch (err) {
+        // Offline, DNS or CORS: not the key's fault, so a reconnect tries again.
+        throw new GameRelayError('disconnected', `Can't reach ${this.#base}: are you online?`, { cause: err });
+      }
+    }, true);
     if (!res.ok || !body.token || !body.expiresAt) {
       throw new GameRelayError(authCode(res.status, body.error), body.message ?? `Auth failed (${res.status})`);
     }
@@ -1153,6 +1160,39 @@ export class GameRelay extends Emitter<RelayEvents> {
     session.set(storeKey, body.token);
     this.#wsUrl = this.#checked(body.wsUrl);
     return body.token;
+  }
+
+  /**
+   * The token step of a connect: `run` (your `getToken`, or our request to `who`) fails with
+   * `disconnected` if `close()` is called meanwhile and, if `bounded`, with `timeout` if it hasn't
+   * answered in `CONNECT_TIMEOUT_MS` (a backend that hangs would otherwise hang a reconnect for
+   * good). Either way `signal` aborts (a fetch stops), and a late answer is ignored.
+   */
+  #tokenStage<T>(who: string, run: (signal: AbortSignal) => Promise<T>, bounded: boolean): Promise<T> {
+    const abort = new AbortController();
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      const settle = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (this.#abortOpen === stop) this.#abortOpen = null;
+        fn();
+      };
+      const stop = (err: GameRelayError) =>
+        settle(() => {
+          abort.abort();
+          reject(err);
+        });
+      const timer = bounded ? setTimeout(() => stop(new GameRelayError('timeout', `No answer from ${who} in ${CONNECT_TIMEOUT_MS / 1000} s`)), CONNECT_TIMEOUT_MS) : undefined;
+      this.#abortOpen = stop;
+      Promise.resolve()
+        .then(() => run(abort.signal))
+        .then(
+          (v) => settle(() => resolve(v)),
+          (err: unknown) => settle(() => reject(err)),
+        );
+    });
   }
 
   /** A server notice for the developer (an old SDK, …): once per code, through the warning catalog. */
@@ -1172,8 +1212,8 @@ export class GameRelay extends Emitter<RelayEvents> {
     return null;
   }
 
-  async #open(): Promise<void> {
-    const token = await this.#getToken();
+  async #open(reconnecting: boolean): Promise<void> {
+    const token = await this.#getToken(reconnecting);
     // close() may have been called while a reconnect waited on the token.
     if (this.#stopped) throw new GameRelayError('disconnected', 'Closed');
     // Who we are (`sdk`) and what we understand (`caps`, @gamerelay/protocol/clients): `compact`,
@@ -1305,7 +1345,7 @@ export class GameRelay extends Emitter<RelayEvents> {
   async #reconnect(): Promise<void> {
     if (this.#stopped) return;
     try {
-      await this.#open();
+      await this.#open(true);
     } catch (err) {
       if (this.#stopped) return; // closed meanwhile, or too old (`#open` stopped everything)
       const code = err instanceof GameRelayError ? err.code : 'disconnected';
@@ -1795,7 +1835,7 @@ export class Room extends Emitter<RoomEvents> {
   async setListing(listing: { name?: string | null; meta?: Json }): Promise<void> {
     this.#hostOnly('room.setListing');
     const name = typeof listing.name === 'string' ? this.#line('room.setListing', 'name', listing.name, LIMITS.maxRoomNameLength) : listing.name;
-    if (listing.meta !== undefined && listing.meta !== null && utf8.encode(JSON.stringify(listing.meta)).byteLength > LIMITS.maxRoomMetaBytes) {
+    if (listing.meta !== undefined && listing.meta !== null && !fitsUtf8(JSON.stringify(listing.meta), LIMITS.maxRoomMetaBytes)) {
       throw new GameRelayError('too_large', `room.setListing: meta is limited to ${LIMITS.maxRoomMetaBytes} bytes of JSON`);
     }
     await this.#hostRequest({ t: 'set_listing', name, meta: listing.meta });
@@ -1816,7 +1856,7 @@ export class Room extends Emitter<RoomEvents> {
    */
   #gone(): boolean {
     if (this.#live) return false;
-    this.#relay.warn('left_room', 'left_room', `${this.#closedWhy()}, so nothing was sent: stop using it on room.on('closed'), and use the room the relay gives you next (createRoom, joinRoom, quickMatch)`);
+    this.#relay.warn('left_room', 'left_room', `${this.#closedWhy()}, so nothing was sent; stop its loop on room.on('closed') and use your new room`);
     return true;
   }
 
@@ -2426,7 +2466,7 @@ export class Room extends Emitter<RoomEvents> {
       if (after.has(id)) continue;
       this.#entities.playerLeft(id);
       this.#inputs.playerLeft(id);
-      this.#lan.remove(id);
+      this.#lan.remove(id); // not playerLeft: reconnect() below starts with everyone the cap allows
       this.fire('player_left', id, 'timeout');
     }
     // State first: becoming host here must work from the room's current state, not our stale copy
@@ -2492,7 +2532,7 @@ export class Room extends Emitter<RoomEvents> {
         this.#players = frozen(this.#players.filter((p) => p.id !== msg.playerId));
         this.#entities.playerLeft(msg.playerId);
         this.#inputs.playerLeft(msg.playerId);
-        this.#lan.remove(msg.playerId);
+        this.#lan.playerLeft(msg.playerId);
         this.#keepTeams();
         return this.fire('player_left', msg.playerId, msg.reason);
       case 'player_disconnected':

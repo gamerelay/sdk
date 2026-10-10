@@ -17,6 +17,7 @@
 import { LIMITS, TokenBucket } from '@gamerelay/protocol/limits';
 import type { Json, PlayerId } from '@gamerelay/protocol/types';
 import { delaysFrom, pickRelay, probeRelay, relayAddresses, relayKey, routeOf, rttOf, stunUrls, type Delays, type StatsReport } from './relays';
+import { fitsUtf8 } from '@gamerelay/protocol/bytes';
 
 /** A broadcast as it goes over the wire with the shortcut on: sender session, sequence, payload. */
 export interface Wrapped {
@@ -458,6 +459,8 @@ interface Peer {
   /** Its latest request to start over that came too soon, and the timer that runs it. */
   deferred: Signal | null;
   deferTimer: ReturnType<typeof setTimeout> | null;
+  /** Back within the cap, an offerer's wait for the answerer's hello before it asks (`playerLeft`). */
+  startTimer: ReturnType<typeof setTimeout> | null;
   /** Our candidates for offer `g` not sent yet (`#queueCandidate`). */
   outbox: { g: string; cs: Json[]; timer: ReturnType<typeof setTimeout> } | null;
 }
@@ -471,7 +474,6 @@ interface Peer {
 export const MAX_LAN_COPY_BYTES = 2048;
 /** After the server rate-limits us, LAN copies pause this long: it's dropping what we send. */
 export const RATE_PAUSE_MS = 1000;
-const utf8 = new TextEncoder();
 /**
  * A copy that reaches a player after the server's copy of it is wasted upstream (and relay)
  * bandwidth: on a relayed route near the game server, it often is. Every `RACE_WINDOW` of a
@@ -688,12 +690,19 @@ export class Lan {
     if (!(this.#deps.withinRate?.() ?? true)) return w; // the server will drop this one
     // The LAN copy follows the server's rules: what it would refuse or drop, LAN peers don't get either.
     if (this.#clock() < this.#pausedUntil) return w;
-    const text = JSON.stringify(w);
-    // (Well under the server's own limit, `LIMITS.maxMessageBytes`, so what it would refuse is covered.)
-    if (text.length > MAX_LAN_COPY_BYTES || utf8.encode(text).byteLength > MAX_LAN_COPY_BYTES) return w;
+    // Written as text only once a peer will get it (each may be stalled, full or skipping), and
+    // only if it's well under the server's own limit, `LIMITS.maxMessageBytes`, so what it would
+    // refuse is covered. `null`: too big for a LAN copy.
+    let text: string | null | undefined;
     const now = this.#clock();
     for (const p of this.#peers.values()) {
       if (!p.open || p.stalled || !p.channel || p.channel.bufferedAmount > MAX_BUFFERED) continue;
+      // Measured before a skipping peer counts this one: a copy too big for the LAN is no probe.
+      if (text === undefined) {
+        const json = JSON.stringify(w);
+        text = fitsUtf8(json, MAX_LAN_COPY_BYTES) ? json : null;
+      }
+      if (text === null) break;
       if (now < p.sparseUntil && ++p.skipped % PROBE_EVERY !== 0) continue; // it said ours lose
       try {
         p.channel.send(text);
@@ -763,7 +772,7 @@ export class Lan {
   add(id: PlayerId, initiate = true): void {
     if (!this.#allowed(id) || this.#peers.has(id)) return;
     this.#peer(id);
-    if (initiate) this.#deps.signal(id, this.#hello(id));
+    if (initiate) this.#sayHello(id);
   }
 
   /**
@@ -777,7 +786,7 @@ export class Lan {
       const p = this.#peer(id);
       if (p.open) continue;
       this.#teardown(p);
-      this.#deps.signal(id, this.#hello(id));
+      this.#sayHello(id);
     }
   }
 
@@ -790,7 +799,33 @@ export class Lan {
     for (const p of this.#peers.values()) {
       if (!p.pc || p.direct === this.#direct(p.id)) continue;
       this.#teardown(p);
-      if (this.#allowed(p.id)) this.#deps.signal(p.id, this.#hello(p.id));
+      if (this.#allowed(p.id)) this.#sayHello(p.id);
+    }
+  }
+
+  /**
+   * A player left: forget them, and if the room is back within the cap, start with every player
+   * we have no entry for (the ones the cap turned away: a pair that gave up on each other keeps its
+   * entry, so it stays given up). Usually both turned each other away, so the answerer says hello
+   * at once and the offerer waits for it; the offerer asks only if no hello has started a
+   * connection by the end of a setup's time (the answerer may have had us all along, as an entry it
+   * gave up on).
+   */
+  playerLeft(id: PlayerId): void {
+    this.remove(id);
+    const players = this.#deps.players();
+    if (players.length - 1 > MAX_LAN_PEERS) return;
+    for (const other of players) {
+      if (this.#peers.has(other) || !this.#allowed(other)) continue;
+      const p = this.#peer(other);
+      if (!this.#offerer(other)) {
+        this.#sayHello(other);
+        continue;
+      }
+      p.startTimer = setTimeout(() => {
+        p.startTimer = null;
+        if (this.#peers.get(other) === p && !p.pc && this.#allowed(other)) this.#sayHello(other);
+      }, this.#deps.timing?.connectMs ?? CONNECT_MS);
     }
   }
 
@@ -798,6 +833,8 @@ export class Lan {
     const p = this.#peers.get(id);
     if (p) {
       this.#teardown(p);
+      if (p.startTimer) clearTimeout(p.startTimer);
+      p.startTimer = null;
       if (p.deferTimer) clearTimeout(p.deferTimer);
       p.deferTimer = null;
       p.deferred = null;
@@ -826,20 +863,30 @@ export class Lan {
     return !this.#deps.relay?.only && (this.#deps.direct?.(id) ?? false);
   }
 
+  /** Send `id` our "start over" (`#hello`). */
+  #sayHello(id: PlayerId): void {
+    this.#deps.signal(id, this.#hello(id));
+  }
+
   /** "Start over" to `id`, as the offerer (`ask`) or the answerer (`hi`, with our relay delays). */
   #hello(id: PlayerId): Signal {
     if (this.#offerer(id)) return { $gr: 'lan', k: 'ask' };
     return Object.keys(this.#delays).length ? { $gr: 'lan', k: 'hi', r: { ...this.#delays } } : { $gr: 'lan', k: 'hi' };
   }
 
-  /** Should we have a LAN channel with `id` at all? */
+  /**
+   * Should we have a LAN channel with `id` at all? The size cap is for starting one: a peer we have
+   * already keeps its signalling (credential refreshes, restarts, retries) when the room grows past
+   * it, or its channel would die at the next relay refresh and never come back.
+   */
   #allowed(id: PlayerId): boolean {
     if (!this.#deps.enabled || this.#closed || id === this.#deps.me) return false;
     if (typeof RTCPeerConnection === 'undefined' && !this.#deps.createPeer) return false;
     if (this.#deps.relay && this.#relays === undefined) return false; // waiting for the server
     if (this.#deps.relay?.only && !this.#relays?.length) return false;
     const players = this.#deps.players();
-    return players.includes(id) && players.length - 1 <= MAX_LAN_PEERS;
+    if (!players.includes(id)) return false;
+    return this.#peers.has(id) || players.length - 1 <= MAX_LAN_PEERS;
   }
 
   #offerer(id: PlayerId): boolean {
@@ -852,7 +899,7 @@ export class Lan {
       const bucket = new TokenBucket(LIMITS.ratePerSecond, LIMITS.rateBurst, this.#clock());
       p = {
         id, pc: null, channel: null, open: false, gen: null, conn: null, server: null, stalled: false, stallTimer: null, early: [], timer: null, retries: 0, misses: 0, openedAt: 0, route: null, rtt: null, direct: false, races: 0, wins: 0, sparseUntil: 0, skipped: 0, bucket,
-        restartAt: Number.NEGATIVE_INFINITY, deferred: null, deferTimer: null, outbox: null,
+        restartAt: Number.NEGATIVE_INFINITY, deferred: null, deferTimer: null, startTimer: null, outbox: null,
       };
       this.#peers.set(id, p);
     }
@@ -918,7 +965,7 @@ export class Lan {
       } else if (s.k === 'ask') {
         if (offerer) return;
         this.#teardown(p);
-        this.#deps.signal(from, this.#hello(from));
+        this.#sayHello(from);
       } else if (s.k === 'offer') {
         if (offerer) return;
         this.#teardown(p);
@@ -936,7 +983,7 @@ export class Lan {
         if (!p.pc || typeof s.g !== 'string' || p.conn !== s.of) {
           // Not for the connection we have (we started over meanwhile): start over for real.
           this.#teardown(p);
-          this.#deps.signal(from, this.#hello(from));
+          this.#sayHello(from);
           return;
         }
         // An ICE restart on the connection we have: the channel stays open while ICE finds a new route.
@@ -1064,7 +1111,7 @@ export class Lan {
       // dropped, and its server copy, if there is one, is delivered as usual. Our own copies stay
       // under `MAX_LAN_COPY_BYTES` (`wrap`); this checks only what the server would refuse.
       const text = ev.data;
-      if (text.length > LIMITS.maxMessageBytes || utf8.encode(text).byteLength > LIMITS.maxMessageBytes) return;
+      if (!fitsUtf8(text, LIMITS.maxMessageBytes)) return;
       if (!p.bucket.take(this.#clock())) return;
       let w: unknown;
       try {
@@ -1189,7 +1236,7 @@ export class Lan {
     if (p.retries >= MAX_RETRIES) return;
     p.retries++;
     setTimeout(() => {
-      if (this.#peers.get(p.id) === p && !p.pc && this.#allowed(p.id)) this.#deps.signal(p.id, this.#hello(p.id));
+      if (this.#peers.get(p.id) === p && !p.pc && this.#allowed(p.id)) this.#sayHello(p.id);
     }, this.#deps.timing?.retryMs ?? RETRY_MS);
   }
 
@@ -1206,7 +1253,7 @@ export class Lan {
     if (wait === undefined) return;
     p.misses++;
     setTimeout(() => {
-      if (this.#peers.get(p.id) === p && !p.pc && this.#allowed(p.id)) this.#deps.signal(p.id, this.#hello(p.id));
+      if (this.#peers.get(p.id) === p && !p.pc && this.#allowed(p.id)) this.#sayHello(p.id);
     }, wait);
   }
 

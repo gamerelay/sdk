@@ -190,3 +190,19 @@ test('a join that fails sends what waited, to the room we are still in', async (
   expect(afterJoin()).toContain('after');
 });
 
+
+test('batches are put together from each message’s text: every item keeps v, order holds, and multi-byte text splits frames under the limit (SDK review #24)', async () => {
+  const { room, socket } = await inFirstRoom();
+  const before = socket.frames.length;
+  const big = '€'.repeat(2000); // 6000 UTF-8 bytes in 2000 characters
+  for (let i = 0; i < 8; i++) room.send({ i, big });
+  room.send({ i: 8, small: 'ok' });
+  await advance(200);
+  const frames = socket.frames.slice(before).filter((f) => f.t !== 'ping');
+  const items = frames.flatMap((f) => (f.t === 'batch' ? (f.m as Record<string, unknown>[]) : [f]));
+  expect(items.every((m) => m.v === 1)).toBe(true);
+  const sends = items.filter((m) => m.t === 'send'); // (the room's own heartbeats ride along)
+  expect(sends.map((m) => (m.d as { i: number }).i)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8]);
+  for (const f of frames) expect(new TextEncoder().encode(JSON.stringify(f)).byteLength).toBeLessThanOrEqual(16_000);
+  expect(frames.length).toBeGreaterThanOrEqual(4); // two 6 KB items per 15 KB frame at most
+});

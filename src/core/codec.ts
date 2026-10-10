@@ -1,6 +1,7 @@
 import type { Json } from '@gamerelay/protocol/types';
 import { GameRelayError } from '../errors';
 import type { FieldKind, SmoothFn } from './buffer';
+import { fitsUtf8, utf8Length } from '@gamerelay/protocol/bytes';
 
 export type FieldType = 'number' | 'angle' | 'flag' | 'text' | 'value';
 export type FieldInput = FieldType | { type: FieldType; precision?: number; smooth?: false | SmoothFn };
@@ -129,7 +130,7 @@ export function checkValue(kind: string, field: FieldSpec, value: unknown): void
     throw bad(`${kind}.${field.name} is a 'text' field of at most 256 characters; got ${value.length}. For longer text use a 'value' field or room.setState`);
   }
   if (!valid(field.type, value)) throw bad(`${kind}.${field.name} is a '${field.type}' field; got ${describe(value)}`);
-  if (field.type === 'value' && new TextEncoder().encode(JSON.stringify(value)).byteLength > MAX_VALUE_BYTES) {
+  if (field.type === 'value' && !fitsUtf8(JSON.stringify(value), MAX_VALUE_BYTES)) {
     throw bad(`${kind}.${field.name} is over 4 KB; keep 'value' fields small, and put bulk data in room.setState or an event`);
   }
 }
@@ -151,6 +152,41 @@ export function roundTo(value: number, precision: number, d = decimalsOf(precisi
   const rounded = d < 0 ? snapped : Number(snapped.toFixed(d));
   // Near the largest numbers, value / precision overflows: those keep their value.
   return Number.isFinite(rounded) ? rounded : value;
+}
+
+/**
+ * What JSON writes as escapes (`\"`, `\\`, `\u0001`, a lone surrogate's `\udXXX`), and surrogates
+ * generally (a pair is written as it is, 4 bytes): text with any of them is written out to measure.
+ */
+const ESCAPED = /["\\\u0000-\u001f\ud800-\udfff]/;
+
+/** The bytes `text` takes as a JSON string. */
+const stringBound = (text: string): number => (ESCAPED.test(text) ? utf8Length(JSON.stringify(text)) : utf8Length(text) + 2);
+
+/**
+ * At least as many bytes as `entry` takes as JSON, without writing it, for splitting updates into
+ * messages (measuring each by `JSON.stringify` wrote every update twice). Numbers, flags and text
+ * are counted exactly; only text with escapes or surrogates, and a 'value' field's object or
+ * array, are written out to measure.
+ */
+export function entryBound(entry: Entry): number {
+  const [id, flags, pairs, hash] = entry;
+  // (A present but undefined hash is written `,null`.)
+  let n = 6 + stringBound(id) + String(flags).length + (hash !== undefined ? stringBound(hash) + 1 : entry.length > 3 ? 5 : 0);
+  for (const v of pairs) {
+    n +=
+      1 +
+      (typeof v === 'number'
+        ? Number.isFinite(v)
+          ? String(v).length
+          : 4 // NaN and ±Infinity are written `null`
+        : typeof v === 'boolean' || v === null
+          ? 5
+          : typeof v === 'string'
+            ? stringBound(v)
+            : utf8Length(JSON.stringify(v)));
+  }
+  return n;
 }
 
 function wire(f: FieldSpec, v: unknown): Json {
