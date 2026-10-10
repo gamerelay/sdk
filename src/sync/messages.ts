@@ -4,6 +4,7 @@ import type { Warn } from '../debug/warnings';
 import type { Json, PlayerId } from '@gamerelay/protocol/types';
 import { GameRelayError } from '../errors';
 import type { SyncTransport } from './transport';
+import { fitsUtf8 } from '@gamerelay/protocol/bytes';
 
 /** Built-in room event names: games can't emit these. */
 export const RESERVED_EVENTS = new Set([
@@ -42,7 +43,7 @@ export function checkJson(where: string, data: Json): string {
   if (json === undefined) {
     throw new GameRelayError('bad_request', `${where}: data must be JSON (objects, arrays, numbers, strings, booleans, null)`);
   }
-  if (new TextEncoder().encode(json).byteLength > LIMITS.maxMessageBytes - 512) {
+  if (!fitsUtf8(json, LIMITS.maxMessageBytes - 512)) {
     throw new GameRelayError(
       'too_large',
       `${where}: data is over ${Math.floor(LIMITS.maxMessageBytes / 1024)} KB; for big or fast-changing data use entities (room.define(kind, fields), then its .spawn())`,

@@ -20,6 +20,8 @@ interface Pending {
   key: string;
   /** The host we asked: only its answer counts. */
   host: PlayerId;
+  /** We asked ourselves, as host: our handler is running here. */
+  local: boolean;
   at: number;
   resolve: (value: Json) => void;
   reject: (err: GameRelayError) => void;
@@ -65,16 +67,16 @@ export class Requests {
     }
     const body = JSON.parse(json) as Json;
     const host = this.#t.hostId?.() ?? '';
-    let promise: Promise<Json>;
-    if (host === this.#t.me) {
-      promise = this.#run(type, body, this.#t.me).then((a) => ('e' in a ? Promise.reject(new GameRelayError('rejected', a.e)) : a.d));
-    } else {
-      const i = `${this.#tag}:${++this.#seq}`;
-      promise = new Promise<Json>((resolve, reject) => {
-        this.#pending.set(i, { type, key, host, at: this.#t.now(), resolve, reject });
-      });
-      this.#t.send({ $gr: 'q', i, n: type, d: body } as unknown as Json, { to: host, reliable: true });
-    }
+    // The host asking itself waits like anyone else: a handler that never settles times out, and
+    // leaving fails it. A host change doesn't: the handler ran as host, its effects stand, and
+    // "try again" would ask the new host to grant it a second time.
+    const i = `${this.#tag}:${++this.#seq}`;
+    const local = host === this.#t.me;
+    const promise = new Promise<Json>((resolve, reject) => {
+      this.#pending.set(i, { type, key, host, local, at: this.#t.now(), resolve, reject });
+    });
+    if (local) void this.#run(type, body, this.#t.me).then((a) => this.#answer(i, a));
+    else this.#t.send({ $gr: 'q', i, n: type, d: body } as unknown as Json, { to: host, reliable: true });
     this.#byKey.set(key, promise);
     const forget = () => {
       if (this.#byKey.get(key) === promise) this.#byKey.delete(key);
@@ -105,12 +107,18 @@ export class Requests {
       });
       return true;
     }
-    const p = this.#pending.get(data.i);
-    if (!p || p.host !== from) return true;
-    this.#pending.delete(data.i);
-    if (typeof data.e === 'string') p.reject(new GameRelayError('rejected', data.e));
-    else p.resolve((data.d ?? null) as Json);
+    if (this.#pending.get(data.i)?.host !== from) return true;
+    this.#answer(data.i, typeof data.e === 'string' ? { e: data.e } : { d: (data.d ?? null) as Json });
     return true;
+  }
+
+  /** Settle request `i` with the host's answer, if it's still waiting. */
+  #answer(i: string, a: Answer): void {
+    const p = this.#pending.get(i);
+    if (!p) return;
+    this.#pending.delete(i);
+    if ('e' in a) p.reject(new GameRelayError('rejected', a.e));
+    else p.resolve(a.d);
   }
 
   /** Time out requests older than 5 s. */
@@ -118,13 +126,19 @@ export class Requests {
     const now = this.#t.now();
     for (const [i, p] of this.#pending) {
       if (now - p.at < REQUEST_TIMEOUT_MS) continue;
-      this.#fail(i, 'timeout', `room.request('${p.type}'): no answer from the host in 5 s; does the host call room.onRequest('${p.type}', …)?`);
+      this.#fail(
+        i,
+        'timeout',
+        p.local
+          ? `room.request('${p.type}'): your own room.onRequest('${p.type}') handler (you're the host) hasn't answered in 5 s and is still running; answer within 5 s, or what it does may land after this`
+          : `room.request('${p.type}'): no answer from the host in 5 s; does the host call room.onRequest('${p.type}', …)?`,
+      );
     }
   }
 
-  /** Reject everything waiting on the old host. */
+  /** Reject everything waiting on the old host (not our own handler's runs: their answers stand). */
   hostChanged(): void {
-    for (const [i, p] of this.#pending) this.#fail(i, 'host_changed', `room.request('${p.type}'): the host changed before answering; try again`);
+    for (const [i, p] of this.#pending) if (!p.local) this.#fail(i, 'host_changed', `room.request('${p.type}'): the host changed before answering; try again`);
   }
 
   close(): void {

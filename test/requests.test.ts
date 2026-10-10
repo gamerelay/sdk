@@ -1,5 +1,6 @@
 import { describe, expect, spyOn, test } from 'bun:test';
 import type { Json } from '@gamerelay/protocol/types';
+import { GameRelayError } from '../src/errors';
 import { RequestRejection, Requests } from '../src/sync/requests';
 import { FakeNet } from './fakeNet';
 
@@ -169,5 +170,62 @@ describe('Requests', () => {
     expect(ran).toBe(0);
     s.b.hostChanged();
     await expect(p).rejects.toMatchObject({ code: 'host_changed' });
+  });
+
+  describe('the host asking itself waits like anyone else (SDK review #11)', () => {
+    test('a handler that never settles times out in 5 s, and a repeat after that runs again', async () => {
+      const s = setup();
+      let runs = 0;
+      s.a.onRequest('slow', () => (runs++, new Promise<Json>(() => {})));
+      const first = s.a.request('slow', null);
+      first.catch(() => {});
+      await s.run(4900);
+      expect(s.a.request('slow', null)).toBe(first); // still waiting: the same promise
+      await s.run(200);
+      await expect(first).rejects.toMatchObject({ code: 'timeout' });
+      const again = s.a.request('slow', null);
+      again.catch(() => {});
+      expect(again).not.toBe(first);
+      expect(runs).toBe(2);
+    });
+
+    test('leaving fails it, and a late answer is ignored', async () => {
+      const s = setup();
+      let finish: (v: Json) => void = () => {};
+      s.a.onRequest('buy', () => new Promise<Json>((r) => (finish = r)));
+      const left = s.a.request('buy', 1);
+      await s.run(20);
+      s.a.close();
+      await expect(left).rejects.toMatchObject({ code: 'disconnected' });
+      finish('late');
+      await s.run(20);
+    });
+  });
+
+  test('a host change doesn’t fail the host’s own request: its handler ran as host, and its answer stands', async () => {
+    const s = setup();
+    let finish: (v: Json) => void = () => {};
+    s.a.onRequest('buy', () => new Promise<Json>((r) => (finish = r)));
+    const own = s.a.request('buy', 1);
+    s.b.onRequest('buy', () => 'b');
+    s.net.host = 'pb';
+    s.a.hostChanged();
+    finish('granted once');
+    expect(await own).toBe('granted once');
+  });
+
+  test('the host’s own request that times out says its handler is still running, not that there is none', async () => {
+    const s = setup();
+    s.a.onRequest('slow', () => new Promise<Json>(() => {}));
+    const own = s.a.request('slow', null);
+    own.catch(() => {});
+    await s.run(5100);
+    const err = await own.then(
+      () => null,
+      (e: GameRelayError) => e,
+    );
+    expect(err?.code).toBe('timeout');
+    expect(err?.message).toContain('still running');
+    expect(err?.message).not.toContain('does the host call');
   });
 });

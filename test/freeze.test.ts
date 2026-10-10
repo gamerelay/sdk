@@ -459,3 +459,126 @@ describe('p2p (the new name of lan)', () => {
     expect(await capsWith({ lan: false })).not.toContain('lan');
   });
 });
+
+describe('a getToken that never answers (SDK review #10)', () => {
+  const never = () => new Promise<string>(() => {});
+
+  test("connect waits for it as long as it takes (a sign-in may come first): no 15 s limit there", async () => {
+    jest.useFakeTimers();
+    FakeSocket.all = [];
+    g.WebSocket = FakeSocket;
+    let signIn!: (token: string) => void;
+    let signal!: AbortSignal;
+    let result: unknown = 'pending';
+    const getToken = (s: AbortSignal) => {
+      signal = s;
+      return new Promise<string>((resolve) => (signIn = resolve));
+    };
+    void GameRelay.connect({ url: 'http://test.local', lan: false, getToken }).then(
+      (r) => (result = r),
+      (e: GameRelayError) => (result = e.code),
+    );
+    await advance(60_000);
+    expect(result).toBe('pending');
+    expect(signal.aborted).toBe(false);
+    signIn('tok');
+    await settle();
+    expect(FakeSocket.last.url).toContain('token=tok');
+    FakeSocket.last.welcome('pa');
+    await settle();
+    expect(result).toBeInstanceOf(GameRelay);
+    (result as GameRelay).close();
+  });
+
+  test('a reconnect whose getToken hangs gives up on it and tries again; close() stops it at once', async () => {
+    jest.useFakeTimers();
+    FakeSocket.all = [];
+    g.WebSocket = FakeSocket;
+    let calls = 0;
+    const signals: AbortSignal[] = [];
+    const getToken = (signal: AbortSignal) => {
+      signals.push(signal);
+      return ++calls === 1 ? Promise.resolve('tok') : never();
+    };
+    const connecting = GameRelay.connect({ url: 'http://test.local', lan: false, getToken });
+    await settle();
+    FakeSocket.last.welcome('pa');
+    const relay = await connecting;
+    FakeSocket.last.drop();
+    for (let t = 0; t < 10_000 && calls < 2; t += 50) await advance(50);
+    expect(calls).toBe(2);
+    // Hung: after its 15 s the reconnect gives up on that call and asks again.
+    for (let t = 0; t < 30_000 && calls < 3; t += 50) await advance(50);
+    expect(calls).toBe(3);
+    expect(signals[1]!.aborted).toBe(true); // the abandoned call heard it
+    expect(signals[2]!.aborted).toBe(false);
+    relay.close();
+    expect(signals[2]!.aborted).toBe(true);
+    await advance(60_000);
+    expect(calls).toBe(3);
+    expect(FakeSocket.all.length).toBe(1);
+  });
+});
+
+describe('the token stage (review of #10)', () => {
+  test('getToken written as a method still gets its options as `this`', async () => {
+    jest.useFakeTimers();
+    FakeSocket.all = [];
+    g.WebSocket = FakeSocket;
+    const options = {
+      url: 'http://test.local',
+      lan: false,
+      backendToken: 'tok-from-this',
+      getToken(this: { backendToken: string }) {
+        return Promise.resolve(this.backendToken);
+      },
+    };
+    const connecting = GameRelay.connect(options as never);
+    await settle();
+    expect(FakeSocket.last.url).toContain('token=tok-from-this');
+    FakeSocket.last.welcome('pa');
+    const relay = await connecting;
+    relay.close();
+  });
+
+  test('a token answer whose body never finishes fails with timeout, not "Auth failed"', async () => {
+    jest.useFakeTimers();
+    FakeSocket.all = [];
+    g.WebSocket = FakeSocket;
+    g.fetch = (_url: string, init: { signal: AbortSignal }) =>
+      Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(new Error('AbortError')))),
+      });
+    let err: GameRelayError | null = null;
+    void GameRelay.connect({ publicKey: 'gr_pub_test', url: 'http://test.local', lan: false }).catch((e: GameRelayError) => (err = e));
+    await advance(16_000);
+    expect(err).not.toBeNull();
+    expect(err!.code).toBe('timeout');
+    expect(err!.message).not.toContain('Auth failed');
+  });
+
+  test('close() during a reconnect’s token request aborts the request itself (one token step for both paths)', async () => {
+    jest.useFakeTimers();
+    FakeSocket.all = [];
+    g.WebSocket = FakeSocket;
+    const signals: AbortSignal[] = [];
+    g.fetch = (_url: string, init: { signal: AbortSignal }) => {
+      signals.push(init.signal);
+      // The first answer expires within the minute, so the reconnect asks again; that one hangs.
+      if (signals.length > 1) return new Promise(() => {});
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ token: 'tok', expiresAt: Date.now() + 30_000 }) });
+    };
+    const connecting = GameRelay.connect({ publicKey: 'gr_pub_test', url: 'http://test.local', lan: false });
+    await settle();
+    FakeSocket.last.welcome('pa');
+    const relay = await connecting;
+    FakeSocket.last.drop();
+    for (let t = 0; t < 10_000 && signals.length < 2; t += 50) await advance(50);
+    expect(signals).toHaveLength(2);
+    expect(signals[1]!.aborted).toBe(false);
+    relay.close();
+    expect(signals[1]!.aborted).toBe(true);
+  });
+});

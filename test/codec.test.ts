@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { FULL, compileSchema, checkValue, decimalsOf, decodeChanges, encodeChanges, isEntry, roundTo } from '../src/core/codec';
+import { FULL, compileSchema, checkValue, decimalsOf, decodeChanges, encodeChanges, entryBound, isEntry, roundTo } from '../src/core/codec';
 
 const ship = () => compileSchema('ship', { x: 'number', h: 'angle', alive: 'flag', name: 'text', inv: 'value' });
 
@@ -132,4 +132,30 @@ describe('encodeChanges / decodeChanges', () => {
     expect(isEntry([1, 0, []])).toBe(false);
     expect(isEntry(['ship:a:1', 0])).toBe(false);
   });
+});
+
+test('entryBound is never under an update’s real size, and stays within a byte or two of it', () => {
+  const utf8 = new TextEncoder();
+  const size = (e: unknown) => utf8.encode(JSON.stringify(e)).byteLength;
+  let seed = 7;
+  const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+  // Lone surrogates (a name cut mid-emoji) are written as 6-byte escapes (review of #24).
+  const texts = ['', 'ada', 'héllo', '日本', '🚗🏁', '"quoted"\n', '\u0001\u001f', 'x'.repeat(256), '\ud83d'.repeat(256), 'a\ude97🏁\ud83d'];
+  for (let i = 0; i < 500; i++) {
+    const pairs: unknown[] = [];
+    for (let f = 0; f < 1 + Math.floor(rand() * 8); f++) {
+      const r = rand();
+      pairs.push(f, r < 0.4 ? (rand() - 0.5) * 10 ** Math.floor(rand() * 12) : r < 0.5 ? -Number.MAX_VALUE * rand() : r < 0.55 ? [NaN, Infinity][f % 2] : r < 0.6 ? rand() < 0.5 : r < 0.8 ? texts[Math.floor(rand() * texts.length)] : { k: texts[i % texts.length], n: [1, 2.5] });
+    }
+    const entry = [`ship:p${i}:${i}`, i % 64, pairs, i % 3 ? undefined : 'h4sh'] as never;
+    expect(entryBound(entry)).toBeGreaterThanOrEqual(size(entry));
+  }
+  const plain = ['ship:pa:1', 0, [0, 12.34, 1, 56.78, 2, 1.57]] as never;
+  // Close enough that updates pack into messages as they did when each was measured exactly.
+  expect(entryBound(plain) - size(plain)).toBeLessThanOrEqual(2);
+  // NaN (a 'value' field may hold it) is written `null`, a byte longer than `NaN`; text is exact.
+  for (const e of [['ship:pa:1', 0, [0, NaN, 1, NaN, 2, NaN, 3, NaN]], ['ship:pa:1', 0, [0, '\ud83d'.repeat(256)]], ['ship:pa:1', 0, [0, 'Zoë 🏁 "x"']]] as never[]) {
+    expect(entryBound(e) - size(e)).toBeGreaterThanOrEqual(0);
+    expect(entryBound(e) - size(e)).toBeLessThanOrEqual(2);
+  }
 });

@@ -4,6 +4,24 @@ Every release of `@gamerelay/sdk`, newest first. The notes under a version's hea
 GitHub release. Until 1.0, a minor version (0.x.0) may change the API; each break is listed
 here with what to change.
 
+## 0.1.0-alpha.8 (2026-10-09)
+
+- **Fix:** a `getToken` that never answers no longer hangs a reconnect for good: a reconnect gives
+  it 15 s, then tries again later, and `relay.close()` while it waits stops it at once. `connect()`
+  still waits as long as it takes (a sign-in may come first). `getToken` now gets an `AbortSignal`
+  that aborts when the SDK stops waiting: pass it to your `fetch`, or close a sign-in prompt.
+- **Fix:** the host's `room.request()` to itself times out after 5 s like anyone's, and fails with
+  `disconnected` if it leaves first. Before, a handler that never settled left it waiting forever,
+  and every repeat of it got the same stuck promise. A host change doesn't fail it: the handler
+  ran as host, so its answer stands (a "try again" would grant it twice).
+- **Fix:** in a room past the direct-connection cap (8 players), connections players already had
+  stopped answering their own refreshes, died after about 20 minutes and never came back, even when
+  the room shrank. They keep working now, and a room back within the cap connects the players it
+  skipped.
+- **Faster:** each message is written as JSON once on its way out (it was twice, plus a copy to
+  measure its size), and sizes are counted without encoding: about a third less time per send
+  frame, and less garbage.
+
 ## 0.1.0-alpha.7 (2026-10-09)
 
 - **Fix:** messages the server sent right after a join's answer, in the same frame (a state

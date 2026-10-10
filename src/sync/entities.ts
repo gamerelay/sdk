@@ -16,6 +16,7 @@ import {
   compileSchema,
   decodeChanges,
   encodeChanges,
+  entryBound,
   isEntry,
   isKindName,
   type Entry,
@@ -94,7 +95,6 @@ const EXPIRE_MS = 3000;
 const ADVANCE_MS = 4;
 /** A gap this long between our own advances means *we* were frozen (a suspended page), not them. */
 const OWN_STALL_MS = 1000;
-const utf8 = new TextEncoder();
 const sessionOf = (id: string) => id.split(':')[1] ?? '';
 /** Only these fields can trip the unannounced-jump snap: positions jump, velocities just change. */
 const POSITION_FIELDS = new Set(['x', 'y', 'z']);
@@ -555,7 +555,7 @@ export class EntityStore {
       size = 0;
     };
     for (const entry of entries) {
-      const n = utf8.encode(JSON.stringify(entry)).byteLength + 1;
+      const n = entryBound(entry) + 1; // an upper bound: no write of the update just to measure it
       if (size + n > MAX_MESSAGE_BYTES) send();
       chunk.push(entry);
       size += n;

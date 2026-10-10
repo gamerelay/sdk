@@ -1,6 +1,7 @@
 import type { Json, PlayerId } from '@gamerelay/protocol/types';
 import { GameRelayError } from '../errors';
 import type { SyncTransport } from './transport';
+import { fitsUtf8 } from '@gamerelay/protocol/bytes';
 
 /** Inputs go to the host at most this often… */
 export const INPUT_SEND_MS = 50;
@@ -14,7 +15,6 @@ export const MAX_HELD_KEYS = 32;
 
 type InputState = Record<string, Json>;
 const EMPTY: Readonly<InputState> = Object.freeze({});
-const utf8 = new TextEncoder();
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 
 /** The same keys at rest: booleans false, numbers 0, anything else kept. */
@@ -60,7 +60,7 @@ export class Inputs {
       json = undefined;
     }
     if (json === undefined) throw new GameRelayError('bad_request', 'room.input(state): state must be JSON (booleans, numbers, strings)');
-    if (utf8.encode(json).byteLength > MAX_INPUT_BYTES) {
+    if (!fitsUtf8(json, MAX_INPUT_BYTES)) {
       throw new GameRelayError('too_large', 'room.input: keep inputs small (under 1 KB): buttons and axes, not game state');
     }
     this.#latest = JSON.parse(json) as InputState;
