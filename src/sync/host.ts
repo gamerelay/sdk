@@ -4,7 +4,7 @@ export interface HostHealthDeps {
   now(): number;
   isHost(): boolean;
   send(message: HealthMessage): void;
-  /** False while disconnected: nothing is sent (it would only pile up), and measuring starts over. */
+  /** False while disconnected or still getting back into the room: nothing is sent (it would only pile up), and measuring starts over. */
   ready?(): boolean;
 }
 
@@ -63,9 +63,14 @@ export class HostHealth {
     }
   }
 
+  /** After a reconnect: what we last said may have gone down with the old socket (a change while offline waits for this). */
+  resend(): void {
+    if (this.#hidden !== null) this.#d.send({ t: 'visibility', hidden: this.#hidden });
+  }
+
   visibility(hidden: boolean): void {
     if (hidden === this.#hidden) return;
     this.#hidden = hidden;
-    this.#d.send({ t: 'visibility', hidden });
+    if (this.#d.ready?.() ?? true) this.#d.send({ t: 'visibility', hidden });
   }
 }

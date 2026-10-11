@@ -1,5 +1,5 @@
-import { describe, expect, spyOn, test } from 'bun:test';
-import { MAX_CATCH_UP, Ticker, intervalScheduler, pickScheduler, type Scheduler } from '../src/core/ticker';
+import { describe, expect, jest, spyOn, test } from 'bun:test';
+import { MAX_CATCH_UP, Ticker, intervalScheduler, pickScheduler, workerScheduler, type Scheduler } from '../src/core/ticker';
 
 function fake() {
   let now = 0;
@@ -92,5 +92,48 @@ describe('Ticker', () => {
 
   test('outside a browser, the scheduler is setInterval', () => {
     expect(pickScheduler(() => {})).toBe(intervalScheduler);
+  });
+});
+
+describe('workerScheduler', () => {
+  test('a worker error after stop() starts no fallback interval (SDK review #18)', () => {
+    const g = globalThis as { Worker?: unknown };
+    const saved = g.Worker;
+    const workers: { onerror: ((e: { preventDefault(): void }) => void) | null; terminated: boolean }[] = [];
+    g.Worker = class {
+      onmessage: (() => void) | null = null;
+      onerror: ((e: { preventDefault(): void }) => void) | null = null;
+      terminated = false;
+      constructor() {
+        workers.push(this);
+      }
+      postMessage() {}
+      terminate() {
+        this.terminated = true;
+      }
+    };
+    jest.useFakeTimers();
+    try {
+      let fellBack = 0;
+      let woke = 0;
+      const stop = workerScheduler(() => fellBack++)(10, () => woke++);
+      stop();
+      workers[0]!.onerror!({ preventDefault() {} }); // (an error event already queued)
+      jest.advanceTimersByTime(100);
+      expect(fellBack).toBe(0);
+      expect(woke).toBe(0);
+      expect(jest.getTimerCount()).toBe(0);
+      // Still running, an error falls back to an interval, and stop() clears it.
+      const stop2 = workerScheduler(() => fellBack++)(10, () => woke++);
+      workers[1]!.onerror!({ preventDefault() {} });
+      jest.advanceTimersByTime(35);
+      expect(fellBack).toBe(1);
+      expect(woke).toBe(3);
+      stop2();
+      expect(jest.getTimerCount()).toBe(0);
+    } finally {
+      jest.useRealTimers();
+      g.Worker = saved;
+    }
   });
 });

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, jest, spyOn, test } from 'bun:test';
 import { GameRelayError } from '../src/index';
-import { FakeSocket, advance, answerRoom, connectFake, settle } from './fakeRelay';
+import { FakeSocket, advance, answerRoom, connectFake, roomInfo, settle } from './fakeRelay';
 import { linkOf } from '../src/internal';
 
 /** The SDK's REPLY_TIMEOUT_MS. */
@@ -262,6 +262,169 @@ describe('the outbox while offline', () => {
     const back = await reopen();
     await advance(3000);
     expect(back.attempts.filter((m) => m.t === 'send').map((m) => m.d)).toEqual([...Array(256).keys()].map((i) => i + 44));
+  });
+});
+
+describe('a warning when reliable sends are dropped', () => {
+  test('past the cap, once, naming relay.connected; not when only replaceable sends went', async () => {
+    const warn = spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { relay, socket } = await setup();
+      socket().drop();
+      await settle();
+      for (let i = 0; i < 250; i++) linkOf(relay).queue({ t: 'send', d: i });
+      for (let i = 0; i < 20; i++) linkOf(relay).queue({ t: 'heartbeat' });
+      await advance(100);
+      const dropped = () => warn.mock.calls.filter((c) => String(c[0]).includes('the oldest were dropped'));
+      expect(dropped().length).toBe(0);
+      for (let i = 0; i < 50; i++) linkOf(relay).queue({ t: 'send', d: 1000 + i });
+      await advance(100);
+      expect(dropped().length).toBe(1);
+      expect(String(dropped()[0]![0])).toContain('relay.connected');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+describe('back from a reconnect', () => {
+  test("a player who dropped or came back while we were away gets player_disconnected / player_reconnected", async () => {
+    const { relay, socket, reopen } = await setup();
+    const entering = relay.createRoom();
+    await settle();
+    const s = socket();
+    const players = (pbConnected: boolean) => [
+      { id: 'pa', name: 'pa', avatar: null, joinedAt: 0, connected: true, slot: 0 },
+      { id: 'pb', name: 'pb', avatar: null, joinedAt: 1, connected: pbConnected, slot: 1 },
+    ];
+    const enter = (to: FakeSocket, t: string, pbConnected: boolean) => {
+      const room = { ...roomInfo('pa'), players: players(pbConnected) };
+      to.deliver({ t: 'room', room, you: 'pa' });
+      to.deliver({ t: 'reply', rid: to.sentOf(t).at(-1)!.rid, data: { roomId: room.id } });
+    };
+    enter(s, 'create_room', true);
+    const room = await entering;
+    const events: string[] = [];
+    room.on('player_disconnected', (id) => events.push(`disconnected ${id}`));
+    room.on('player_reconnected', (id) => events.push(`reconnected ${id}`));
+    for (const pbConnected of [false, true]) {
+      socket().drop();
+      const back = await reopen();
+      enter(back, 'join_room', pbConnected);
+      await settle();
+    }
+    expect(events).toEqual(['disconnected pb', 'reconnected pb']);
+    expect(room.players.find((p) => p.id === 'pb')!.connected).toBe(true);
+  });
+
+  test('a player who joined and dropped while we were away: player_joined, then player_disconnected, seen with the room as it is now (code review)', async () => {
+    const { relay, socket, reopen } = await setup();
+    const entering = relay.createRoom();
+    await settle();
+    answerRoom(socket(), 'create_room', 'pa');
+    const room = await entering;
+    const events: string[] = [];
+    room.on('player_joined', (p) => events.push(`joined ${p.id}`));
+    room.on('player_disconnected', (id) => events.push(`disconnected ${id} host=${room.hostId} round=${room.state.round}`));
+    socket().drop();
+    const back = await reopen();
+    const info = {
+      ...roomInfo('pa'), hostId: 'pa', state: { round: 2 },
+      players: [...roomInfo('pa').players, { id: 'pb', name: 'pb', avatar: null, joinedAt: 1, connected: false, slot: 1 }],
+    };
+    back.deliver({ t: 'room', room: info, you: 'pa' });
+    back.deliver({ t: 'reply', rid: back.sentOf('join_room').at(-1)!.rid, data: { roomId: info.id } });
+    await settle();
+    expect(events).toEqual(['joined pb', 'disconnected pb host=pa round=2']);
+  });
+
+  test('a hidden tab says so again: a visibility sent as the old socket died may never have arrived', async () => {
+    const { relay, socket, reopen, page } = await setup('pa', { page: true });
+    const entering = relay.createRoom();
+    await settle();
+    answerRoom(socket(), 'create_room', 'pa');
+    await entering;
+    page!.document.hidden = true;
+    page!.fire('visibilitychange');
+    await advance(200);
+    socket().drop(); // (the visibility went out on it; say the server never read it)
+    const back = await reopen();
+    answerRoom(back, 'join_room', 'pa');
+    await advance(200);
+    expect(back.sentOf('visibility').map((m) => m.hidden)).toEqual([true]);
+  });
+
+  test('a visibility change after the new socket opens but before the room is back goes out once (code review)', async () => {
+    const { relay, socket, reopen, page } = await setup('pa', { page: true });
+    const entering = relay.createRoom();
+    await settle();
+    answerRoom(socket(), 'create_room', 'pa');
+    await entering;
+    await advance(100);
+    socket().drop();
+    const back = await reopen(); // welcomed: connected, the rejoin not answered yet
+    page!.document.hidden = true;
+    page!.fire('visibilitychange');
+    await advance(100);
+    answerRoom(back, 'join_room', 'pa');
+    await advance(200);
+    expect(back.sentOf('visibility').map((m) => m.hidden)).toEqual([true]);
+  });
+
+  test('a visibility change while offline goes out once after the reconnect, not twice (review)', async () => {
+    const { relay, socket, reopen, page } = await setup('pa', { page: true });
+    const entering = relay.createRoom();
+    await settle();
+    answerRoom(socket(), 'create_room', 'pa');
+    await entering;
+    await advance(100); // (the room's first report, visible, goes out on this socket)
+    socket().drop();
+    await settle();
+    page!.document.hidden = true;
+    page!.fire('visibilitychange');
+    await advance(200);
+    const back = await reopen();
+    answerRoom(back, 'join_room', 'pa');
+    await advance(200);
+    expect(back.sentOf('visibility').map((m) => m.hidden)).toEqual([true]);
+  });
+});
+
+describe('sends batched to the next animation frame', () => {
+  test('a requestAnimationFrame that runs its callback at once (a shim) still sends, once (code review)', async () => {
+    const g = globalThis as { requestAnimationFrame?: unknown; cancelAnimationFrame?: unknown };
+    g.requestAnimationFrame = (cb: () => void) => (cb(), 1);
+    g.cancelAnimationFrame = () => {};
+    try {
+      const { relay, socket } = await setup();
+      linkOf(relay).queue({ t: 'send', d: 1 });
+      linkOf(relay).queue({ t: 'send', d: 2 });
+      await advance(200);
+      expect(socket().sentOf('send').map((m) => m.d)).toEqual([1, 2]);
+    } finally {
+      delete g.requestAnimationFrame;
+      delete g.cancelAnimationFrame;
+    }
+  });
+
+  test("the frame clears its backup timer: frames don't each leave one pending", async () => {
+    const g = globalThis as { requestAnimationFrame?: unknown; cancelAnimationFrame?: unknown };
+    const frames: (() => void)[] = [];
+    g.requestAnimationFrame = (cb: () => void) => frames.push(cb);
+    g.cancelAnimationFrame = () => {};
+    try {
+      const { relay, socket } = await setup();
+      const timers = jest.getTimerCount();
+      for (let i = 0; i < 5; i++) {
+        linkOf(relay).queue({ t: 'send', d: i });
+        frames.splice(0).forEach((run) => run());
+      }
+      expect(socket().sentOf('send').length).toBe(5);
+      expect(jest.getTimerCount()).toBe(timers);
+    } finally {
+      delete g.requestAnimationFrame;
+      delete g.cancelAnimationFrame;
+    }
   });
 });
 

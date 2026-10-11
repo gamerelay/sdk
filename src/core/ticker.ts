@@ -17,7 +17,9 @@ const WORKER_SOURCE = 'let h;onmessage=(e)=>{clearInterval(h);h=setInterval(()=>
 export function workerScheduler(onFallback: () => void): Scheduler {
   return (ms, wake) => {
     let stop: () => void = () => {};
+    let stopped = false;
     const fallback = () => {
+      if (stopped) return; // an error from a worker we already stopped: nothing to replace
       onFallback();
       stop = intervalScheduler(ms, wake);
     };
@@ -39,7 +41,10 @@ export function workerScheduler(onFallback: () => void): Scheduler {
     } catch {
       fallback();
     }
-    return () => stop();
+    return () => {
+      stopped = true;
+      stop();
+    };
   };
 }
 

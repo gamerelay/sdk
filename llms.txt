@@ -66,7 +66,7 @@ the page. Until it's filled in, `connect()` rejects with `unauthorized`.
 updates in place, and within `v0` nothing is removed or renamed without a deprecation first (the
 old name keeps working and warns in the console for at least 30 days). `/sdk/gamerelay.js` is the
 same `v0` line, forever. To pin one exact version instead, load it from npm through jsDelivr:
-`https://cdn.jsdelivr.net/npm/@gamerelay/sdk@0.1.0-alpha.8/gamerelay.js` (any published
+`https://cdn.jsdelivr.net/npm/@gamerelay/sdk@0.1.0-alpha.9/gamerelay.js` (any published
 version: `npm view @gamerelay/sdk versions`). Until the SDK reaches 1.0, a pinned alpha may be
 asked to update: new server features can need the newest alpha, and old alphas stop being
 accepted sooner than they will after 1.0.
@@ -78,7 +78,7 @@ accepted, `connect()` rejects with `upgrade_required` and the SDK stops retrying
 `/sdk/v0/` URL (or `npm i @gamerelay/sdk@latest`) to fix it.
 
 Names marked **experimental** may still change within `v0`: the player-to-player route (on by
-default; see the docs page), `relay.joinOrCreate`, `relay.features`, `relay.serverInfo`, and a
+default; see the docs page), `relay.features`, `relay.serverInfo`, and a
 field's `smooth` option. Everything else in this guide is the `v0` promise.
 
 ## Connect and get into a room
@@ -90,7 +90,7 @@ const room = await relay.quickMatch({ maxPlayers: 2 }); // join any open public 
 // or: const room = await relay.createRoom({ maxPlayers: 4 });  share room.code with friends
 // or: const room = await relay.joinRoom('K7QM');
 // or: const room = await relay.joinInvite();  the room in this page's ?join= or ?room=CODE link, or null (see Invite links)
-// or: const room = await relay.joinOrCreate({ maxPlayers: 4, updateUrl: true });  experimental: the link's room, else quick match
+// or: const room = await relay.joinOrCreate({ maxPlayers: 4, updateUrl: true });  the link's room, else quick match
 ```
 
 A player is in at most one room at a time. `relay.playerId` stays the same across reloads of
@@ -431,10 +431,14 @@ me.remove();
   everyone snaps instead of sliding across the map.
 - **Lifetime**: when a player disconnects, their entities freeze where they were until they
   reconnect (up to 30 s). When they leave for good, their entities go (`'left'`), unless spawned
-  with `{ onLeave: 'host' }`: then the host keeps them (a carried flag stays in the world).
+  with `{ onLeave: 'host' }`: then the host keeps them (a carried flag stays in the world). A
+  reload is a new page: its old entities go (`'expired'`), and `onLeave: 'host'` ones go to the
+  host the same way.
 - **Host entities**: `ships.spawn(…, { owner: 'host' })`, only on the host. They belong to the
   host role, so when the host changes the next host writes them, carrying on from where they were.
-  Use them for the world: enemies, balls, pickups.
+  Use them for the world: enemies, balls, pickups. If the role moves before the SDK sent your last
+  changes (you were offline, say), the room keeps its version: a spawn it never got is removed
+  (`'expired'`), and an entity you removed comes back (`onSpawn` again, the same object).
 - Entities are live objects (Proxies): copy one with `{ ...e }` (not `structuredClone`).
 - Late joiners get every entity automatically. Limits: 256 entities per player, 1,024 per room.
 - A handle belongs to its room: after `room.leave()` or moving rooms, define again in the new
@@ -536,8 +540,10 @@ room.clearTimer('round');
 
 - State is for facts, not motion (at most about 10 changes a second; 64 KB in all).
 - A timer fires exactly once even if the host changes: its handler's `setState` changes and the
-  timer's clear go out together.
-- Keys starting with `$` in state (`$timers`, `$teams`, …) belong to the SDK.
+  timer's clear go out together. A handler may set its own timer again for a repeating one
+  (`room.timer('wave', 30_000)` in its handler); not for every frame: that's your game loop.
+- Keys starting with `$` in state (`$timers`, `$teams`, …) belong to the SDK; `__proto__`,
+  `constructor` and `prototype` aren't allowed (`setState` throws `bad_request`).
 
 ## Slots and teams
 
@@ -577,7 +583,8 @@ function frame() { draw(); requestAnimationFrame(frame); }                      
 ## Debugging
 
 `GameRelay.connect({ publicKey, debug: true })` shows an overlay (ping, smoothing delay, messages
-and bytes per second, entities per kind, host). Warnings print to the console either way, once
+and bytes per second, entities per kind, host) and prints player-to-player status lines (`LAN
+shortcut to …`; its failures print either way). Warnings print to the console either way, once
 each, and each one says the fix and names the llms.txt section to read. The full list:
 
 - `room.on('playerJoined') is a custom event …; the built-in for a player arriving is room.on('player_joined')` (see Room reference)
@@ -605,19 +612,20 @@ Test on a bad network before shipping: `connect({ …, simulate: { latency: 150,
 The easiest way to play with friends: put the room code in the page URL and send the link.
 
 ```js
-// Join the room in this page's link (?join=… or ?room=CODE), or start one.
-const room =
-  (await relay.joinInvite().catch(() => null)) ??
-  (await relay.createRoom({ maxPlayers: 4 }));
-history.replaceState(null, '', room.inviteUrl()); // the address bar is now the invite link
+// Join the room in this page's link (?join=… or ?room=CODE), or start one (private: not quick
+// match); updateUrl: the address bar is now the invite link.
+const room = await relay.joinOrCreate({ maxPlayers: 4, private: true, updateUrl: true });
 
 room.inviteUrl()          // this page's URL plus ?room=CODE (a link-only room: ?join=<link>); other params and the hash are kept
 await room.shareInvite()  // share sheet on phones, clipboard elsewhere: 'shared' | 'copied' | 'cancelled'
 ```
 
-- `relay.joinInvite(url?)` resolves `null` when there is no `?join=` or `?room=` in the URL, and rejects like
-  `joinRoom` (`room_not_found`, `room_full`) when the room is gone or full. An old link points at a
-  room that may have closed, so catch and fall back (above).
+- `joinOrCreate` starts a room when the link's room has closed. A full, locked or banning room
+  still rejects (`room_full`, `locked`, `banned`): tell the player. Without `private` it
+  quick-matches instead of starting a room.
+- `relay.joinInvite(url?)` is the lower-level step: it resolves `null` when there is no `?join=` or
+  `?room=` in the URL, and rejects like `joinRoom` (`room_not_found`, `room_full`) when the room is
+  gone or full.
 - Call `shareInvite()` from a click or tap: browsers only allow sharing and copying after a user
   gesture. It rejects if copying isn't allowed (e.g. a page not served over https).
 - When the player leaves the room, clear the link: `history.replaceState(null, '', location.pathname)`.
@@ -942,7 +950,8 @@ Webhooks are notifications: they can't block or change what happens in the game.
 
 The SDK reconnects on its own (exponential backoff) and puts the player back in their room.
 This also happens after a server restart. Reliable `send`s made while offline are queued (up
-to 256) and sent on reconnect. Unreliable ones are dropped.
+to 256; past that the oldest are dropped, with a console warning) and sent on reconnect.
+Unreliable ones are dropped.
 
 ```js
 relay.on('disconnected', () => showBanner('Reconnecting…'));
