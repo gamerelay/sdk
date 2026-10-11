@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, jest, test } from 'bun:test';
 import { LIMITS } from '@gamerelay/protocol/limits';
 import type { Json } from '@gamerelay/protocol/types';
 import { Lan, MAX_LAN_COPY_BYTES, MAX_UNCONFIRMED, Merge, PROBE_EVERY, RACE_WINDOW, RETRY_MS, SPARSE_MS, STALE_MS, type LanDeps, type Wrapped } from '../src/sync/lan';
@@ -732,6 +732,58 @@ describe('LAN shortcut: channel lifecycle', () => {
     return { l, peers, sent, got, players };
   }
   const receive = (p: FakePeer, data: unknown) => (p.channel.onmessage as unknown as (ev: { data: unknown }) => void)({ data });
+
+  test("close() clears a retry's pending hello: no timer outlives the room", async () => {
+    jest.useFakeTimers();
+    try {
+      const { l, peers, sent } = await answerer();
+      peers[0]!.channel.onopen?.();
+      peers[0]!.channel.onclose!(); // the retry's hello waits retryMs
+      l.close();
+      expect(jest.getTimerCount()).toBe(0);
+      jest.advanceTimersByTime(100);
+      expect(sent.filter((m) => m.k === 'hello')).toEqual([]);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test("a reconnect's hello replaces a retry's still waiting: one hello, not two (review)", async () => {
+    jest.useFakeTimers();
+    try {
+      const { l, peers, sent } = await answerer();
+      peers[0]!.channel.onopen?.();
+      peers[0]!.channel.onclose!(); // the retry's hello waits retryMs
+      l.reconnect();
+      jest.advanceTimersByTime(100);
+      expect(sent.filter((m) => m.k === 'hi').length).toBe(1);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('status lines are marked as status, and an offer WebRTC throws on as a failure (SDK review #23)', async () => {
+    const lines: [string, boolean | undefined][] = [];
+    let broken = false;
+    const l = new Lan(
+      deps({
+        me: 'b',
+        enabled: true,
+        players: () => ['a', 'b'],
+        log: (m, failure) => lines.push([m, failure]),
+        createPeer: () => {
+          if (broken) throw new Error('no WebRTC here');
+          return new FakePeer() as unknown as RTCPeerConnection;
+        },
+      }),
+    );
+    await l.signal('a', { $gr: 'lan', k: 'offer', g: 'g1', sdp: 'o' });
+    expect(lines).toEqual([]);
+    l.remove('a');
+    broken = true;
+    await l.signal('a', { $gr: 'lan', k: 'offer', g: 'g2', sdp: 'o' });
+    expect(lines).toEqual([['LAN shortcut to a failed: no WebRTC here', true]]);
+  });
 
   test('a copy that arrives over the channel is delivered', async () => {
     const { l, peers, got } = await answerer();
@@ -1815,6 +1867,26 @@ describe('LAN shortcut: the LAN first, a relay otherwise, in one connection', ()
       (peers[0]!.onicecandidate as (ev: unknown) => void)({ candidate: { toJSON: () => ({ candidate: srflx, sdpMid: '0' }) } });
       (peers[0]!.onicecandidate as (ev: unknown) => void)({ candidate: null });
       expect(sent.find((x) => x.d.k === 'ice')!.d.c!.candidate).toContain('typ srflx raddr 0.0.0.0 rport 0');
+    });
+
+    test("a party change's hello replaces a retry's still waiting: one hello, not two (code review)", async () => {
+      jest.useFakeTimers();
+      try {
+        let member = false;
+        const { l, peers, sent } = withRelays('b', { probe: async () => null }, () => member, undefined, { retryMs: 50, stableMs: 20 });
+        await l.setRelays([sf]);
+        await l.signal('a', offer());
+        peers[0]!.channel.onopen!();
+        peers[0]!.channel.onclose!(); // a retry's hello waits retryMs
+        await l.signal('a', offer()); // a new offer came first
+        sent.length = 0;
+        member = true;
+        l.directChanged();
+        jest.advanceTimersByTime(200);
+        expect(sent.map((x) => x.d.k).filter((k) => k === 'hi')).toEqual(['hi']);
+      } finally {
+        jest.useRealTimers();
+      }
     });
 
     test('joining or leaving the party starts the connection over, the other way; no change, no restart', async () => {

@@ -26,6 +26,8 @@ export interface RelayLink {
   readonly lanEnabled: boolean;
   readonly lanForceRelay: boolean;
   readonly lanDirect: 'party' | null;
+  /** `debug` was set: P2P status lines go to the console too (failures always do). */
+  readonly debug: boolean;
   queue(message: Outgoing): void;
   request(message: Request): Promise<Json | undefined>;
   now(): number;

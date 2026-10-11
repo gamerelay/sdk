@@ -161,7 +161,7 @@ export interface CreateRoomOptions extends RoomOptions {
   linkOnly?: boolean;
 }
 
-/** `relay.joinOrCreate(options)`. Experimental. */
+/** `relay.joinOrCreate(options)`. */
 export interface JoinOrCreateOptions extends RoomOptions {
   /** With no invite in the URL: a new unlisted room (friends join with its code or invite), not quick match. */
   private?: boolean;
@@ -390,16 +390,18 @@ const ICE_REFRESH_MS = 20 * 60 * 1000;
  * (the tab may be hidden after the frame was requested).
  */
 function nextFrame(cb: () => void): void {
-  if (typeof requestAnimationFrame !== 'function') return void setTimeout(cb, 0);
+  if (typeof requestAnimationFrame !== 'function' || typeof cancelAnimationFrame !== 'function') return void setTimeout(cb, 0);
   if (typeof document !== 'undefined' && document.hidden) return queueMicrotask(cb);
-  let done = false;
-  const run = () => {
-    if (done) return;
-    done = true;
+  let frame = 0;
+  // (The timer first: a frame callback may run at once, in a shim, and clears it.)
+  const backup = setTimeout(() => {
+    cancelAnimationFrame(frame);
     cb();
-  };
-  requestAnimationFrame(run);
-  setTimeout(run, 100);
+  }, 100);
+  frame = requestAnimationFrame(() => {
+    clearTimeout(backup);
+    cb();
+  });
 }
 
 /** Invite links carry the room code in this query parameter: `?room=CODE`. */
@@ -532,6 +534,8 @@ export class GameRelay extends Emitter<RelayEvents> {
   #attempts = 0;
   #reconnectHintMs: number | null = null;
   #reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The pings that refine the clock after a welcome (cleared on close: they'd keep Bun or Node alive). */
+  #welcomePings: ReturnType<typeof setTimeout>[] = [];
   /** The code of the last reconnect failure reported through `error`: each new one once per outage. */
   #reported: string | null = null;
   #stopped = false;
@@ -591,6 +595,7 @@ export class GameRelay extends Emitter<RelayEvents> {
         const p2p = relay.#p2p;
         return typeof p2p === 'object' && p2p.direct === 'party' ? 'party' : null;
       },
+      debug: !!opts.debug,
       queue: (m) => this.#queue(m),
       request: (m) => this.#request(m),
       now: () => this.now(),
@@ -699,7 +704,6 @@ export class GameRelay extends Emitter<RelayEvents> {
    * if there's none, or that room has closed, quick-match (or, with `private`, create a room that
    * isn't listed or quick-matched: friends join with its code or invite). A full, locked or banning room still rejects (`room_full`, `locked`,
    * `banned`): say so to the player. `updateUrl` writes the room's invite into the address bar.
-   * @experimental
    */
   async joinOrCreate(options: JoinOrCreateOptions = {}): Promise<Room> {
     const { maxPlayers, tag } = options;
@@ -852,6 +856,8 @@ export class GameRelay extends Emitter<RelayEvents> {
     if (this.#flushRetry) clearTimeout(this.#flushRetry);
     if (this.#reconnectTimer) clearTimeout(this.#reconnectTimer);
     this.#flushRetry = this.#reconnectTimer = null;
+    for (const timer of this.#welcomePings) clearTimeout(timer);
+    this.#welcomePings = [];
     this.#outbox = [];
     this.#held = null;
     this.#unwatchPage();
@@ -1086,6 +1092,7 @@ export class GameRelay extends Emitter<RelayEvents> {
       if (extra > 0 && this.#isReplaceable(m)) extra--;
       else kept.push(m);
     }
+    if (kept.length > max) this.#warn('queue_full', 'queue_full', `Over ${max} reliable messages waited to go out (offline, or sending too fast): the oldest were dropped. Check relay.connected before sending.`);
     return kept.slice(-max);
   }
 
@@ -1244,9 +1251,10 @@ export class GameRelay extends Emitter<RelayEvents> {
       this.#heardAt = performance.now();
       this.#probeAt = null;
       let welcomed = false;
-      // No welcome in time (a socket stuck connecting): give up on it, as if it had closed.
-      late = setTimeout(() => {
-        if (welcomed || this.#ws !== ws) return;
+      // Give up on this socket before its welcome. The token may be expired or revoked: mint a
+      // fresh one next time. A host the server sent us to that doesn't answer: once back to the base
+      // URL, and forget a restart notice's host (the token's `wsUrl` comes back with the next token).
+      const giveUp = (err: GameRelayError) => {
         this.#ws = null;
         attempt(() => ws.close());
         this.#token = null;
@@ -1254,7 +1262,12 @@ export class GameRelay extends Emitter<RelayEvents> {
           this.#fallBack = true;
           this.#movedTo = null;
         }
-        reject(new GameRelayError('timeout', `No answer from ${target} in ${CONNECT_TIMEOUT_MS / 1000} s`));
+        reject(err);
+      };
+      // No welcome in time (a socket stuck connecting).
+      late = setTimeout(() => {
+        if (welcomed || this.#ws !== ws) return;
+        giveUp(new GameRelayError('timeout', `No answer from ${target} in ${CONNECT_TIMEOUT_MS / 1000} s`));
       }, CONNECT_TIMEOUT_MS);
       const receive = (ev: MessageEvent) => {
         // (A delayed message can arrive after its socket was replaced.)
@@ -1265,6 +1278,11 @@ export class GameRelay extends Emitter<RelayEvents> {
         const msg = attempt(() => JSON.parse(String(ev.data)) as ServerMessage | null);
         if (!msg) return;
         if (msg.t === 'welcome') {
+          // A welcome without a key to sign with (malformed) fails the connect, as no welcome would
+          // (once connected, a second one is ignored: the server sends one per socket).
+          const key = typeof msg.playerId === 'string' ? attempt(() => unmaskKey(msg.k, msg.playerId), null) : null;
+          // ('unsupported', not 'disconnected': a reconnect reports it once instead of retrying in silence.)
+          if (!key) return welcomed ? undefined : giveUp(new GameRelayError('unsupported', `${target} sent an unusable welcome (no key to sign with)`));
           welcomed = true;
           clearTimeout(late);
           // The server made this connection's bucket before it said welcome, and nothing is sent
@@ -1274,14 +1292,15 @@ export class GameRelay extends Emitter<RelayEvents> {
           // An older server sends no features: everything stays off.
           if (msg.features) this.#features = Object.freeze({ ...this.#features, ...msg.features });
           this.#serverInfo = Object.freeze({ version: msg.server ?? null });
-          for (const notice of msg.notices ?? []) this.#notice(notice);
-          this.#frameKey = unmaskKey(msg.k, msg.playerId);
+          if (Array.isArray(msg.notices)) for (const notice of msg.notices) this.#notice(notice);
+          this.#frameKey = key;
           // A rough clock until the pings below (and any the game sends) refine it. The old samples
           // stay in use until then, so the clock doesn't jump back to this rough one.
           if (this.#clock.length === 0) this.#clockOffset = msg.serverTime - monotonic();
           this.#clockStale = true;
           resolve();
-          for (const delay of [0, 1_000, 3_000]) setTimeout(() => void this.ping().catch(() => {}), delay);
+          for (const timer of this.#welcomePings) clearTimeout(timer);
+          this.#welcomePings = [0, 1_000, 3_000].map((delay) => setTimeout(() => void this.ping().catch(() => {}), delay));
         }
         this.#handle(msg);
       };
@@ -1298,14 +1317,7 @@ export class GameRelay extends Emitter<RelayEvents> {
             this.#shutdown();
             return;
           }
-          this.#token = null; // maybe expired/revoked: mint a fresh one next time
-          // A host the server sent us to that doesn't answer: once back to the base URL, and
-          // forget a restart notice's host (the token's `wsUrl` comes back with the next token).
-          if (target !== base) {
-            this.#fallBack = true;
-            this.#movedTo = null;
-          }
-          reject(new GameRelayError('disconnected', `Connection failed (${ev.code})`));
+          giveUp(new GameRelayError('disconnected', `Connection failed (${ev.code})`));
           return;
         }
         this.#onDisconnect(ev.code);
@@ -1329,6 +1341,7 @@ export class GameRelay extends Emitter<RelayEvents> {
   }
 
   #scheduleReconnect(): void {
+    if (this.#stopped) return; // a `disconnected` or `error` listener closed the relay
     const backoff = Math.min(10_000, 250 * 2 ** this.#attempts) * (0.5 + Math.random() / 2);
     // A restart drops every player at once: spread them over 0.5–1.5× the server's hint, or they
     // would all come back in the same millisecond.
@@ -1630,7 +1643,7 @@ export class Room extends Emitter<RoomEvents> {
     this.#health = new HostHealth({
       now: () => performance.now(),
       isHost: () => this.isHost,
-      ready: () => relay.connected,
+      ready: () => relay.serverReady,
       send: (m) => this.#queue(m),
     });
     this.#timers = new Timers({
@@ -1667,7 +1680,8 @@ export class Room extends Emitter<RoomEvents> {
       relay: { only: relay.lanForceRelay },
       direct: relay.lanDirect === 'party' ? (id) => this.#directAllowed && (relay.party?.members.some((m) => m.id === id) ?? false) : undefined,
       deliver: (from, d, at) => this.#receive(d, from, at),
-      log: (m) => console.info(`[gamerelay] ${m}`),
+      // Status lines with `debug` only; failures always (a developer needs them to see why P2P never connects).
+      log: (m, failure) => (failure || relay.debug) && console.info(`[gamerelay] ${m}`),
     });
     this.#lan.stateAt(info.stateSeq);
     for (const p of this.#players) this.#lan.add(p.id);
@@ -2016,7 +2030,7 @@ export class Room extends Emitter<RoomEvents> {
     this.#iceAt = this.#relay.now();
     const none = (why: string) => {
       if (this.#iceHave) return;
-      if (this.#relay.lanForceRelay) console.info(`[gamerelay] LAN shortcut: no relays (${why})`);
+      if (this.#relay.lanForceRelay && this.#relay.debug) console.info(`[gamerelay] LAN shortcut: no relays (${why})`);
       void this.#lan.setRelays(null);
     };
     this.#relay
@@ -2068,6 +2082,9 @@ export class Room extends Emitter<RoomEvents> {
   setState(patch: JsonObject): void {
     if (this.#gone()) return; // before the local write, so a closed room's state stays what was sent
     if (!this.isHost) throw new GameRelayError('not_host', 'Only the host can set state');
+    // The server refuses the whole patch for one of these; applied here first, the rest would leave
+    // the host's state apart from everyone else's.
+    for (const k of Object.keys(patch)) if (UNSAFE_KEYS.has(k)) throw new GameRelayError('bad_request', `State keys cannot be "${k}"`);
     // Only the game's own calls count toward the rate warning; timers and teams write state too.
     if (this.#batchPatch) this.#batchCounted = true;
     else this.#countState();
@@ -2480,6 +2497,13 @@ export class Room extends Emitter<RoomEvents> {
       this.#seed = info.seed;
       this.fire('seed', info.seed, info.hostId);
     }
+    // Who dropped or came back while we were away (a newcomer counts as having been connected),
+    // after the state and host, so a handler reads the room as it is now.
+    for (const p of info.players) {
+      const was = before.get(p.id)?.connected ?? true;
+      if (was !== p.connected) this.fire(p.connected ? 'player_reconnected' : 'player_disconnected', p.id);
+    }
+    this.#health.resend();
     // Host controls that changed while we were away.
     const access: RoomAccess = { locked: info.locked ?? false, public: info.public ?? false, linkOnly: info.linkOnly ?? false, maxPlayers: info.maxPlayers };
     if (access.locked !== this.#locked || access.public !== this.#public || access.linkOnly !== this.#linkOnly || access.maxPlayers !== this.#maxPlayers) this.#setAccess(access, info.hostId);
@@ -2578,7 +2602,7 @@ function frozen<T>(list: T[]): T[] {
   return Object.freeze(list) as T[];
 }
 
-/** Keys a patch may not set: assigning them would change the state object's prototype, not its data. */
+/** Keys a patch may not set (the server refuses them): each would reach an object's prototype chain, not its data. */
 const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 function applyPatch(state: JsonObject, patch: JsonObject): JsonObject {

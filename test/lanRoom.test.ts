@@ -2,7 +2,7 @@
  * The LAN shortcut's hooks in Room, on a stand-in relay (no WebRTC here: the sender side, the
  * barriers and the merge of server copies are what's under test).
  */
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import type { Json, PlayerInfo, RoomInfo, ServerMessage } from '@gamerelay/protocol/types';
 import { Room, type GameRelay } from '../src/index';
 import type { Wrapped } from '../src/sync/lan';
@@ -10,7 +10,7 @@ import { CREATE, control } from '../src/internal';
 
 const player = (id: string, slot: number): PlayerInfo => ({ id, name: id, avatar: null, joinedAt: slot, connected: true, slot });
 
-function lanRoom(me: string, hostId = 'pa', stateSeq = 0, opts: { lan?: boolean; forceRelay?: boolean; direct?: boolean; party?: string[]; request?: (m: { t: string }) => Promise<unknown> } = {}) {
+function lanRoom(me: string, hostId = 'pa', stateSeq = 0, opts: { lan?: boolean; forceRelay?: boolean; direct?: boolean; debug?: boolean; party?: string[]; request?: (m: { t: string }) => Promise<unknown> } = {}) {
   const queued: { t: string; d?: Json; to?: string; h?: boolean }[] = [];
   const clock = { now: 1000 };
   const loops: (() => void)[] = [];
@@ -29,6 +29,7 @@ function lanRoom(me: string, hostId = 'pa', stateSeq = 0, opts: { lan?: boolean;
     request: opts.request ?? (async () => undefined),
     lanForceRelay: opts.forceRelay === true,
     lanDirect: opts.direct === true ? 'party' : null,
+    debug: !!opts.debug,
     party: opts.party ? { code: 'PRTY', leaderId: opts.party[0], members: opts.party.map((id) => ({ id, name: id, connected: true })) } : null,
     left: () => {},
   } as unknown as GameRelay;
@@ -441,4 +442,31 @@ describe('LAN shortcut in Room: relays', () => {
     lanRoom('pb', 'pa', 0, { lan: false, request: async (m) => void asked.push(m.t) });
     expect(asked).toEqual([]);
   });
+});
+
+test("P2P status lines print only with debug, not in players' consoles; failures always do (SDK review #23)", async () => {
+  const info = spyOn(console, 'info').mockImplementation(() => {});
+  const g = globalThis as { RTCPeerConnection?: unknown };
+  g.RTCPeerConnection = class {
+    constructor() {
+      throw new Error('no WebRTC here');
+    }
+  };
+  try {
+    for (const debug of [false, true]) {
+      info.mockClear();
+      lanRoom('pb', 'pa', 0, { forceRelay: true, debug, request: async () => ({ ice: [] }) }); // relay-only, and no relays
+      // And the Lan's own lines: an offer it can't take (WebRTC throws) says so.
+      const { room } = lanRoom('pb', 'pa', 0, { debug, request: async () => ({ ice: [] }) });
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      control(room).handle(msg({ t: 'message', from: 'pa', d: { $gr: 'lan', k: 'offer', g: 'g1', sdp: 'o' }, at: 0 }));
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      const lines = info.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('LAN shortcut'));
+      expect(lines.some((m) => m.includes('no relays'))).toBe(debug);
+      expect(lines.some((m) => m.includes('LAN shortcut to pa failed'))).toBe(true);
+    }
+  } finally {
+    info.mockRestore();
+    delete g.RTCPeerConnection;
+  }
 });

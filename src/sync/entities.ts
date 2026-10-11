@@ -128,6 +128,10 @@ interface Local {
   writtenAt: number;
   /** The usual time between the game's writes (its simulation step), smoothed; 0 until known. */
   writeGap: number;
+  /** The stamp of the last message that carried it: its next one is never earlier (receivers order by it). */
+  stampedAt: number;
+  /** What it started from (taken over, or spawned): the room's version of fields no update carried yet. */
+  base: unknown[];
   /** A write that no update has carried yet (a flag, not a time: write times are scheduled step times, a clock sends don't share). */
   unsent: boolean;
   /** Host-owned: written by whoever is host (that's us, while it's local). */
@@ -149,6 +153,8 @@ interface Remote {
   reason?: RemoveReason;
   /** Local time of the last update from the owner (for expiry). */
   lastSeen: number;
+  /** The owner disconnected since its last update: silence after it's back means the page went (a reload). */
+  ownerAway: boolean;
   /** Timeline time `values` were read at; `Infinity` once removed (values frozen). */
   readAt: number;
   host: boolean;
@@ -175,7 +181,8 @@ export class EntityStore {
   readonly #schemas = new Map<string, KindSchema>();
   readonly #local = new Map<string, Local>();
   readonly #remote = new Map<string, Remote>();
-  readonly #pending = new Map<string, { entry: Entry; from: PlayerId; t: number }[]>();
+  /** Updates for kinds not defined yet, with whether their sender was host when they came. */
+  readonly #pending = new Map<string, { entry: Entry; from: PlayerId; t: number; fromHost: boolean }[]>();
   /**
    * Each sender's recent id sessions, newest first: a new one means it reloaded. Not a claim: who
    * may mint in a session is its owner tag (`mintedBy`), never who sent it first.
@@ -189,8 +196,8 @@ export class EntityStore {
   #down = false;
   readonly #warnedKinds = new Set<string>();
   #warnedRate = false;
-  /** The last stamp sent: stamps never run backwards. */
-  #lastStamp = Number.NEGATIVE_INFINITY;
+  /** The last stamp sent, per group (our own entities, host ones): stamps never run backwards. */
+  readonly #lastStamp = { own: Number.NEGATIVE_INFINITY, host: Number.NEGATIVE_INFINITY };
 
   constructor(t: SyncTransport, hooks: EntityHooks = {}, newId: (kind: string, owner: PlayerId) => string = createIdAllocator()) {
     this.#t = t;
@@ -255,7 +262,14 @@ export class EntityStore {
     this.#schemas.set(kind, schema);
     const waiting = this.#pending.get(kind) ?? [];
     this.#pending.delete(kind);
-    for (const p of waiting) this.#apply(p.entry, p.from, p.t);
+    // Judged by who was host when they came, as they would have been then: the host may have changed since.
+    for (const p of waiting) this.#apply(p.entry, p.from, p.t, p.fromHost);
+    // Host entities from then are ours to write if we hold the role now (`hostChanged` ran before
+    // they existed). Only once all of them are in: a later one may move or remove the entity.
+    if (waiting.length > 0 && this.#t.hostId?.() === this.#t.me) {
+      const now = this.#t.now();
+      for (const r of [...this.#remote.values()]) if (r.host && r.removedAt === undefined && kindOf(r.id) === kind) this.#takeOver(r, now);
+    }
   }
 
   spawn(kind: string, initial: Record<string, unknown>, options: SpawnOptions = {}): Entity {
@@ -378,10 +392,19 @@ export class EntityStore {
     }
     // Each message is stamped with when its values were written (the game's simulation step), not
     // when it's sent: a 30 Hz simulation sent on a 20 Hz grid would otherwise carry one step in some
-    // updates and two in others, at evenly spaced stamps, and others would see the speed pulse.
-    const out = {
-      own: { entries: [] as Entry[], reliable: false, t: Number.NEGATIVE_INFINITY },
-      host: { entries: [] as Entry[], reliable: false, t: Number.NEGATIVE_INFINITY },
+    // updates and two in others, at evenly spaced stamps, and others would see the speed pulse. Only
+    // changes set the stamp (`t`, the newest write among them): an entry with nothing new (a
+    // keyframe, "still here", a removal) holds at any time since its last update, and a spawn from
+    // whenever it appears, so they take the stamp they're sent with instead of pulling the changes'
+    // up to now. A message of only those is "as of now". A change is never stamped earlier than its
+    // entity's last message, though: written just after a keyframe went (its step scheduled before
+    // the send), it would reach others before that keyframe's older values. (An entry with nothing
+    // new stamped early is harmless: the same values, a little earlier.)
+    const newGroup = () => ({ entries: [] as Entry[], recs: [] as Local[], reliable: false, t: undefined as number | undefined, floor: -Infinity });
+    const out = { own: newGroup(), host: newGroup() };
+    const carried = (g: typeof out.own, rec: Local, changed: boolean) => {
+      g.recs.push(rec);
+      if (changed) g.floor = Math.max(g.floor, rec.stampedAt);
     };
     for (const rec of [...this.#local.values()]) {
       const group = rec.host ? out.host : out.own;
@@ -391,10 +414,13 @@ export class EntityStore {
         if (rec.spawned) {
           // Last changes first (a ship that died, then despawned), then the removal.
           const { pairs } = encodeChanges(rec.schema, rec.values, rec.sent, false);
-          if (pairs.length > 0) entries.push([rec.id, hf, pairs]);
+          if (pairs.length > 0) {
+            entries.push([rec.id, hf, pairs]);
+            group.t = Math.max(group.t ?? rec.writtenAt, rec.writtenAt);
+          }
           entries.push([rec.id, REMOVE | hf, []]);
           group.reliable = true;
-          group.t = Math.max(group.t, now);
+          carried(group, rec, pairs.length > 0);
         }
         this.#local.delete(rec.id);
         continue;
@@ -405,8 +431,8 @@ export class EntityStore {
       // clear, off the send grid, before others' timelines run past the last position.
       if (rec.moved && !rec.teleport && !rec.unsent && now - rec.writtenAt >= this.#quietAfter(rec)) {
         entries.push([rec.id, hf, []]);
-        group.t = Math.max(group.t, now);
         rec.moved = false;
+        carried(group, rec, false);
         continue;
       }
       if (now < rec.nextSend) continue;
@@ -429,13 +455,15 @@ export class EntityStore {
       entries.push(full ? [rec.id, flags, pairs, rec.schema.hash] : [rec.id, flags, pairs]);
       // A teleport must arrive: lost, the next plain update reads as a slide across the map.
       if (full || discrete || rec.teleport) group.reliable = true;
-      // Fresh changes are stamped when they were written; a keyframe with nothing new is "as of now".
-      group.t = Math.max(group.t, changed && rec.spawned ? rec.writtenAt : now);
+      if (changed && rec.spawned) group.t = Math.max(group.t ?? rec.writtenAt, rec.writtenAt);
       rec.spawned = true;
       rec.teleport = false;
+      carried(group, rec, changed);
     }
-    this.#flush(out.own.entries, out.own.reliable, undefined, false, out.own.t);
-    this.#flush(out.host.entries, out.host.reliable, undefined, true, out.host.t);
+    for (const g of [out.own, out.host]) {
+      const t = this.#flush(g.entries, g.reliable, undefined, g === out.host, g.t === undefined ? g.t : Math.max(g.t, g.floor));
+      for (const rec of g.recs) rec.stampedAt = Math.max(rec.stampedAt, t);
+    }
     this.#advance();
   }
 
@@ -460,13 +488,16 @@ export class EntityStore {
     if (id === this.#t.me) return;
     const own: Entry[] = [];
     const hosted: Entry[] = [];
+    const recs: Local[] = [];
     for (const rec of this.#local.values()) {
       if (rec.removed || !rec.spawned) continue;
       const { pairs } = encodeChanges(rec.schema, rec.values, [], true);
       (rec.host ? hosted : own).push([rec.id, SPAWN | FULL | (rec.host ? HOST : 0) | (rec.leaveHost ? LEAVE_HOST : 0), pairs, rec.schema.hash]);
+      recs.push(rec);
     }
-    this.#flush(own, true, id);
-    this.#flush(hosted, true, id, true);
+    const t = Math.max(this.#flush(own, true, id), this.#flush(hosted, true, id, true));
+    // They have these as of now: a change written before it (a step scheduled before this) mustn't be stamped earlier.
+    for (const rec of recs) rec.stampedAt = Math.max(rec.stampedAt, t);
   }
 
   /**
@@ -482,11 +513,20 @@ export class EntityStore {
         if (r.host && r.removedAt === undefined) this.#takeOver(r, now);
       }
     } else if (previous === me && hostId !== me) {
+      // What we did as host that no update carried yet never reaches the room: the server drops a
+      // replaced host's sends. So the room's version stands, here too.
       for (const l of [...this.#local.values()]) {
         if (!l.host) continue;
-        this.#local.delete(l.id);
-        // Seeded at the moment we're showing, so it glides on to the new host's updates.
-        if (!l.removed) this.#remote.set(l.id, this.#makeRemote(l.id, l.schema, HOST_OWNER, this.renderTime(), true, l));
+        if (!l.spawned) {
+          this.#local.delete(l.id);
+          // Never sent: nobody else has it, and the new host won't send it. Gone now, not after 3 s.
+          if (!l.removed) {
+            l.removed = true; // writes to the object the game still holds are refused, as for any removed one
+            this.#hooks.onRemove?.(l.obj, 'expired');
+          }
+          continue;
+        }
+        this.#followHost(l);
       }
     }
     for (const r of this.#remote.values()) if (r.host) r.lastSeen = now;
@@ -508,7 +548,7 @@ export class EntityStore {
       r.reason = 'left';
     }
     for (const [kind, list] of this.#pending) {
-      const rest = list.filter((p) => p.from !== id);
+      const rest = list.filter((p) => p.from !== id || (p.entry[1] & HOST) !== 0); // host entities outlive their host
       // An empty list would still count toward MAX_PENDING_KINDS.
       if (rest.length > 0) this.#pending.set(kind, rest);
       else this.#pending.delete(kind);
@@ -532,6 +572,28 @@ export class EntityStore {
     this.#remote.set(n.id, n);
   }
 
+  /**
+   * Our local becomes a remote host entity: the room's version stands. Seeded with what the room
+   * has (the values last sent), at the moment we're showing, so it glides on to the host's updates.
+   */
+  #followHost(l: Local): Remote {
+    this.#local.delete(l.id);
+    const r = this.#makeRemote(l.id, l.schema, HOST_OWNER, this.renderTime(), true, { ...l, values: this.#sentValues(l) });
+    this.#remote.set(l.id, r);
+    // A removal that never went out: it's still in the room, so it's back (the same object).
+    if (l.removed) this.#hooks.onSpawn?.(l.obj);
+    return r;
+  }
+
+  /** What the room has of `rec`: the values last sent (writes since never left), as values. */
+  #sentValues(rec: Local): unknown[] {
+    return rec.schema.fields.map((f, i) => {
+      const sent = rec.sent[i];
+      if (sent === undefined) return rec.base[i];
+      return f.type === 'value' ? (JSON.parse(sent as string) as unknown) : sent; // 'value' fields keep their JSON
+    });
+  }
+
   /** How long an entity must go unwritten to count as stopped: 1.5 of its usual steps, or one send interval until we know them. */
   #quietAfter(rec: Local): number {
     return rec.writeGap > 0 ? rec.writeGap * 1.5 : 1000 / rec.schema.rate;
@@ -541,12 +603,17 @@ export class EntityStore {
    * `reliable` groups carry spawns, removes, keyframes or teleports, which the next update doesn't
    * replace; only plain updates are `supersedable` (their LAN copy may race even when host-only).
    */
-  #flush(entries: Entry[], reliable: boolean, to?: PlayerId, host = false, stamp?: number): void {
-    if (entries.length === 0) return;
+  #flush(entries: Entry[], reliable: boolean, to?: PlayerId, host = false, stamp?: number): number {
+    if (entries.length === 0) return -Infinity;
     const now = this.#t.now();
-    // Between the last stamp and now: never backwards (receivers treat time as ordered), never ahead.
-    const t = Math.round(Math.min(now, Math.max(stamp ?? now, this.#lastStamp)));
-    if (to === undefined) this.#lastStamp = t;
+    // Changes: between the group's last stamp for changes and now, so they never run backwards,
+    // never ahead. A message with none is "as of now" and doesn't move that stamp: a "still here"
+    // sent alone would otherwise push the next message's changes, written before it, up to it.
+    // (An entity's own updates stay in order: `tick` never stamps a change earlier than that
+    // entity's last message.)
+    const group = host ? 'host' : 'own';
+    const t = Math.round(stamp === undefined ? now : Math.min(now, Math.max(stamp, this.#lastStamp[group])));
+    if (to === undefined && stamp !== undefined) this.#lastStamp[group] = t;
     let chunk: Entry[] = [];
     let size = 0;
     const send = () => {
@@ -561,9 +628,10 @@ export class EntityStore {
       size += n;
     }
     send();
+    return t;
   }
 
-  #apply(entry: Entry, from: PlayerId, t: number): KindSchema | undefined {
+  #apply(entry: Entry, from: PlayerId, t: number, fromHost = from === this.#t.hostId?.()): KindSchema | undefined {
     const [id, flags, pairs, hash] = entry;
     const kind = kindOf(id);
     const schema = this.#schemas.get(kind);
@@ -576,17 +644,31 @@ export class EntityStore {
         if (this.#pending.size >= MAX_PENDING_KINDS) return undefined;
         this.#pending.set(kind, (list = []));
       }
-      list.push({ entry, from, t });
+      list.push({ entry, from, t, fromHost });
       if (list.length > PENDING_PER_KIND) list.shift();
       return undefined;
     }
     let rec = this.#remote.get(id);
-    if (this.#local.has(id)) return schema;
+    const mine = this.#local.get(id);
+    if (mine) {
+      // Our `onLeave: 'host'` entity, from the host: the room handed it over while we were away
+      // (back, but silent about it for 3 s). The room's version stands: we follow the host now.
+      if (mine.host || !mine.leaveHost || !(flags & HOST) || !fromHost) return schema;
+      if (mine.removed && flags & REMOVE) {
+        this.#local.delete(id); // removed on both sides: the game already had onRemove
+        return schema;
+      }
+      rec = this.#followHost(mine);
+    }
     const hosted = rec ? rec.host : (flags & HOST) !== 0;
     // Host entities take updates from the current host only; the rest from their owner only.
-    if (hosted ? from !== this.#t.hostId?.() : rec !== undefined && rec.owner !== from) return schema;
-    if (rec) rec.lastSeen = this.#t.now();
+    if (hosted ? !fromHost : rec !== undefined && rec.owner !== from) return schema;
+    if (rec) {
+      rec.lastSeen = this.#t.now();
+      rec.ownerAway = false;
+    }
     if (rec && flags & LEAVE_HOST && !rec.host) rec.leaveHost = true;
+    let values: (unknown | undefined)[] | null;
     if (flags & REMOVE) {
       if (rec && rec.removedAt === undefined) {
         rec.removedAt = Math.max(t, rec.buffer.latestTime ?? t);
@@ -612,6 +694,10 @@ export class EntityStore {
         );
         return schema;
       }
+      // A full update carries every field: one that doesn't (or doesn't decode) would make an
+      // entity whose missing fields read undefined, so it isn't made.
+      values = decodeChanges(schema, pairs);
+      if (!values || values.includes(undefined)) return schema;
       // (Host entities keep the ids their first host minted, so they're exempt.)
       if (!hosted) {
         const session = sessionOf(id);
@@ -623,9 +709,14 @@ export class EntityStore {
         const known = this.#sessions.get(from) ?? [];
         if (!known.includes(session)) {
           this.#sessions.set(from, [session, ...known].slice(0, MAX_SESSIONS));
-          // A new session from this owner means it reloaded or reconnected afresh: its old entities are gone.
-          for (const r of this.#remote.values()) {
+          // A new session from this owner means it reloaded or reconnected afresh: its old entities
+          // are gone, except `onLeave: 'host'` ones, which the host keeps, as when it leaves.
+          for (const r of [...this.#remote.values()]) {
             if (r.host || r.owner !== from || r.removedAt !== undefined || sessionOf(r.id) === session) continue;
+            if (r.leaveHost) {
+              this.#adopt(r, this.#t.now());
+              continue;
+            }
             r.removedAt = r.buffer.latestTime ?? t;
             r.reason = 'expired';
           }
@@ -637,9 +728,10 @@ export class EntityStore {
       rec = created;
     } else if (rec.removedAt !== undefined) {
       return schema;
+    } else {
+      values = decodeChanges(schema, pairs);
+      if (!values) return schema;
     }
-    const values = decodeChanges(schema, pairs);
-    if (!values) return schema;
     const jumped = rec.buffer.push(t, values, (flags & TELEPORT) !== 0);
     if (jumped && (schema.index.has('x') || schema.index.has('y'))) {
       this.#hooks.warn?.(
@@ -668,8 +760,16 @@ export class EntityStore {
       if (r.removedAt === undefined && online) {
         // Silence only counts while the owner is connected (a disconnected owner's entities freeze).
         const ownerId = r.host ? this.#t.hostId?.() : r.owner;
-        if (ownerId !== undefined && this.#t.player(ownerId)?.connected === false) r.lastSeen = now;
-        else if (now - r.lastSeen > EXPIRE_MS) {
+        if (ownerId !== undefined && this.#t.player(ownerId)?.connected === false) {
+          r.lastSeen = now;
+          r.ownerAway = true;
+        } else if (now - r.lastSeen > EXPIRE_MS) {
+          // Back, and still nothing for it: a reconnect resends everything at once, so the page that
+          // had it is gone (a reload with nothing to spawn yet). The host keeps it, as when they leave.
+          if (r.leaveHost && r.ownerAway) {
+            this.#adopt(r, now);
+            continue;
+          }
           r.removedAt = r.buffer.latestTime ?? t;
           r.reason = 'expired';
         }
@@ -732,6 +832,8 @@ export class EntityStore {
       schema,
       values,
       sent: [],
+      stampedAt: -Infinity,
+      base: values.slice(),
       spawned: true,
       teleport: false,
       removed: false,
@@ -803,13 +905,14 @@ export class EntityStore {
       firstAt: t,
       visible: from !== undefined,
       lastSeen: this.#t.now(),
+      ownerAway: false,
       readAt: Number.NaN,
       host,
       leaveHost: false,
       slot: from?.slot ?? (undefined as unknown as Slot),
       obj: from?.obj ?? (undefined as unknown as Entity),
     };
-    if (from && !buffer) r.buffer.push(t, from.values);
+    if (from && !buffer) r.buffer.push(t, from.values, false, true);
     const refuse = () => {
       this.#skip(
         `write:${schema.kind}:owner`,

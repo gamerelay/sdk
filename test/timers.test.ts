@@ -111,6 +111,74 @@ describe('Timers', () => {
     expect(s.t.left('pu')).toBe(5000);
   });
 
+  test('a handler re-arming its own timer for 0 ms, in the same millisecond, keeps it (SDK review #9)', () => {
+    const s = setup();
+    let runs = 0;
+    s.handlers.pu = () => {
+      if (++runs === 1) s.t.set('pu', 0); // the same deadline as the one that just fell due
+    };
+    s.t.set('pu', 0);
+    s.t.tick();
+    expect(s.t.left('pu')).toBe(0);
+    s.t.tick();
+    expect(runs).toBe(2);
+    expect(s.t.left('pu')).toBeNull();
+  });
+
+  test('a due timer set again by another handler before its own ran fires once; put off, it waits (second and third reviews of #9)', () => {
+    const s = setup();
+    const runs: string[] = [];
+    s.handlers.a = () => {
+      runs.push('a');
+      s.t.set('b', 0); // b is due anyway: this run of b is that one
+      s.t.set('c', 5000);
+    };
+    s.handlers.b = () => runs.push('b');
+    s.handlers.c = () => runs.push('c');
+    s.t.set('a', 0);
+    s.t.set('b', 0);
+    s.t.set('c', 0);
+    s.t.tick();
+    s.t.tick();
+    expect(runs).toEqual(['a', 'b']); // c was put off before its turn: it fires in 5 s, once
+    expect(s.t.left('b')).toBeNull();
+    expect(s.t.left('c')).toBe(5000);
+  });
+
+  test('a due timer an earlier handler clears in the same pass doesn’t fire (third review of #9)', () => {
+    const s = setup();
+    const runs: string[] = [];
+    s.handlers.round = () => {
+      runs.push('round');
+      s.t.clear('warning');
+    };
+    s.handlers.warning = () => runs.push('warning');
+    s.t.set('round', 0);
+    s.t.set('warning', 0);
+    s.t.tick();
+    s.t.tick();
+    expect(runs).toEqual(['round']);
+    expect(s.t.left('warning')).toBeNull();
+  });
+
+  test('a due timer set for 0 ms by an earlier, slow handler fires once (third review of #9)', () => {
+    const s = setup();
+    const runs: string[] = [];
+    s.handlers.a = () => {
+      runs.push('a');
+      s.tick(1); // the handler took a millisecond: the new deadline is after this pass's clock
+      s.t.set('b', 0);
+    };
+    s.handlers.b = () => runs.push('b');
+    s.t.set('a', 0);
+    s.t.set('b', 0);
+    s.t.tick();
+    s.t.tick();
+    s.t.tick();
+    expect(runs).toEqual(['a', 'b']);
+    expect(s.t.left('b')).toBeNull();
+  });
+
   test('a throwing handler still clears its timer', () => {
     const s = setup();
     const err = spyOn(console, 'error').mockImplementation(() => {});

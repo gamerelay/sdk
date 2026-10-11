@@ -4,6 +4,64 @@ Every release of `@gamerelay/sdk`, newest first. The notes under a version's hea
 GitHub release. Until 1.0, a minor version (0.x.0) may change the API; each break is listed
 here with what to change.
 
+## 0.1.0-alpha.9 (2026-10-11)
+
+- **`relay.joinOrCreate({ maxPlayers, tag, private, updateUrl })` is stable** (part of the `v0`
+  promise): the room in the page's invite link, else quick match (or, with `private`, a new
+  unlisted room). It replaces the `joinInvite() ?? createRoom()` snippet in the README, llms.txt
+  and the docs. Unlike that snippet, a full or locked room rejects (`room_full`, `locked`) instead
+  of starting a new room.
+- **Fix:** others saw a moving entity jump up to one simulation step, about once a second, when it shared a send
+  with another entity's keyframe: the keyframe stamped the whole message "now". Only changes set
+  a message's time now, and host entities and your own keep separate clocks. An entity's updates
+  are never stamped earlier than its last one (or the full update a player who just joined got),
+  so a change made just after a keyframe or a spawn went out isn't played before it (which showed
+  the old position for up to a second).
+- **Fix:** a player reloading the page lost their `onLeave: 'host'` entities (a carried flag
+  vanished). The host keeps them now, as when they leave, whether the new page spawns something
+  or not. If your page was only slow to come back (silent about it for 3 s after reconnecting),
+  the host has it by then: your copy follows the host's (`mine` turns false), so you don't
+  diverge from it;
+  if you had just removed it, it comes back (`onSpawn` again), since the room still has it,
+  unless the host removed it too.
+- **Fix:** if the host role moved before the SDK sent your last host-entity changes, the room's
+  version now stands at once: a spawn it never got is removed (`'expired'`) instead of lingering
+  frozen for 3 s, and an entity you removed comes back as the same object (`onSpawn` again)
+  instead of a new one a second later. Either way it shows what the room has, not writes that
+  never went out, and glides to the new host's updates without overshooting, while an
+  unannounced jump after that still snaps.
+- **Fix:** host entities you got updates for before you called `define()` for their kind were
+  dropped if the host changed meanwhile, and lost for good if you became host. They're kept now.
+- **Fix:** an update that arrives late (out of order) no longer looks like a teleport, and the
+  fields it leaves out come from the update before it, not the newest one. A change it carries
+  (a flag picked up, sent reliably behind faster updates) reaches the updates after it that left
+  it out, instead of waiting for the next full update. Received updates also allocate less: the
+  buffer keeps each update's own field list instead of copying it.
+- **Fix:** a timer handler setting its own timer again for 0 ms was cleared in the same tick. And
+  when several timers fall due together, one that an earlier handler clears or sets again for
+  later no longer fires anyway in that tick (or twice).
+- **Fix:** a malformed welcome from the server (no key to sign with) left `connect()` waiting
+  forever or connected but unable to send. It fails at once now with `unsupported` (a reconnect
+  reports it once through `error` and keeps trying).
+- **Fix:** players who dropped or came back while you were reconnecting now get
+  `player_disconnected` / `player_reconnected` when you're back, as if you'd been there.
+- **Fix:** a hidden tab says so again after a reconnect, in case the old socket took it down
+  with it (the server prefers visible players as host).
+- More than 256 reliable messages waiting during an outage now prints a console warning when the
+  oldest are dropped, instead of dropping them silently.
+- `relay.close()` leaves no timers behind (the clock pings after connecting kept Bun or Node
+  alive for up to 3 s), nor does a P2P retry for a player who left; a send batched to the next
+  animation frame no longer leaves a 100 ms backup timer behind each frame.
+- **Fix:** `room.setState()` with a `constructor` or `prototype` key now throws `bad_request`
+  before changing anything. The server refuses the whole patch for those keys, but the host had
+  already applied the rest of it, so its state drifted from everyone else's.
+- **Fix:** another player's entity whose first full update left fields out (or didn't decode)
+  appeared with fields reading `undefined`. It's ignored now until a complete one comes.
+- P2P status lines (`LAN shortcut to …`) print only with `debug: true`, not in players' consoles.
+  Failures (WebRTC throwing) still print.
+- In a hidden tab whose tick worker errors after the loop stopped, no fallback interval is
+  started.
+
 ## 0.1.0-alpha.8 (2026-10-09)
 
 - **Fix:** a `getToken` that never answers no longer hangs a reconnect for good: a reconnect gives

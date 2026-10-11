@@ -443,6 +443,23 @@ describe('EntityStore: others’ entities', () => {
     expect(b.get(next)!.x).toBe(5);
   });
 
+  test('a full update that leaves fields out, or fails to decode, makes no entity (SDK review #19)', () => {
+    const { b, net, run, events } = setup();
+    b.define('ship', SHIP);
+    const hash = compileSchema('ship', SHIP).hash;
+    const id = 'ship:aaaaaaaa:1';
+    const send = (flags: number, pairs: unknown[], h?: string) => b.receive({ $gr: 'u', t: net.now, e: [h ? [id, flags, pairs, h] : [id, flags, pairs]] }, 'pa', net.now);
+    send(SPAWN | FULL, [0, 5], hash); // x only: y and alive would read undefined
+    send(SPAWN | FULL, [0, 'five', 1, 0, 2, true], hash); // doesn't decode: no empty entity for later updates to fill
+    send(0, [0, 6]);
+    run(300);
+    expect(b.all('ship')).toEqual([]);
+    expect(events).toEqual([]);
+    send(SPAWN | FULL, [0, 7, 1, 8, 2, true], hash);
+    run(300);
+    expect(b.all('ship').map((e) => [e.x, e.y, e.alive])).toEqual([[7, 8, true]]);
+  });
+
   test('nobody can take another player’s ids at a newcomer by sending them first (security review)', () => {
     // pc sends the newcomer (b) an id in ada's session, and a copy of ada's own id, before ada's
     // updates get there. Ids carry their minter's tag, so neither is pc's to send.
@@ -623,7 +640,11 @@ describe('host-owned entities', () => {
     for (const [id, name] of [['pa', 'ada'], ['pb', 'bo'], ['pc', 'cy']] as const) {
       stores[id] = new EntityStore(
         net.join(id, name, (d, f, at) => stores[id]!.receive(d, f, at)),
-        { onSpawn: (e) => events.push(`${id} spawn ${e.kind}`), warn: (_k, _key, message) => warned.push(`${id}: ${message}`) },
+        {
+          onSpawn: (e) => events.push(`${id} spawn ${e.kind}`),
+          onRemove: (e, reason) => events.push(`${id} remove ${e.kind} ${reason}`),
+          warn: (_k, _key, message) => warned.push(`${id}: ${message}`),
+        },
         createIdAllocator(() => ({ pa: 0.1, pb: 0.2, pc: 0.3 })[id]),
       );
       stores[id]!.define('drone', DRONE);
@@ -643,6 +664,160 @@ describe('host-owned entities', () => {
     };
     return { net, events, warned, a: stores.pa!, b: stores.pb!, c: stores.pc!, run, handOver };
   }
+
+  describe('losing host with changes no update carried yet (SDK review #6)', () => {
+    test('a removal that never went out is undone: the room still has it, so it’s back, the same object', () => {
+      const { a, b, events, run, handOver } = room3();
+      const d = a.spawn('drone', { x: 1, y: 0 }, { owner: 'host' });
+      run(300);
+      events.length = 0;
+      d.remove(); // no tick before the host moves: the removal never goes out
+      handOver('pb');
+      expect(a.get(d.id)).toBe(d);
+      expect(d.mine).toBe(false);
+      expect(events).toEqual(['pa remove drone removed', 'pa spawn drone']);
+      b.get(d.id)!.x = 7; // the new host still has it, and writes it
+      run(400);
+      expect(d.x).toBe(7);
+      expect(events.filter((e) => e.startsWith('pa'))).toEqual(['pa remove drone removed', 'pa spawn drone']); // no second spawn
+    });
+
+    test('the old host’s copy shows what the room has: writes no update carried are gone (second review of #6)', () => {
+      const { a, run, handOver } = room3();
+      const d = a.spawn('drone', { x: 1, y: 0 }, { owner: 'host' });
+      run(300);
+      d.x = 50; // never sent
+      handOver('pb');
+      expect(a.get(d.id)!.x).toBe(1);
+    });
+
+    test('losing the role just after taking it: the copy shows what the room has, not writes never sent (third review of #6)', () => {
+      const { a, b, handOver, run } = room3();
+      const d = a.spawn('drone', { x: 1, y: 0 }, { owner: 'host' });
+      run(300);
+      handOver('pb');
+      const onB = b.get(d.id)!;
+      onB.x = 999; // written, but b never ticks as host: nothing went out
+      handOver('pa');
+      expect(onB.mine).toBe(false);
+      expect(onB.x).toBe(1);
+    });
+
+    test('a spawn that never went out is gone at once, not a 3 s phantom', () => {
+      const { a, b, events, warned, run, handOver } = room3();
+      const d = a.spawn('drone', { x: 1, y: 0 }, { owner: 'host' });
+      handOver('pb');
+      expect(a.get(d.id)).toBeUndefined();
+      expect(events).toEqual(['pa spawn drone', 'pa remove drone expired']);
+      d.x = 5; // the object the game still holds is removed, so the write is refused and says why
+      expect(warned.at(-1)).toContain(`${d.id} was removed`);
+      run(400);
+      expect(b.get(d.id)).toBeUndefined();
+      expect(a.get(d.id)).toBeUndefined();
+    });
+  });
+
+  test('host updates that came before their kind was defined are judged by who was host then (SDK review #7)', () => {
+    const net = new FakeNet();
+    const stores: Record<string, EntityStore> = {};
+    for (const [id, seed] of [['pa', 0.1], ['pb', 0.2], ['pc', 0.3]] as const) {
+      stores[id] = new EntityStore(net.join(id, id, (d, f, at) => stores[id]!.receive(d, f, at)), {}, createIdAllocator(() => seed));
+    }
+    const { pa: a, pb: b, pc: c } = stores as Record<string, EntityStore>;
+    a!.define('drone', DRONE);
+    b!.define('drone', DRONE);
+    net.host = 'pa';
+    const run = (ms: number) => {
+      const end = net.now + ms;
+      while (net.now + FRAME <= end) {
+        net.advanceTo(net.now + FRAME);
+        for (const s of Object.values(stores)) s.tick();
+      }
+    };
+    const d = a!.spawn('drone', { x: 3, y: 4 }, { owner: 'host' });
+    run(300); // c holds pa's updates: it hasn't defined 'drone' yet
+    net.host = 'pc';
+    for (const s of Object.values(stores)) s.hostChanged('pc', 'pa');
+    c!.define('drone', DRONE); // c is host now, and only now learns of the drone
+    run(50);
+    const onC = c!.get(d.id)!;
+    expect(onC.mine).toBe(true);
+    expect(onC.x).toBe(3);
+    onC.x = 9;
+    run(4000); // c writes it: nobody's copy goes quiet and expires
+    expect(b!.get(d.id)!.x).toBe(9);
+    expect(a!.get(d.id)!.x).toBe(9);
+  });
+
+  describe('held host updates (second review of #7)', () => {
+    function heldRoom() {
+      const net = new FakeNet();
+      const stores: Record<string, EntityStore> = {};
+      const events: string[] = [];
+      for (const [id, seed] of [['pa', 0.1], ['pb', 0.2], ['pc', 0.3]] as const) {
+        stores[id] = new EntityStore(
+          net.join(id, id, (d, f, at) => stores[id]?.receive(d, f, at)),
+          { onSpawn: (e) => events.push(`${id} spawn ${e.id}`), onRemove: (e, r) => events.push(`${id} remove ${e.id} ${r}`) },
+          createIdAllocator(() => seed),
+        );
+      }
+      stores.pa!.define('drone', DRONE);
+      stores.pb!.define('drone', DRONE);
+      net.host = 'pa';
+      const run = (ms: number) => {
+        const end = net.now + ms;
+        while (net.now + FRAME <= end) {
+          net.advanceTo(net.now + FRAME);
+          for (const s of Object.values(stores)) s.tick();
+        }
+      };
+      const handOver = (to: string) => {
+        const prev = net.host;
+        net.host = to;
+        for (const s of Object.values(stores)) s.hostChanged(to, prev);
+      };
+      return { net, stores, events, run, handOver };
+    }
+
+    test('replayed as host, every held update applies before we take the entity over: its last move, or its removal', () => {
+      const { stores, events, run, handOver } = heldRoom();
+      const moved = stores.pa!.spawn('drone', { x: 0, y: 0 }, { owner: 'host' });
+      const gone = stores.pa!.spawn('drone', { x: 0, y: 0 }, { owner: 'host' });
+      run(200);
+      moved.x = 40;
+      run(200);
+      gone.remove();
+      run(200);
+      handOver('pc');
+      stores.pc!.define('drone', DRONE);
+      expect(stores.pc!.get(moved.id)!.mine).toBe(true);
+      expect(stores.pc!.get(moved.id)!.x).toBe(40);
+      run(400);
+      expect(stores.pc!.get(gone.id)).toBeUndefined();
+      expect(stores.pb!.get(gone.id)).toBeUndefined();
+      expect(events.filter((e) => e.startsWith('pc') && e.includes(gone.id))).toEqual([]);
+    });
+
+    test('a host leaving keeps only held host-entity updates: its own entities left with it', () => {
+      const { net, stores, events, run, handOver } = heldRoom();
+      stores.pa!.define('ship', DRONE);
+      const own = stores.pa!.spawn('ship', { x: 0, y: 0 }); // pa's own, not a host entity
+      const d = stores.pa!.spawn('drone', { x: 4, y: 0 }, { owner: 'host' });
+      run(300); // pc holds both: no 'ship' or 'drone' defined there
+      net.leave('pa');
+      delete stores.pa;
+      for (const s of Object.values(stores)) s.playerLeft('pa');
+      handOver('pc'); // pc is host now: nobody else will send it the drone
+      stores.pc!.define('ship', DRONE);
+      stores.pc!.define('drone', DRONE);
+      run(400);
+      expect(stores.pc!.get(own.id)).toBeUndefined();
+      const onC = stores.pc!.get(d.id)!;
+      expect(onC.mine).toBe(true);
+      expect(onC.x).toBe(4);
+      expect(events.filter((e) => e.startsWith('pc'))).toEqual([`pc spawn ${d.id}`]);
+    });
+  });
 
   test('only the host can create host entities', () => {
     const { b } = room3();
@@ -809,6 +984,128 @@ describe('onLeave: host', () => {
     };
     return { net, events, stores, join, run, leave };
   }
+
+  test('a player’s flag stays in the world when they reload too, and the host writes it (SDK review #5)', () => {
+    const { net, stores, events, run } = room();
+    const flag = stores.pb!.spawn('flag', { x: 5, y: 0, held: true }, { onLeave: 'host' });
+    run(300);
+    const onA = stores.pa!.get(flag.id)!;
+    const onC = stores.pc!.get(flag.id)!;
+    // pb reloads: the same player, a new page (a new id session), which spawns again.
+    const reloaded = new EntityStore(net.join('pb', 'bo', (d, f, at) => reloaded.receive(d, f, at)), {}, createIdAllocator(() => 0.9));
+    reloaded.define('flag', FLAG);
+    stores.pb = reloaded;
+    reloaded.spawn('flag', { x: 0, y: 0, held: false });
+    run(400);
+    expect(events.filter((e) => e.includes(flag.id) && e.includes('remove'))).toEqual([]);
+    expect(stores.pa!.get(flag.id)).toBe(onA);
+    expect(onA.mine).toBe(true);
+    onA.x = 9;
+    run(400);
+    expect(stores.pc!.get(flag.id)).toBe(onC);
+    expect(onC.x).toBe(9);
+  });
+
+  test('a reload that spawns nothing: back, and still silent about it, the host keeps it (review of #5)', () => {
+    const { net, stores, events, run } = room();
+    const flag = stores.pb!.spawn('flag', { x: 5, y: 0, held: true }, { onLeave: 'host' });
+    run(300);
+    const onA = stores.pa!.get(flag.id)!;
+    // The old page's socket closes, the new page connects and shows a menu: nothing to spawn.
+    net.setConnected('pb', false);
+    run(1000);
+    const reloaded = new EntityStore(net.join('pb', 'bo', (d, f, at) => reloaded.receive(d, f, at)), {}, createIdAllocator(() => 0.9));
+    reloaded.define('flag', FLAG);
+    stores.pb = reloaded;
+    run(4000);
+    expect(events.filter((e) => e.includes(flag.id) && e.includes('remove'))).toEqual([]);
+    expect(stores.pa!.get(flag.id)).toBe(onA);
+    expect(onA.mine).toBe(true);
+    expect(stores.pc!.get(flag.id)!.owner.name).toBe('ada');
+  });
+
+  test('an owner whose page survived a blip but stayed silent for 3 s follows the host’s copy: nobody diverges (second review of #5)', () => {
+    const { net, stores, run } = room();
+    const flag = stores.pb!.spawn('flag', { x: 5, y: 0, held: true }, { onLeave: 'host' });
+    run(300);
+    const pb = stores.pb!;
+    net.setConnected('pb', false);
+    delete stores.pb; // its page is slow to get going again
+    run(1000);
+    net.setConnected('pb', true);
+    run(4000); // back, silent: the host takes the flag
+    expect(stores.pa!.get(flag.id)!.mine).toBe(true);
+    stores.pb = pb; // pb resumes
+    stores.pa!.get(flag.id)!.x = 9;
+    run(400);
+    expect(flag.mine).toBe(false);
+    expect(flag.x).toBe(9);
+    expect(stores.pc!.get(flag.id)!.x).toBe(9);
+  });
+
+  test('an owner removing it as the host’s copy arrives gets it back with onSpawn: the room still has it (third review of #5)', () => {
+    const { net, stores, events, run } = room();
+    const flag = stores.pb!.spawn('flag', { x: 5, y: 0, held: true }, { onLeave: 'host' });
+    run(300);
+    const pb = stores.pb!;
+    net.setConnected('pb', false);
+    delete stores.pb;
+    run(1000);
+    net.setConnected('pb', true);
+    run(4000); // back, silent: the host takes the flag
+    events.length = 0;
+    flag.remove(); // pb's page resumes and drops it, but doesn't tick before the host's update comes
+    stores.pb = pb;
+    stores.pa!.get(flag.id)!.x = 9;
+    const end = net.now + 400;
+    while (net.now + FRAME <= end) {
+      net.advanceTo(net.now + FRAME);
+      stores.pa!.tick();
+      stores.pc!.tick();
+    }
+    expect(events.filter((e) => e.startsWith('pb'))).toEqual([`pb remove ${flag.id} removed`, `pb spawn ${flag.id}`]);
+    expect(pb.get(flag.id)).toBe(flag);
+    expect(flag.mine).toBe(false);
+    run(400);
+    expect(flag.x).toBe(9);
+    expect(events.filter((e) => e.startsWith('pb'))).toHaveLength(2);
+  });
+
+  test('removed by the owner and by the host at once: one onRemove, no onSpawn (fourth review of #5)', () => {
+    const { net, stores, events, run } = room();
+    const flag = stores.pb!.spawn('flag', { x: 5, y: 0, held: true }, { onLeave: 'host' });
+    run(300);
+    const pb = stores.pb!;
+    net.setConnected('pb', false);
+    delete stores.pb;
+    run(1000);
+    net.setConnected('pb', true);
+    run(4000); // back, silent: the host takes the flag
+    events.length = 0;
+    flag.remove(); // pb drops it as the host does
+    stores.pa!.get(flag.id)!.remove();
+    stores.pb = pb;
+    const end = net.now + 400;
+    while (net.now + FRAME <= end) {
+      net.advanceTo(net.now + FRAME);
+      stores.pa!.tick();
+      stores.pc!.tick();
+    }
+    run(400);
+    expect(events.filter((e) => e.startsWith('pb'))).toEqual([`pb remove ${flag.id} removed`]);
+    expect(pb.get(flag.id)).toBeUndefined();
+  });
+
+  test('an owner silent without a disconnect (a frozen tab) still times out: it may come back and resume', () => {
+    const { stores, events, run } = room();
+    const flag = stores.pb!.spawn('flag', { x: 5, y: 0, held: true }, { onLeave: 'host' });
+    run(300);
+    const pb = stores.pb!;
+    delete stores.pb; // stops ticking: sends nothing, socket still up
+    run(4000);
+    expect(events).toContain(`pa remove ${flag.id} expired`);
+    stores.pb = pb;
+  });
 
   test('a player’s flag stays in the world when they leave, and the host writes it', () => {
     const { stores, events, run, leave } = room();
@@ -991,4 +1288,117 @@ test("after a reconnect, keyframes are spread over the next second instead of al
   const fullPerMessage = net.updates('pa').slice(before).map((u) => u.e.filter((e) => e[1] & FULL).length);
   expect(fullPerMessage.reduce((a, b) => a + b, 0)).toBeGreaterThanOrEqual(10); // each one keyframed within the second
   expect(Math.max(...fullPerMessage)).toBeLessThanOrEqual(2);
+});
+
+describe('host entities under any handover schedule (invariants)', () => {
+  function rng(seed: number) {
+    let a = seed >>> 0;
+    return () => {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  test('after any run of spawns, moves, removals and handovers, everyone has what the host has', () => {
+    // The host spawns, moves and removes host entities at random, sometimes in the same frame as a
+    // handover and before its send (changes that never go out). Once things are quiet, every
+    // player's host entities, and their values, must be the host's. All along, each player's
+    // onSpawn and onRemove for an entity alternate (never spawned twice, never removed twice), an
+    // entity back after a removal is the same object, and nobody shows one the host doesn't have
+    // for longer than it takes a removal to arrive (a phantom).
+    //
+    // A handover as the server does it: it switches at once (dropping the old host's later
+    // host-only sends), and tells each player after what it already forwarded, so everything the
+    // old host sent before is applied first. The old host hears at once here: the gap where it
+    // sends before hearing is known and documented (it needs acknowledged host sends).
+    const DRONE = { x: 'number', y: 'number' } as const;
+    for (let seed = 1; seed <= 30; seed++) {
+      const random = rng(seed);
+      const net = new FakeNet({ latency: 60, jitter: 10, seed });
+      const ids = ['pa', 'pb', 'pc'];
+      const stores: Record<string, EntityStore> = {};
+      const shown = new Map<string, boolean>(); // player:id → spawned and not removed
+      const objects = new Map<string, object>();
+      const bad: string[] = [];
+      const hook = (id: string, on: boolean) => (e: { id: string }) => {
+        const key = `${id}:${e.id}`;
+        if ((shown.get(key) ?? false) === on) bad.push(`${key} ${on ? 'spawned' : 'removed'} twice`);
+        if (on && objects.has(key) && objects.get(key) !== e) bad.push(`${key} came back as a new object`);
+        shown.set(key, on);
+        objects.set(key, e);
+      };
+      const phantomSince = new Map<string, number>();
+      const checkPhantoms = () => {
+        const hosted = new Set(stores[net.host]!.all('drone').map((e) => e.id));
+        for (const id of ids) {
+          for (const e of stores[id]!.all('drone')) {
+            const key = `${id}:${e.id}`;
+            if (hosted.has(e.id)) phantomSince.delete(key);
+            else if (!phantomSince.has(key)) phantomSince.set(key, net.now);
+            else if (net.now - phantomSince.get(key)! > 1000 && !bad.includes(`${key} phantom`)) bad.push(`${key} phantom`);
+          }
+        }
+      };
+      const views: Record<string, string> = { pa: 'pa', pb: 'pa', pc: 'pa' }; // who each player thinks is host
+      for (const [i, id] of ids.entries()) {
+        const hooks = { onSpawn: hook(id, true), onRemove: hook(id, false) };
+        const t = { ...net.join(id, id, (d, f, at) => stores[id]!.receive(d, f, at)), hostId: () => views[id]! };
+        stores[id] = new EntityStore(t, hooks, createIdAllocator(() => 0.1 * (i + 1)));
+        stores[id]!.define('drone', DRONE);
+      }
+      net.host = 'pa';
+      let told: { at: number; id: string; next: string }[] = [];
+      const tell = (id: string, next: string) => {
+        const prev = views[id]!;
+        views[id] = next;
+        if (prev !== next) stores[id]!.hostChanged(next, prev);
+      };
+      const handOver = () => {
+        const prev = net.host;
+        const next = ids.filter((id) => id !== prev)[Math.floor(random() * 2)]!;
+        net.host = next;
+        told = told.filter((m) => m.id !== prev);
+        tell(prev, next);
+        for (const id of ids) if (id !== prev) told.push({ at: net.now + 85, id, next }); // after up to 80 ms in flight
+      };
+      const hear = () => {
+        for (const m of told.filter((m) => m.at <= net.now)) tell(m.id, m.next);
+        told = told.filter((m) => m.at > net.now);
+      };
+      const act = () => {
+        if (views[net.host] !== net.host) return; // the new host hasn't heard yet
+        const host = stores[net.host]!;
+        const mine = host.all('drone').filter((e) => e.mine);
+        if (random() < 0.05 && mine.length < 8) host.spawn('drone', { x: Math.floor(random() * 100), y: 0 }, { owner: 'host' });
+        for (const e of mine) if (random() < 0.2) e.x = Math.floor(random() * 100);
+        if (random() < 0.02 && mine.length > 0) mine[Math.floor(random() * mine.length)]!.remove();
+      };
+      for (let f = 0; f < 360; f++) {
+        net.advanceTo(net.now + FRAME);
+        hear();
+        act();
+        if (random() < 0.02) handOver(); // before the old host's send: its changes this frame never go out
+        for (const s of Object.values(stores)) s.tick();
+        if (random() < 0.02) handOver();
+        checkPhantoms();
+      }
+      for (let f = 0; f < 300; f++) {
+        net.advanceTo(net.now + FRAME);
+        hear();
+        for (const s of Object.values(stores)) s.tick();
+        checkPhantoms();
+      }
+      const view = (s: EntityStore) =>
+        s
+          .all('drone')
+          .map((e) => `${e.id}=${e.x}`)
+          .sort();
+      const want = view(stores[net.host]!);
+      for (const id of ids) expect({ seed, id, has: view(stores[id]!) }).toEqual({ seed, id, has: want });
+      expect({ seed, bad }).toEqual({ seed, bad: [] });
+    }
+  });
 });

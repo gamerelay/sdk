@@ -433,3 +433,13 @@ test('a link-only access change asks for the share link a microtask later, not w
   await Promise.resolve();
   expect(requests.filter((r) => r.t === 'share_link').length).toBe(1);
 });
+
+test("setState refuses a key the server refuses, before the local write: the host's state can't drift from the room's (SDK review #20)", () => {
+  const { room, queued } = makeRoom('pa', { players: [player('pa', 0)] });
+  for (const key of ['constructor', 'prototype', '__proto__']) {
+    const patch = JSON.parse(`{"score": 5, "${key}": 1}`) as JsonObject; // (parsed: "__proto__" as a plain key)
+    expect(() => room.setState(patch)).toThrow(expect.objectContaining({ code: 'bad_request' }));
+  }
+  expect(room.state).toEqual({});
+  expect(queued.filter((m) => m.t === 'set_state')).toEqual([]);
+});

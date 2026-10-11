@@ -86,6 +86,43 @@ describe('every rejection is a GameRelayError with a code', () => {
     expect(FakeSocket.last.closedByClient).toBe(true);
   });
 
+  test('a welcome without a usable key fails the connect at once, closing its socket, instead of hanging or sending unsigned', async () => {
+    for (const bad of [{ playerId: undefined }, { k: 'not-a-key' }]) {
+      jest.useFakeTimers();
+      FakeSocket.all = [];
+      g.WebSocket = FakeSocket;
+      g.fetch = async () => ({ ok: true, status: 200, json: async () => ({ token: 'tok', expiresAt: Date.now() + 3_600_000 }) });
+      let err: GameRelayError | null = null;
+      void GameRelay.connect({ publicKey: 'gr_pub_test', url: 'http://test.local', lan: false }).then(
+        (relay) => {
+          relay.close();
+          err = { code: 'connected' } as unknown as GameRelayError;
+        },
+        (e) => (err = e),
+      );
+      await settle();
+      FakeSocket.last.welcome('pa', Date.now(), bad);
+      await settle();
+      expect(err!.code).toBe('unsupported');
+      expect(FakeSocket.last.closedByClient).toBe(true);
+    }
+  });
+
+  test('a second, malformed welcome on a connected socket is ignored: the relay stays connected and signing (review)', async () => {
+    const { relay, socket, done } = await connectFake();
+    cleanup = done;
+    let dropped = 0;
+    relay.on('disconnected', () => dropped++);
+    socket().welcome('pa', Date.now(), { playerId: undefined });
+    await advance(1_000);
+    expect(relay.connected).toBe(true);
+    expect(dropped).toBe(0);
+    expect(FakeSocket.all.length).toBe(1);
+    const asked = relay.ping(); // (FakeSocket refuses an unsigned frame)
+    await advance(100);
+    expect(await asked).toBeGreaterThanOrEqual(0);
+  });
+
   test('a secret key in publicKey is refused before anything is sent', async () => {
     const { err, fetched } = await failConnect(() => Promise.reject(new Error('unused')), { publicKey: 'gr_sk_live_123' });
     expect(err.code).toBe('unauthorized');
@@ -128,6 +165,18 @@ describe('one way everything stops', () => {
     expect(s.attempts.slice(sent).some((m) => m.t === 'quick_match')).toBe(false);
   });
 
+  test('close() leaves no timers behind: not the pings after the welcome, nor a reconnect a `disconnected` listener cancelled', async () => {
+    const { relay } = await connectFake();
+    relay.close();
+    expect(jest.getTimerCount()).toBe(0);
+    const again = await connectFake();
+    again.relay.on('disconnected', () => again.relay.close());
+    await advance(3_100); // the welcome's pings are done
+    again.socket().drop(1006);
+    expect(jest.getTimerCount()).toBe(0);
+    again.done();
+  });
+
   test('close() while a reconnect waits for its welcome settles it, and nothing is left waiting', async () => {
     const { relay, socket } = await inRoom();
     socket().drop(1006);
@@ -162,6 +211,24 @@ describe('one way everything stops', () => {
     const sockets = FakeSocket.all.length;
     await advance(30_000, 1000);
     expect(FakeSocket.all.length).toBe(sockets);
+  });
+
+  test('a reconnect that keeps getting unusable welcomes reports it once, and keeps trying (code review)', async () => {
+    const { relay, socket } = await inRoom();
+    const errors: string[] = [];
+    relay.on('error', (e) => errors.push(e.code));
+    socket().drop(1006);
+    let bad = 0;
+    for (let t = 0; t < 60_000 && bad < 3; t += 100) {
+      const s = FakeSocket.last;
+      if (s.readyState === 0 && !s.closedByClient) {
+        s.welcome('pa', Date.now(), { k: 'not-a-key' });
+        bad++;
+      }
+      await advance(100);
+    }
+    expect(bad).toBe(3);
+    expect(errors).toEqual(['unsupported']);
   });
 
   test('a reconnect the server refuses (rotated key): `error` says why, and it stops', async () => {

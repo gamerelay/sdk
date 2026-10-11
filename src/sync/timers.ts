@@ -27,6 +27,10 @@ export interface TimerDeps {
 export class Timers {
   readonly #d: TimerDeps;
   #firing = false;
+  /** Due timers whose handlers have run, this pass. */
+  readonly #fired = new Set<string>();
+  /** …and those set again after that: kept even if the new deadline is due already. */
+  readonly #rearmed = new Set<string>();
 
   constructor(deps: TimerDeps) {
     this.#d = deps;
@@ -42,6 +46,7 @@ export class Timers {
     if (typeof name !== 'string' || !NAME.test(name)) throw bad(`room.timer: '${name}' isn't a valid timer name (a letter, then letters, digits, _ : . -)`);
     if (!(Number.isFinite(ms) && ms >= 0)) throw bad(`room.timer('${name}', ms): ms must be a number of milliseconds, 0 or more`);
     this.#d.setState({ [TIMERS_KEY]: { ...this.#all(), [name]: Math.round(this.#d.now() + ms) } });
+    if (this.#firing && this.#fired.has(name)) this.#rearmed.add(name);
   }
 
   clear(name: string): void {
@@ -74,8 +79,14 @@ export class Timers {
     if (due.length === 0) return;
     const run = () => {
       this.#firing = true;
+      this.#fired.clear();
+      this.#rearmed.clear();
       try {
         for (const name of due) {
+          // An earlier handler may have cleared it, or set it again for later.
+          const at = this.#all()[name];
+          if (!(typeof at === 'number' && at <= now)) continue;
+          this.#fired.add(name);
           try {
             this.#d.fire(name);
           } catch (err) {
@@ -86,7 +97,12 @@ export class Timers {
         this.#firing = false;
       }
       const rest = { ...this.#all() }; // handlers may have set new timers
-      for (const name of due) if (rest[name] === all[name]) delete rest[name]; // unless re-armed
+      // Each timer that fired is cleared, unless set again after its handler ran (by name: set for
+      // 0 ms within the same millisecond, its deadline is the one that just fell due). One an
+      // earlier handler cleared or put off didn't fire and is left as that handler made it.
+      for (const name of this.#fired) if (!this.#rearmed.has(name)) delete rest[name];
+      this.#fired.clear();
+      this.#rearmed.clear();
       this.#d.setState({ [TIMERS_KEY]: rest });
     };
     if (this.#d.batch) this.#d.batch(run);

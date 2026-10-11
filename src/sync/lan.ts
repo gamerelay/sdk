@@ -387,7 +387,8 @@ export interface LanDeps {
    */
   withinRate?(): boolean;
   deliver(from: PlayerId, d: Json, at: number): void;
-  log?(message: string): void;
+  /** A status line; `failure`: something broke (WebRTC threw), not the usual comings and goings. */
+  log?(message: string, failure?: boolean): void;
   /** For tests. Default: a real `RTCPeerConnection`. */
   createPeer?(config: RTCConfiguration): RTCPeerConnection;
   /**
@@ -459,8 +460,11 @@ interface Peer {
   /** Its latest request to start over that came too soon, and the timer that runs it. */
   deferred: Signal | null;
   deferTimer: ReturnType<typeof setTimeout> | null;
-  /** Back within the cap, an offerer's wait for the answerer's hello before it asks (`playerLeft`). */
-  startTimer: ReturnType<typeof setTimeout> | null;
+  /**
+   * A hello we send later (`#helloLater`): back within the cap, an offerer's wait for the
+   * answerer's before it asks (`playerLeft`); the answerer's retry after a drop or a miss.
+   */
+  helloTimer: ReturnType<typeof setTimeout> | null;
   /** Our candidates for offer `g` not sent yet (`#queueCandidate`). */
   outbox: { g: string; cs: Json[]; timer: ReturnType<typeof setTimeout> } | null;
 }
@@ -611,7 +615,7 @@ export class Lan {
       try {
         pc.setConfiguration({ ...pc.getConfiguration(), ...this.#iceConfig(p, fresh) });
       } catch (err) {
-        this.#deps.log?.(`LAN shortcut to ${p.id}: couldn't take the new relay credentials (${(err as Error).message})`);
+        this.#deps.log?.(`LAN shortcut to ${p.id}: couldn't take the new relay credentials (${(err as Error).message})`, true);
         continue;
       }
       if (p.open && this.#offerer(p.id)) void this.#renegotiate(p);
@@ -822,10 +826,7 @@ export class Lan {
         this.#sayHello(other);
         continue;
       }
-      p.startTimer = setTimeout(() => {
-        p.startTimer = null;
-        if (this.#peers.get(other) === p && !p.pc && this.#allowed(other)) this.#sayHello(other);
-      }, this.#deps.timing?.connectMs ?? CONNECT_MS);
+      this.#helloLater(p, this.#deps.timing?.connectMs ?? CONNECT_MS);
     }
   }
 
@@ -833,8 +834,8 @@ export class Lan {
     const p = this.#peers.get(id);
     if (p) {
       this.#teardown(p);
-      if (p.startTimer) clearTimeout(p.startTimer);
-      p.startTimer = null;
+      if (p.helloTimer) clearTimeout(p.helloTimer);
+      p.helloTimer = null;
       if (p.deferTimer) clearTimeout(p.deferTimer);
       p.deferTimer = null;
       p.deferred = null;
@@ -863,9 +864,21 @@ export class Lan {
     return !this.#deps.relay?.only && (this.#deps.direct?.(id) ?? false);
   }
 
-  /** Send `id` our "start over" (`#hello`). */
+  /** Send `id` our "start over" (`#hello`). It replaces one waiting to go later (`#helloLater`). */
   #sayHello(id: PlayerId): void {
+    const p = this.#peers.get(id);
+    if (p?.helloTimer) clearTimeout(p.helloTimer);
+    if (p) p.helloTimer = null;
     this.#deps.signal(id, this.#hello(id));
+  }
+
+  /** Say hello to `p` in `ms`, unless it left, or a connection was set up, meanwhile. */
+  #helloLater(p: Peer, ms: number): void {
+    if (p.helloTimer) clearTimeout(p.helloTimer);
+    p.helloTimer = setTimeout(() => {
+      p.helloTimer = null;
+      if (this.#peers.get(p.id) === p && !p.pc && this.#allowed(p.id)) this.#sayHello(p.id);
+    }, ms);
   }
 
   /** "Start over" to `id`, as the offerer (`ask`) or the answerer (`hi`, with our relay delays). */
@@ -899,7 +912,7 @@ export class Lan {
       const bucket = new TokenBucket(LIMITS.ratePerSecond, LIMITS.rateBurst, this.#clock());
       p = {
         id, pc: null, channel: null, open: false, gen: null, conn: null, server: null, stalled: false, stallTimer: null, early: [], timer: null, retries: 0, misses: 0, openedAt: 0, route: null, rtt: null, direct: false, races: 0, wins: 0, sparseUntil: 0, skipped: 0, bucket,
-        restartAt: Number.NEGATIVE_INFINITY, deferred: null, deferTimer: null, startTimer: null, outbox: null,
+        restartAt: Number.NEGATIVE_INFINITY, deferred: null, deferTimer: null, helloTimer: null, outbox: null,
       };
       this.#peers.set(id, p);
     }
@@ -1022,7 +1035,7 @@ export class Lan {
       }
     } catch (err) {
       if (stale()) return; // an old connection failing as it was closed: nothing to do
-      this.#deps.log?.(`LAN shortcut to ${from} failed: ${(err as Error).message}`);
+      this.#deps.log?.(`LAN shortcut to ${from} failed: ${(err as Error).message}`, true);
       // A restart on an open channel that fails is a lost connection (set up again after a pause).
       if (s.k === 'reoffer') this.#lost(p);
       else this.#teardown(p);
@@ -1173,7 +1186,7 @@ export class Lan {
       this.#deps.signal(p.id, { $gr: 'lan', k: 'reoffer', g, of, sdp: this.#sdpOut(pc, p.id) });
     } catch (err) {
       if (stale()) return;
-      this.#deps.log?.(`LAN shortcut to ${p.id}: couldn't restart ICE (${(err as Error).message})`);
+      this.#deps.log?.(`LAN shortcut to ${p.id}: couldn't restart ICE (${(err as Error).message})`, true);
       this.#lost(p);
     }
   }
@@ -1235,9 +1248,7 @@ export class Lan {
     if (this.#clock() - p.openedAt >= (this.#deps.timing?.stableMs ?? STABLE_MS)) p.retries = 0;
     if (p.retries >= MAX_RETRIES) return;
     p.retries++;
-    setTimeout(() => {
-      if (this.#peers.get(p.id) === p && !p.pc && this.#allowed(p.id)) this.#sayHello(p.id);
-    }, this.#deps.timing?.retryMs ?? RETRY_MS);
+    this.#helloLater(p, this.#deps.timing?.retryMs ?? RETRY_MS);
   }
 
   /**
@@ -1252,9 +1263,7 @@ export class Lan {
     const wait = (this.#deps.timing?.missMs ?? MISS_BACKOFF_MS)[p.misses];
     if (wait === undefined) return;
     p.misses++;
-    setTimeout(() => {
-      if (this.#peers.get(p.id) === p && !p.pc && this.#allowed(p.id)) this.#sayHello(p.id);
-    }, wait);
+    this.#helloLater(p, wait);
   }
 
   /**

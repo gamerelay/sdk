@@ -16,7 +16,9 @@ export type WarningKind =
   | 'notice'
   | 'invite'
   /** A Room the game left was still used. */
-  | 'left_room';
+  | 'left_room'
+  /** Reliable messages dropped: too many waited to go out. */
+  | 'queue_full';
 
 /**
  * Every warning the SDK can print, and the llms.txt section that explains its fix. Typed
@@ -39,6 +41,7 @@ export const SECTIONS: Readonly<Record<WarningKind, string>> = {
   notice: 'Versions',
   invite: 'Invite links',
   left_room: 'Room reference',
+  queue_full: 'Connection events',
 };
 
 /** Console warnings written for the LLM that will read them: each key prints once, then counts. */

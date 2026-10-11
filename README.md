@@ -10,7 +10,7 @@ Multiplayer for browser games, without writing a server. You declare what exists
 and who owns it; the SDK sends it, smooths it for everyone else, gives it to players who join
 late, and hands the host's share to another player when the host leaves. Rooms, quick match,
 invite links, parties, chat, saved player data and leaderboards come with it. Zero dependencies,
-fully typed, about 32 KB gzipped.
+fully typed, about 34 KB gzipped.
 
 **Docs:** [gamerelay.io/docs](https://gamerelay.io/docs) · **Guide for AI tools:**
 [gamerelay.io/llms.txt](https://gamerelay.io/llms.txt) (also in this package as `llms.txt`) ·
@@ -78,12 +78,12 @@ field doesn't compile.
 To play with friends, put the room in the page URL and send the link:
 
 ```js
-// Came in through an invite link? Join that room; otherwise make a new one.
-const room =
-  (await relay.joinInvite().catch(() => null)) ??
-  (await relay.createRoom({ maxPlayers: 4 }));
-history.replaceState(null, '', room.inviteUrl()); // the address bar is now the invite link
+// Came in through an invite link? Join that room; otherwise make a new one (private: not quick
+// match). updateUrl: the address bar is now the invite link.
+const room = await relay.joinOrCreate({ maxPlayers: 4, private: true, updateUrl: true });
 ```
+
+A full or locked room still rejects (`room_full`, `locked`): tell the player.
 
 `room.shareInvite()` opens the share sheet on phones and copies the link elsewhere. It shares
 the room's short link, `https://play.gamerelay.io/<game>/<link>` once the game has a slug and a
@@ -94,7 +94,7 @@ it (`?join=`). `createRoom({ linkOnly: true })` makes a room that only its link 
 
 `https://gamerelay.io/sdk/v0/gamerelay.js` (and `.mjs`) is the `v0` line and updates in place;
 `/sdk/gamerelay.js` is the same line, forever. To pin one exact version, load it from npm through
-jsDelivr: `https://cdn.jsdelivr.net/npm/@gamerelay/sdk@0.1.0-alpha.8/gamerelay.js`. Until the SDK
+jsDelivr: `https://cdn.jsdelivr.net/npm/@gamerelay/sdk@0.1.0-alpha.9/gamerelay.js`. Until the SDK
 reaches 1.0, a pinned alpha may be asked to update: new server features can need the newest alpha,
 and old alphas stop being accepted sooner than they will after 1.0.
 `GameRelay.version` is the running version. The server may print a notice in the console
