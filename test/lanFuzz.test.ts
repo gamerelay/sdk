@@ -9,7 +9,15 @@
  */
 import { describe, expect, test } from 'bun:test';
 import type { Json } from '@gamerelay/protocol/types';
-import { Lan, Merge, type Wrapped } from '../src/sync/lan';
+import { Lan as LanCore, Merge, type LanDeps, type Wrapped } from '../src/sync/lan';
+import { Peers } from '../src/sync/peers';
+
+/** The room's `Lan` with its peer code already loaded (a room loads it on demand: `load.ts`). */
+class Lan extends LanCore {
+  constructor(deps: LanDeps) {
+    super({ peers: Peers, ...deps });
+  }
+}
 
 function rng(seed: number): () => number {
   let a = seed >>> 0;

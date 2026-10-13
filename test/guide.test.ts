@@ -3,6 +3,9 @@
  * fails here instead of in someone's game.
  */
 import { describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { GameRelay, Room, seededRandom } from '../src/index';
 import { makeKind, type KindHost } from '../src/sync/kind';
 
@@ -131,9 +134,12 @@ describe('README.md', () => {
     const claim = Number(readme.match(/about (\d+) KB gzipped/)?.[1]);
     // A separate process: Bun.build inside the whole suite's run trips over other tests' module state.
     const cwd = new URL('..', import.meta.url).pathname;
-    const out = Bun.spawnSync(['bun', 'build', 'src/index.ts', '--minify', '--target', 'browser', '--format', 'esm'], { cwd });
+    const dir = mkdtempSync(join(tmpdir(), 'gamerelay-sdk-'));
+    const out = Bun.spawnSync(['bun', 'scripts/build.ts', '--out', dir], { cwd });
     expect(out.exitCode).toBe(0);
-    const kb = Bun.gzipSync(out.stdout).length / 1024;
+    // What every page loads: the main file (the P2P chunk comes only when a room starts P2P).
+    const kb = Bun.gzipSync(await Bun.file(join(dir, 'gamerelay.mjs')).bytes()).length / 1024;
+    rmSync(dir, { recursive: true, force: true });
     expect(Math.abs(kb - claim)).toBeLessThanOrEqual(2);
   });
 });

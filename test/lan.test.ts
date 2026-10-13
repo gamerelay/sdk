@@ -1,7 +1,15 @@
 import { describe, expect, jest, test } from 'bun:test';
 import { LIMITS } from '@gamerelay/protocol/limits';
 import type { Json } from '@gamerelay/protocol/types';
-import { Lan, MAX_LAN_COPY_BYTES, MAX_UNCONFIRMED, Merge, PROBE_EVERY, RACE_WINDOW, RETRY_MS, SPARSE_MS, STALE_MS, type LanDeps, type Wrapped } from '../src/sync/lan';
+import { Lan as LanCore, MAX_UNCONFIRMED, Merge, STALE_MS, type LanDeps, type Wrapped } from '../src/sync/lan';
+import { MAX_LAN_COPY_BYTES, PROBE_EVERY, Peers, RACE_WINDOW, RETRY_MS, SPARSE_MS } from '../src/sync/peers';
+
+/** The room's `Lan` with its peer code already loaded (a room loads it on demand: `load.ts`). */
+class Lan extends LanCore {
+  constructor(deps: LanDeps) {
+    super({ peers: Peers, ...deps });
+  }
+}
 
 const w = (n: number, e = 'A', b?: number): Wrapped => ({ $gr: 'l', e, n, ...(b ? { b } : {}), d: n });
 
@@ -1029,8 +1037,26 @@ describe('LAN shortcut: more edges (review 4)', () => {
     expect(got).toEqual([1, 2, 1, 2]);
   });
 
+  test('parseCandidate: type and lowercased address, nothing from what is not a candidate line', async () => {
+    const { parseCandidate } = await import('../src/sync/relays');
+    const cases: [unknown, [string | undefined, string]][] = [
+      ['candidate:1 1 udp 2122260223 192.168.1.5 5000 typ host generation 0', ['host', '192.168.1.5']],
+      ['candidate:2 1 tcp 1518280447 10.0.0.2 9 typ host tcptype active', ['host', '10.0.0.2']],
+      ['candidate:3 1 udp 1 FE80::1 5000 typ srflx raddr 0.0.0.0 rport 0', ['srflx', 'fe80::1']],
+      ['candidate:4 1 udp 1 192.241.216.26 49170 typ relay', ['relay', '192.241.216.26']],
+      ['candidate:5 1 udp 1 192.168.1.5 5000', [undefined, '192.168.1.5']], // no typ
+      ['candidate:6 1 udp 1 192.168.1.5 5000 typ', [undefined, '192.168.1.5']], // typ last
+      ['candidate:7 1 udp 1 relay 5000 host typ', [undefined, 'relay']], // an address is not a type
+      ['', [undefined, '']],
+      [undefined, [undefined, '']],
+      [null, [undefined, '']],
+      [7, [undefined, '']],
+    ];
+    for (const [line, want] of cases) expect({ line, got: parseCandidate(line) }).toEqual({ line, got: want });
+  });
+
   test('address filter edges', async () => {
-    const { onThisNetwork } = await import('../src/sync/lan');
+    const { onThisNetwork } = await import('../src/sync/peers');
     const c = (addr: string, typ = 'host') => ({ candidate: `candidate:1 1 udp 1 ${addr} 5000 typ ${typ}` });
     for (const ok of ['172.16.0.1', '172.31.255.1', 'abc.local']) expect(onThisNetwork(c(ok)), ok).toBe(true);
     for (const no of ['172.15.0.1', '172.32.0.1', '169.254.1.1', '100.64.0.1', '127.0.0.1', '8.8.8.8']) expect(onThisNetwork(c(no)), no).toBe(false);
@@ -1404,7 +1430,7 @@ describe('LAN shortcut: the LAN first, a relay otherwise, in one connection', ()
     test('a batch from a peer: each candidate is checked as a single one would be, early ones kept for their offer', async () => {
       const { l, peers } = withRelays('b');
       await l.setRelays([sf]);
-      const batch = { $gr: 'lan', k: 'ice', g: 'g1', c: cand('192.168.1.5', 'host'), cs: [cand('73.71.58.49', 'host'), cand('203.0.113.7', 'relay'), 'junk', null, cand('192.241.216.26', 'relay')] };
+      const batch = { $gr: 'lan', k: 'ice', g: 'g1', c: cand('192.168.1.5', 'host'), cs: [cand('73.71.58.49', 'host'), cand('203.0.113.7', 'relay'), 'junk', null, { candidate: null }, { candidate: 7 }, cand('192.241.216.26', 'relay')] };
       await l.signal('a', batch as never); // before the offer: kept
       await l.signal('a', offer());
       expect(peers[0]!.candidates.map((c) => (c as { candidate: string }).candidate.split(' ')[4])).toEqual(['192.168.1.5', '192.241.216.26']);

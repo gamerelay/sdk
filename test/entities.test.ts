@@ -1,7 +1,7 @@
 import { describe, expect, spyOn, test } from 'bun:test';
 import { FULL, REMOVE, SPAWN, TELEPORT, compileSchema } from '../src/core/codec';
 import { createIdAllocator } from '../src/core/ids';
-import { EntityStore, MAX_OWN, MAX_PENDING_KINDS, MAX_ROOM, type Entity } from '../src/sync/entities';
+import { ADVANCE_MS, EntityStore, MAX_OWN, MAX_PENDING_KINDS, MAX_ROOM, type Entity } from '../src/sync/entities';
 import { FakeNet, type NetOptions } from './fakeNet';
 
 const SHIP = { x: 'number', y: 'number', alive: 'flag' } as const;
@@ -220,6 +220,29 @@ describe('EntityStore: others’ entities', () => {
     const moving = steps.filter((d) => d > 0);
     expect(moving.length).toBeGreaterThan(40); // moves most frames, not only when updates land
     expect(Math.max(...moving)).toBeLessThan(15); // no lurches (a 50 ms update is 15 units)
+  });
+
+  test('a held entity moves on frame to frame, with no tick or new data between (a draw loop at 120 Hz)', async () => {
+    // Field reads look at the clock once per task (#27): a draw loop's hundreds of reads share one
+    // render time, and the next frame, a task of its own, gets a new one.
+    const { a, b, net, run } = setup();
+    a.define('ship', SHIP);
+    b.define('ship', SHIP);
+    const mine = a.spawn('ship', { x: 0, y: 0, alive: true });
+    for (let i = 0; i < 60; i++) {
+      mine.x = i * 5;
+      run(FRAME);
+    }
+    const held = b.get(mine.id)!;
+    const xs: number[] = [];
+    for (let frame = 0; frame < 4; frame++) {
+      await Promise.resolve(); // the next frame: a task (here, a microtask) after this one
+      net.advanceTo(net.now + 8); // 120 Hz, no tick and nothing arriving
+      xs.push(held.x as number, held.x as number); // one frame's reads agree
+    }
+    for (let i = 0; i < xs.length; i += 2) expect(xs[i + 1]).toBe(xs[i]!);
+    const frames = xs.filter((_, i) => i % 2 === 0);
+    expect(new Set(frames).size).toBe(frames.length); // and each frame is further along
   });
 
   test('a discrete change shows at its moment on the timeline, not on arrival', () => {
@@ -1399,6 +1422,133 @@ describe('host entities under any handover schedule (invariants)', () => {
       const want = view(stores[net.host]!);
       for (const id of ids) expect({ seed, id, has: view(stores[id]!) }).toEqual({ seed, id, has: want });
       expect({ seed, bad }).toEqual({ seed, bad: [] });
+    }
+  });
+});
+
+describe('remote reads under any schedule (invariants)', () => {
+  function rng(seed: number) {
+    let a = seed >>> 0;
+    return () => {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  test('reading a field never changes what a later read returns', () => {
+    // Remote values are read lazily, as of the timeline's last advance (at most every ADVANCE_MS),
+    // and cached until the next (#27). The cache must be invisible after an advance: an observer
+    // that reads every field of every entity after every step sees, at each checkpoint, exactly
+    // what a twin sees that reads fields only there. The twin gets the same messages at the same
+    // moments and moves its timeline at the same moments (it lists the entities, which advances,
+    // without reading fields), so only the field reads differ. Checkpoints come after a step at
+    // least ADVANCE_MS long, whose tick advanced after that step's messages arrived: within one
+    // advance a read may show what arrived before it, and an earlier read in it what came before. The schedule covers steps
+    // shorter and longer than an advance, teleports, spawns and removals, own and host entities,
+    // an owner dropping and coming back, and leaving with `onLeave: 'host'` entities (which move
+    // to the host's timeline mid-read).
+    const SHIP = { x: 'number', y: { type: 'number', precision: 0.01 }, a: 'angle', hp: 'value', alive: 'flag' } as const;
+    const DRONE = { x: 'number', y: 'number' } as const;
+    const STEPS = [0.5, 1, 2, 3, 3.9, 4, 5, 8, 16, 16, 17, 33, 50, 120];
+    for (let seed = 1; seed <= 40; seed++) {
+      const random = rng(seed);
+      const pick = <T>(xs: readonly T[]) => xs[Math.floor(random() * xs.length)]!;
+      const net = new FakeNet({ latency: 60, jitter: 15, loss: 0.05, seed });
+      net.host = 'ph';
+      const host = new EntityStore(net.join('ph', 'host', (d, f, at) => host.receive(d, f, at)), {}, createIdAllocator(() => 0.1));
+      let ada: EntityStore | null = new EntityStore(net.join('pa', 'ada', (d, f, at) => ada?.receive(d, f, at)), {}, createIdAllocator(() => 0.2));
+      // The observer and its twin: one socket, every message to both; the twin never sends.
+      let arrived = 0;
+      const tb = net.join('pb', 'bo', (d, f, at) => {
+        arrived++;
+        reader.receive(d, f, at);
+        twin.receive(d, f, at);
+      });
+      const reader = new EntityStore(tb);
+      const twin = new EntityStore({ ...tb, send: () => {} });
+      const all = [host, ada, reader, twin];
+      for (const s of all) {
+        s.define('ship', SHIP);
+        s.define('drone', DRONE);
+      }
+      const view = (s: EntityStore) =>
+        ['ship', 'drone']
+          .flatMap((k) => s.all(k).map((e) => `${e.id} ${Object.keys(k === 'ship' ? SHIP : DRONE).map((f) => (e as Record<string, unknown>)[f]).join(',')}`))
+          .sort();
+      const write = (s: EntityStore, kind: 'ship' | 'drone', filter: (e: Entity) => boolean) => {
+        const mine = s.all(kind).filter((e) => e.mine && filter(e));
+        for (const e of mine) {
+          if (random() < 0.4) e.x = Math.round(random() * 1000) / 10;
+          if (kind === 'ship' && random() < 0.2) e.y = Math.round(random() * 10000) / 100;
+          if (kind === 'ship' && random() < 0.2) e.a = random() * 6.28 - 3.14;
+          if (kind === 'ship' && random() < 0.05) e.hp = Math.floor(random() * 100);
+          if (kind === 'ship' && random() < 0.03) e.alive = !e.alive;
+          if (random() < 0.01) e.teleport();
+        }
+        if (random() < 0.01 && mine.length > 0) pick(mine).remove();
+      };
+      let leftAt = 400 + Math.floor(random() * 400);
+      const mismatches: string[] = [];
+      const fieldsOf = (e: Entity) => Object.keys(e.kind === 'ship' ? SHIP : DRONE).map((f) => (e as Record<string, unknown>)[f]).join(',');
+      let held: Entity[] = []; // what the reader listed last: a game holds on to entities
+      let twinHeld: Entity[] = []; // the twin's, listed at the same moment
+      for (let step = 0; step < 1200; step++) {
+        const dt = pick(STEPS);
+        arrived = 0;
+        net.advanceTo(net.now + dt);
+        // Data arrived, no tick or listing since, all in one task: the reader's held entities look
+        // at the clock again (the twin lists, which always does), and show what arrived.
+        if (dt >= ADVANCE_MS && arrived > 0 && random() < 0.5) {
+          const r = held.map((e) => `${e.id} ${fieldsOf(e)}`);
+          twin.all('ship');
+          twin.all('drone');
+          const t = twinHeld.map((e) => `${e.id} ${fieldsOf(e)}`);
+          if (JSON.stringify(r) !== JSON.stringify(t) && mismatches.length < 3) mismatches.push(`step ${step}, held: reader ${JSON.stringify(r)} twin ${JSON.stringify(t)}`);
+        }
+        if (ada && random() < 0.03 && ada.all('ship').filter((e) => e.mine).length < 4) {
+          ada.spawn('ship', { x: 0, y: 0, a: 0, hp: 100, alive: true }, random() < 0.5 ? { onLeave: 'host' } : {});
+        }
+        if (random() < 0.02 && host.all('drone').length < 4) host.spawn('drone', { x: random() * 100, y: 0 }, { owner: 'host' });
+        if (ada) write(ada, 'ship', () => true);
+        write(host, 'drone', () => true);
+        write(host, 'ship', () => true); // ships it took over from ada
+        // ada's connection drops and comes back now and then; later she leaves for good.
+        if (ada && random() < 0.005) net.setConnected('pa', false);
+        if (ada && random() < 0.02) net.setConnected('pa', true);
+        if (ada && --leftAt === 0) {
+          net.leave('pa');
+          ada = null;
+          for (const s of [host, reader, twin]) s.playerLeft('pa');
+        }
+        for (const s of all) s?.tick();
+        // The reader reads everything (sometimes twice in a row, sometimes by id); the twin only lists.
+        if (random() < 0.8) {
+          held = [];
+          twinHeld = [];
+          for (const kind of ['ship', 'drone']) {
+            for (const e of reader.all(kind)) {
+              held.push(e);
+              for (const f of Object.keys(kind === 'ship' ? SHIP : DRONE)) void (e as Record<string, unknown>)[f];
+            }
+            twinHeld.push(...twin.all(kind));
+          }
+          if (random() < 0.3) {
+            const e = reader.all('ship')[0];
+            if (e) {
+              void reader.get(e.id)?.x;
+              twin.get(e.id);
+            }
+          }
+        }
+        if (dt >= ADVANCE_MS && random() < 0.3) {
+          const [r, t] = [view(reader), view(twin)];
+          if (JSON.stringify(r) !== JSON.stringify(t) && mismatches.length < 3) mismatches.push(`step ${step}: reader ${JSON.stringify(r)} twin ${JSON.stringify(t)}`);
+        }
+      }
+      expect({ seed, mismatches }).toEqual({ seed, mismatches: [] });
     }
   });
 });

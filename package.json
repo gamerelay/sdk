@@ -1,11 +1,11 @@
 {
   "name": "@gamerelay/sdk",
-  "version": "0.1.0-alpha.9",
+  "version": "0.1.0-alpha.10",
   "description": "Multiplayer for browser games without a server: rooms, entity sync with smoothing, host migration, chat and leaderboards. Zero dependencies.",
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "bun build src/index.ts --outfile dist/gamerelay.mjs --format esm --minify --target browser && bun build src/global.ts --outfile dist/gamerelay.js --format iife --minify --target browser",
+    "build": "bun scripts/build.ts",
     "typecheck": "tsc -p .",
     "test": "bun test",
     "pack:npm": "bun scripts/pack.ts"

@@ -35,7 +35,8 @@ function neutral(state: InputState): Readonly<InputState> {
 export class Inputs {
   readonly #t: SyncTransport;
   readonly #tag = Math.random().toString(36).slice(2, 8);
-  readonly #remote = new Map<PlayerId, { k: string; s: number; d: Readonly<InputState>; at: number; held: Map<string, number> }>();
+  /** Each player's latest input; `rest`, its neutral copy, made once it's stale. */
+  readonly #remote = new Map<PlayerId, { k: string; s: number; d: Readonly<InputState>; at: number; held: Map<string, number>; rest?: Readonly<InputState> }>();
   /** Keys pressed since the last send (and, on the host, within the last 50 ms): key → when. */
   readonly #latch = new Map<string, number>();
   #latest: InputState | null = null;
@@ -75,7 +76,7 @@ export class Inputs {
     const rec = this.#remote.get(id);
     if (!rec) return EMPTY;
     const now = this.#t.now();
-    if (now - rec.at > INPUT_STALE_MS) return neutral(rec.d);
+    if (now - rec.at > INPUT_STALE_MS) return (rec.rest ??= neutral(rec.d)); // one object, not one per call
     let out: InputState | null = null;
     for (const [k, until] of rec.held) {
       if (until <= now || rec.d[k] === true) continue;

@@ -96,11 +96,12 @@ export function compileSchema(kind: string, fields: Record<string, FieldInput>, 
 export const bufferKind = (type: FieldType): FieldKind => (type === 'number' ? 'linear' : type === 'angle' ? 'angle' : 'step');
 export const isDiscrete = (type: FieldType): boolean => type === 'flag' || type === 'text' || type === 'value';
 
-function isJson(v: unknown): boolean {
+/** `v` as JSON, or undefined when it isn't JSON (undefined, a function, a cycle, a BigInt). */
+function jsonOf(v: unknown): string | undefined {
   try {
-    return v !== undefined && JSON.stringify(v) !== undefined;
+    return v === undefined ? undefined : JSON.stringify(v);
   } catch {
-    return false;
+    return undefined;
   }
 }
 
@@ -121,19 +122,27 @@ function valid(type: FieldType, v: unknown): boolean {
     case 'text':
       return typeof v === 'string' && v.length <= 256;
     case 'value':
-      return isJson(v);
+      return jsonOf(v) !== undefined;
   }
 }
 
 export function checkValue(kind: string, field: FieldSpec, value: unknown): void {
+  if (field.type === 'value') {
+    const json = jsonOf(value); // written once, both to see it's JSON and to measure it
+    if (json === undefined) throw bad(`${kind}.${field.name} is a 'value' field; got ${describe(value)}`);
+    if (!fitsUtf8(json, MAX_VALUE_BYTES)) {
+      throw bad(`${kind}.${field.name} is over 4 KB; keep 'value' fields small, and put bulk data in room.setState or an event`);
+    }
+    return;
+  }
   if (field.type === 'text' && typeof value === 'string' && value.length > 256) {
     throw bad(`${kind}.${field.name} is a 'text' field of at most 256 characters; got ${value.length}. For longer text use a 'value' field or room.setState`);
   }
   if (!valid(field.type, value)) throw bad(`${kind}.${field.name} is a '${field.type}' field; got ${describe(value)}`);
-  if (field.type === 'value' && !fitsUtf8(JSON.stringify(value), MAX_VALUE_BYTES)) {
-    throw bad(`${kind}.${field.name} is over 4 KB; keep 'value' fields small, and put bulk data in room.setState or an event`);
-  }
 }
+
+/** 10^0 to 10^20: `decimalsOf` gives at most 20 (each exact as a double). */
+const POW10 = Array.from({ length: 21 }, (_, i) => 10 ** i);
 
 /** Decimals that write `precision` exactly (0.25: 2, 0.125: 3); -1 past `toFixed`'s 20. */
 export function decimalsOf(precision: number): number {
@@ -147,7 +156,21 @@ export function decimalsOf(precision: number): number {
  * `d`: `decimalsOf(precision)`, which a field works out once.
  */
 export function roundTo(value: number, precision: number, d = decimalsOf(precision)): number {
-  const snapped = Math.round(value / precision) * precision;
+  const steps = Math.round(value / precision);
+  if (d >= 0) {
+    // In whole units of the last decimal: the steps times the precision's digits is an exact
+    // integer, and dividing it by an exact power of ten rounds once, to the double nearest the
+    // decimal, which is what parsing `toFixed(d)` gave, with no string per number. Up to 2^50,
+    // where `toFixed`'s input (steps × precision, a few ulps off) still rounds to that decimal;
+    // past it the old way, so no value changes.
+    // Only a precision that is exactly that decimal (not 1/3, which `decimalsOf` takes to 9 places,
+    // nor 1.1 - 1, a hair off 0.1): there, steps × precision is the same number of units.
+    const scale = POW10[d]!;
+    const digits = Math.round(precision * scale);
+    const units = steps * digits;
+    if (digits / scale === precision && Math.abs(units) < 2 ** 50) return units / scale + 0; // (+ 0: no -0)
+  }
+  const snapped = steps * precision;
   // Too fine for toFixed: the multiple as it is (float noise there is far below the precision anyway).
   const rounded = d < 0 ? snapped : Number(snapped.toFixed(d));
   // Near the largest numbers, value / precision overflows: those keep their value.
@@ -195,25 +218,29 @@ function wire(f: FieldSpec, v: unknown): Json {
 
 /**
  * Changed fields as a flat `[index, value, index, value, …]` list, compared after rounding; `sent`
- * (one slot per field, what receivers last got) is updated to match. `full` sends every field.
+ * (one slot per field, what receivers last got) is updated to match. `full` sends every field, and
+ * `changed` still says whether any differed from `sent` (a keyframe with news, or only a repeat).
  */
 export function encodeChanges(
   schema: KindSchema,
   values: readonly unknown[],
   sent: unknown[],
   full: boolean,
-): { pairs: Json[]; discrete: boolean } {
+): { pairs: Json[]; discrete: boolean; changed: boolean } {
   const pairs: Json[] = [];
   let discrete = false;
+  let changed = false;
   schema.fields.forEach((f, i) => {
     const w = wire(f, values[i]);
     const key = f.type === 'value' ? JSON.stringify(w) : w;
-    if (!full && sent[i] !== undefined && sent[i] === key) return;
+    const same = sent[i] !== undefined && sent[i] === key;
+    if (!same) changed = true;
+    if (!full && same) return;
     sent[i] = key;
     pairs.push(i, w);
     if (isDiscrete(f.type)) discrete = true;
   });
-  return { pairs, discrete };
+  return { pairs, discrete, changed };
 }
 
 export function decodeChanges(schema: KindSchema, pairs: unknown): (unknown | undefined)[] | null {
