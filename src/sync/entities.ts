@@ -92,7 +92,7 @@ export const MAX_PENDING_KINDS = 16;
 /** A connected owner sends at least a keyframe a second; this much silence means the entity is gone. */
 const EXPIRE_MS = 3000;
 /** How often (ms) the timeline is advanced at most: reads within one frame share it. */
-const ADVANCE_MS = 4;
+export const ADVANCE_MS = 4;
 /** A gap this long between our own advances means *we* were frozen (a suspended page), not them. */
 const OWN_STALL_MS = 1000;
 const sessionOf = (id: string) => id.split(':')[1] ?? '';
@@ -155,8 +155,8 @@ interface Remote {
   lastSeen: number;
   /** The owner disconnected since its last update: silence after it's back means the page went (a reload). */
   ownerAway: boolean;
-  /** Timeline time `values` were read at; `Infinity` once removed (values frozen). */
-  readAt: number;
+  /** The advance (`EntityStore.#epoch`) `values` were read in; `Infinity` once removed (values frozen). */
+  readIn: number;
   host: boolean;
   /** Becomes a host entity when its owner leaves, instead of going with them. */
   leaveHost: boolean;
@@ -190,6 +190,17 @@ export class EntityStore {
   readonly #sessions = new Map<PlayerId, string[]>();
   #lastAdvance = -Infinity;
   #lastAdvanceNow = 0;
+  /** Counts advances: a remote's values are read once in each (`Remote.readIn`). */
+  #epoch = 0;
+  /**
+   * The clock was read in this task (by an advance): field reads skip it until a microtask from
+   * then, or until new data arrives. A draw loop reads hundreds of fields, and the clock (one
+   * `performance.now()` each) was most of a read's cost.
+   */
+  #checked = false;
+  readonly #uncheck = () => {
+    this.#checked = false;
+  };
   /** When we last advanced while online: silence is only judged while we're listening. */
   #listening = Number.NaN;
   #lastT = 0;
@@ -323,10 +334,16 @@ export class EntityStore {
 
   all(kind: string): Entity[] {
     if (!this.#schemas.has(kind)) this.#unknownKind(kind);
-    this.#advance();
+    const out = this.mine(kind);
+    for (const r of this.#remote.values()) if (r.visible && r.schema.kind === kind) out.push(r.obj);
+    return out;
+  }
+
+  /** `all(kind)`'s entities we write (`mine`): the local ones, in the same order. */
+  mine(kind: string): Entity[] {
+    this.#advance(); // as `all` does: a host entity we take over in it is ours from then
     const out: Entity[] = [];
     for (const r of this.#local.values()) if (r.schema.kind === kind && !r.removed) out.push(r.obj);
-    for (const r of this.#remote.values()) if (r.visible && r.schema.kind === kind) out.push(r.obj);
     return out;
   }
 
@@ -406,7 +423,8 @@ export class EntityStore {
       g.recs.push(rec);
       if (changed) g.floor = Math.max(g.floor, rec.stampedAt);
     };
-    for (const rec of [...this.#local.values()]) {
+    // (A Map's iteration carries on past the current entry's deletion, the only change in here.)
+    for (const rec of this.#local.values()) {
       const group = rec.host ? out.host : out.own;
       const entries = group.entries;
       const hf = rec.host ? HOST : 0;
@@ -443,8 +461,8 @@ export class EntityStore {
       // Half an interval of slack so the keyframe lands on the send nearest the second mark.
       if (full) rec.nextKey = now + KEYFRAME_MS - interval / 2;
       // Did anything actually change since the last send? (A keyframe resends everything anyway.)
-      const changed = !full || encodeChanges(rec.schema, rec.values, rec.sent.slice(), false).pairs.length > 0;
-      const { pairs, discrete } = encodeChanges(rec.schema, rec.values, rec.sent, full);
+      const { pairs, discrete, changed: news } = encodeChanges(rec.schema, rec.values, rec.sent, full);
+      const changed = !full || news;
       if (pairs.length === 0 && !rec.teleport) {
         rec.unsent = false; // what was written rounds to what's already sent
         continue; // nothing new (a "still here" sample, when due, went out above)
@@ -469,6 +487,7 @@ export class EntityStore {
 
   receive(data: unknown, from: PlayerId, at: number): boolean {
     if (!isObj(data) || data.$gr !== 'u') return false;
+    this.#checked = false; // new data: the next read looks at the clock again
     if (from === this.#t.me || !Array.isArray(data.e)) return true;
     const t = typeof data.t === 'number' && Math.abs(data.t - at) <= STAMP_SLACK_MS ? data.t : at;
     let interval = 50;
@@ -568,7 +587,7 @@ export class EntityStore {
   #adopt(r: Remote, now: number): void {
     if (this.#t.hostId?.() === this.#t.me) return this.#takeOver(r, now);
     const n = this.#makeRemote(r.id, r.schema, HOST_OWNER, r.firstAt, true, r, r.buffer);
-    Object.assign(n, { visible: r.visible, readAt: r.readAt, lastSeen: now });
+    Object.assign(n, { visible: r.visible, lastSeen: now }); // read afresh: it's on the host's timeline now
     this.#remote.set(n.id, n);
   }
 
@@ -744,11 +763,16 @@ export class EntityStore {
   }
 
   #advance(): number {
+    if (!this.#checked) {
+      this.#checked = true;
+      queueMicrotask(this.#uncheck);
+    }
     const now = this.#t.now();
     if (now - this.#lastAdvance < ADVANCE_MS) return this.#lastT;
     this.#lastAdvance = now;
     this.#lastAdvanceNow = now;
     this.#times.clear();
+    this.#epoch++;
     const t = (this.#lastT = now - this.#renderDelay());
     const online = this.#t.ready?.() ?? true;
     // Coming back from our own outage (offline, or our page frozen): nobody went silent, we did.
@@ -781,7 +805,7 @@ export class EntityStore {
       if (r.removedAt !== undefined && t >= r.removedAt) {
         this.#remote.delete(r.id);
         r.values = r.buffer.read(r.removedAt); // its final state, for the remove handler
-        r.readAt = Number.POSITIVE_INFINITY;
+        r.readIn = Number.POSITIVE_INFINITY;
         if (r.visible) this.#hooks.onRemove?.(r.obj, r.reason ?? 'removed');
       }
     }
@@ -793,14 +817,16 @@ export class EntityStore {
     return t;
   }
 
-  /** Remote values are read lazily, once per frame, at the render time. */
+  /**
+   * Remote values are read lazily, once per advance (about once a frame), at its render time: a
+   * field read is a clock check and an epoch compare, and the buffer is read on the first.
+   */
   #refresh(r: Remote): void {
-    if (r.readAt === Number.POSITIVE_INFINITY) return;
-    this.#advance();
-    const t = this.#timeOf(this.#timeline(r));
-    if (r.readAt === t || r.readAt === Number.POSITIVE_INFINITY) return;
-    r.values = r.buffer.read(t);
-    r.readAt = t;
+    if (r.readIn === Number.POSITIVE_INFINITY) return;
+    if (!this.#checked) this.#advance();
+    if (r.readIn === this.#epoch || r.readIn === Number.POSITIVE_INFINITY) return; // (removed by that advance)
+    r.values = r.buffer.read(this.#timeOf(this.#timeline(r)));
+    r.readIn = this.#epoch;
   }
 
   #removeLocal(rec: Local): void {
@@ -906,7 +932,7 @@ export class EntityStore {
       visible: from !== undefined,
       lastSeen: this.#t.now(),
       ownerAway: false,
-      readAt: Number.NaN,
+      readIn: -1,
       host,
       leaveHost: false,
       slot: from?.slot ?? (undefined as unknown as Slot),

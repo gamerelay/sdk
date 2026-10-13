@@ -253,7 +253,9 @@ class Emitter<Events extends Record<string, Handler>> {
     this.#handlers[event]?.delete(handler);
   }
   protected fire<K extends keyof Events>(event: K, ...args: Parameters<Events[K]>): void {
-    for (const h of this.#handlers[event] ?? []) {
+    const handlers = this.#handlers[event];
+    if (!handlers) return;
+    for (const h of handlers) {
       try {
         (h as (...a: Parameters<Events[K]>) => void)(...args);
       } catch (err) {
@@ -1037,7 +1039,7 @@ export class GameRelay extends Emitter<RelayEvents> {
       return;
     }
     const loss = this.#opts.simulate?.loss ?? 0;
-    let items = this.#outbox.filter((m) => !(loss && m.t === 'send' && m.r === false && Math.random() < loss));
+    let items = loss ? this.#outbox.filter((m) => !(m.t === 'send' && m.r === false && Math.random() < loss)) : this.#outbox;
     this.#outbox = [];
     // The server drops a frame it can't pay for whole, so send only what the budget covers. What a
     // later message replaces goes first, newest first (those were queued with no budget, so they
@@ -1045,11 +1047,13 @@ export class GameRelay extends Emitter<RelayEvents> {
     const left = Math.max(0, Math.floor(this.#budget.left(performance.now())) - reserve);
     if (items.length > left) {
       let extra = items.length - left;
+      const dropped = new Set<number>();
       for (let i = items.length - 1; i >= 0 && extra > 0; i--) {
         if (!this.#isReplaceable(items[i]!)) continue;
-        items.splice(i, 1);
+        dropped.add(i);
         extra--;
       }
+      if (dropped.size > 0) items = items.filter((_, i) => !dropped.has(i));
       this.#outbox = this.#trim(items.slice(left), MAX_QUEUED);
       items = items.slice(0, left);
     }
@@ -1627,8 +1631,7 @@ export class Room extends Emitter<RoomEvents> {
       handle: (msg) => this.#handle(msg),
       sync: (next) => this.#sync(next),
       close: (reason, message, later) => this.#closeLocal(reason, message, later),
-      dispose: () => this.#dispose(),
-      closeLan: () => this.#lan.close(),
+      dispose: () => this.#closeLocal('replaced'),
       lanPause: () => this.#lan.pause(),
       lanPartyChanged: () => this.#lan.directChanged(),
       debugInfo: () => this.#debugInfo(),
@@ -1755,9 +1758,19 @@ export class Room extends Emitter<RoomEvents> {
       this.#stateSeen = { of: state, values: new Map(Object.entries(state)) };
       return;
     }
-    let changed = Object.keys(state).length !== seen.values.size;
-    if (!changed) for (const [k, v] of seen.values) if (state[k] !== v) changed = true;
-    if (!changed) return;
+    // One pass, no key list (60 times a second): a key we don't have, a value that's not the one we
+    // set, or fewer keys than we set.
+    let keys = 0;
+    let changed = false;
+    for (const k in state) {
+      if (!Object.hasOwn(state, k)) continue; // (a polyfill's enumerable key on Object.prototype)
+      keys++;
+      if (!seen.values.has(k) || seen.values.get(k) !== state[k]) {
+        changed = true;
+        break;
+      }
+    }
+    if (!changed && keys === seen.values.size) return;
     this.#stateSeen = { of: state, values: new Map(Object.entries(state)) };
     this.#stateWrite();
   }
@@ -2154,6 +2167,7 @@ export class Room extends Emitter<RoomEvents> {
       live: () => this.#live,
       spawn: (k, initial, o) => this.spawn(k, initial, o),
       all: (k) => this.all(k),
+      mine: (k) => this.#entities.mine(k),
       get: (id) => this.get(id),
       on: (event, k, fn) => this.on(event as 'remove', k, fn),
     });
@@ -2440,18 +2454,8 @@ export class Room extends Emitter<RoomEvents> {
     await this.#relay.request({ t: 'leave_room' }).catch(() => undefined);
   }
 
-  /** Stop this object's work without a `closed` event (it was replaced by a new one). */
-  #dispose(): void {
-    this.#closedAs ??= 'replaced';
-    this.#live = false;
-    this.#claims.close();
-    this.#requests.close();
-    this.#lan.close();
-    this.#stopLoop();
-    this.#unwatchVisibility();
-  }
-
-  #closeLocal(reason: CloseReason, message?: string, later = false): void {
+  /** Stop this object's work; `closed` fires unless it was `'replaced'` by a new object. */
+  #closeLocal(reason: CloseReason | 'replaced', message?: string, later = false): void {
     if (!this.#live) return;
     this.#closedAs = reason;
     this.#live = false;
@@ -2460,6 +2464,7 @@ export class Room extends Emitter<RoomEvents> {
     this.#lan.close();
     this.#stopLoop();
     this.#unwatchVisibility();
+    if (reason === 'replaced') return;
     // Closed now (nothing more goes out), but a handler that enters another room waits for the batch.
     if (later) queueMicrotask(() => this.fire('closed', reason, message));
     else this.fire('closed', reason, message);

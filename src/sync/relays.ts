@@ -13,6 +13,16 @@ const MAX_DELAY_MS = 10_000;
 /** A relay that hasn't answered a probe in this long is too far to help. */
 export const PROBE_MS = 1500;
 
+/**
+ * A candidate line's type (`host`, `srflx`, `relay`) and address, lowercased ('' when it has none).
+ * A peer's candidate is any JSON: one that isn't a string has neither.
+ */
+export function parseCandidate(line: unknown): [typ: string | undefined, addr: string] {
+  const parts = typeof line === 'string' ? line.split(' ') : [];
+  const i = parts.indexOf('typ');
+  return [i < 0 ? undefined : parts[i + 1], parts[4]?.toLowerCase() ?? ''];
+}
+
 const urlsOf = (s: RTCIceServer): string[] => (Array.isArray(s.urls) ? s.urls : [s.urls]);
 
 /** A relay's name: its first URL. Every player gets the same list from the server. */
@@ -137,8 +147,7 @@ async function firstCandidate(config: RTCConfiguration, typ: 'srflx' | 'relay', 
       };
       pc.onicecandidate = (ev) => {
         if (!ev.candidate) return done(null); // gathering ended without one
-        const parts = ev.candidate.candidate.split(' ');
-        if (parts[parts.indexOf('typ') + 1] === typ) done(Math.round(clock() - start));
+        if (parseCandidate(ev.candidate.candidate)[0] === typ) done(Math.round(clock() - start));
       };
       pc.setLocalDescription(offer).catch(() => done(null));
     });

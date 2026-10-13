@@ -8,6 +8,10 @@ import { Room, type GameRelay } from '../src/index';
 import type { Wrapped } from '../src/sync/lan';
 import { CREATE, control } from '../src/internal';
 
+// A room loads the peer code on demand (`load.ts`): loaded once here, so a test's few ticks are
+// enough for it, as a cached chunk is in a browser. Loading itself: `p2pLoad.test.ts`.
+await import('../src/sync/peers');
+
 const player = (id: string, slot: number): PlayerInfo => ({ id, name: id, avatar: null, joinedAt: slot, connected: true, slot });
 
 function lanRoom(me: string, hostId = 'pa', stateSeq = 0, opts: { lan?: boolean; forceRelay?: boolean; direct?: boolean; debug?: boolean; party?: string[]; request?: (m: { t: string }) => Promise<unknown> } = {}) {

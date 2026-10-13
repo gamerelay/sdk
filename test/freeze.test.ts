@@ -293,7 +293,7 @@ describe('internals out of reach', () => {
     for (const name of ['queue', 'request', 'warn', 'writeTime', 'lanWithinRate', 'lanEnabled', 'newEntityId', 'serverReady']) {
       expect({ name, there: name in relay }).toEqual({ name, there: false });
     }
-    for (const name of ['handle', 'sync', 'closeLocal', 'dispose', 'closeLan', 'lanPause', 'lanPartyChanged', 'debugInfo']) {
+    for (const name of ['handle', 'sync', 'closeLocal', 'dispose', 'lanPause', 'lanPartyChanged', 'debugInfo']) {
       expect({ name, there: name in room }).toEqual({ name, there: false });
     }
   });

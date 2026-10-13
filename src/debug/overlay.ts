@@ -16,7 +16,7 @@ export interface OverlayStats {
 
 /** The open channels' round trips, fastest to slowest (` · rtt 4–31 ms`), once any is known. */
 function lanRtt(lan: LanStats): string {
-  const ms = Object.values(lan.rttMs ?? {});
+  const ms = Object.values(lan.rttMs);
   if (ms.length === 0) return '';
   const [lo, hi] = [Math.min(...ms), Math.max(...ms)];
   return ` · rtt ${lo === hi ? lo : `${lo}–${hi}`} ms`;

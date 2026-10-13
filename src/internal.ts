@@ -60,8 +60,6 @@ export interface RoomControl {
   close(reason: 'left' | 'lost' | 'kicked' | 'closed', message?: string, later?: boolean): void;
   /** Stop without a `closed` event (a new object replaces this one). */
   dispose(): void;
-  /** The connection is closed or replaced: close the p2p channels too. */
-  closeLan(): void;
   /** The server rate-limited us: p2p copies pause too. */
   lanPause(): void;
   /** Our party changed: direct connections follow who's in it. */

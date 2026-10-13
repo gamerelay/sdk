@@ -54,6 +54,8 @@ export interface KindHost {
   live(): boolean;
   spawn(kind: string, initial: Record<string, unknown>, options?: SpawnOptions): Entity;
   all(kind: string): Entity[];
+  /** `all(kind)`'s own ones (ours to write), without making the rest. */
+  mine(kind: string): Entity[];
   get(id: string): Entity | undefined;
   on(event: 'spawn' | 'remove', kind: string, handler: (entity: Entity, reason: RemoveReason) => void): () => void;
 }
@@ -76,7 +78,7 @@ export function makeKind<F>(name: string, host: KindHost): Kind<F> {
     },
     mine() {
       check();
-      return host.all(name).filter((e) => e.mine);
+      return host.mine(name);
     },
     get(id: string) {
       check();

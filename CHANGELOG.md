@@ -4,6 +4,28 @@ Every release of `@gamerelay/sdk`, newest first. The notes under a version's hea
 GitHub release. Until 1.0, a minor version (0.x.0) may change the API; each break is listed
 here with what to change.
 
+## 0.1.0-alpha.10 (2026-10-13)
+
+- **Smaller: about 31 KB gzipped, from 35.** The WebRTC peer code (P2P connections, signalling,
+  relays) is a second file now, `gamerelay-p2p.<hash>.mjs` (about 5.5 KB gzipped), fetched when a
+  room starts with P2P on, in a browser that has WebRTC. The ESM build imports it with a literal
+  path, so your bundler includes it; the script tag loads it from next to itself (`/sdk/v0/`, jsDelivr, or your own copy: put the
+  chunk beside it), else from jsDelivr at its exact version. If it can't load (a strict
+  `script-src`, offline), the room plays over the server only, as with `p2p: false`, and says why
+  in the console. Nothing to change in your code. One thing to know: a page that pins
+  `gamerelay.js` with `integrity=` gets the chunk without a pin (its name is a hash of its
+  contents, but `import()` can't check it); use `p2p: false` if that matters.
+- **Faster reads of others' entities**: a field read no longer looks at the clock each time, only
+  once per task (and again when new data arrives), about 3.5x faster in Chrome. All the reads in
+  one frame's draw see the same moment, as they mostly did already (the timeline moved at most
+  every 4 ms); the next frame sees the next one, as before. A bot or test that moves time in one
+  synchronous loop sees new positions after `tick()`, `all()`, `get()` or new data, not from field
+  reads alone.
+- **Less work per write and send**: numbers are rounded to their precision without making a string
+  (about 10x faster, the same values), a `'value'` field is checked with one `JSON.stringify`, and
+  a keyframe is encoded once; `kind.mine()`, a stale player's input, and the per-frame state check
+  allocate less.
+
 ## 0.1.0-alpha.9 (2026-10-11)
 
 - **`relay.joinOrCreate({ maxPlayers, tag, private, updateUrl })` is stable** (part of the `v0`

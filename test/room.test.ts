@@ -274,6 +274,38 @@ describe('host controls', () => {
   });
 });
 
+describe('writing to room.state directly', () => {
+  const guest = () => makeRoom('pb', { hostId: 'pa', players: [player('pa', 0), player('pb', 1)], state: { lap: 1, score: 0 } });
+
+  test('a change, a new key, or one gone is noticed once a frame, and warned about', () => {
+    for (const write of [
+      (s: Record<string, unknown>) => (s.lap = 2),
+      (s: Record<string, unknown>) => (s.extra = true),
+      (s: Record<string, unknown>) => delete s.score,
+      (s: Record<string, unknown>) => (delete s.score, (s.other = 0)), // as many keys as before
+    ]) {
+      const { room, warned, step } = guest();
+      step();
+      expect(warned).toEqual([]);
+      write(room.state as Record<string, unknown>);
+      step();
+      expect(warned).toEqual(['state_write']);
+    }
+  });
+
+  test('a key inherited from Object.prototype (an old polyfill) is not taken for a write', () => {
+    Object.defineProperty(Object.prototype, 'polyfilled', { value: 1, enumerable: true, configurable: true });
+    try {
+      const { warned, step } = guest();
+      step();
+      step();
+      expect(warned).toEqual([]);
+    } finally {
+      delete (Object.prototype as Record<string, unknown>).polyfilled;
+    }
+  });
+});
+
 describe('a closed room (SDK review, 2026-10-09)', () => {
   const two = (me: string) => makeRoom(me, { hostId: 'pa', players: [player('pa', 0), player('pb', 1)] });
 
@@ -351,6 +383,15 @@ describe('a closed room (SDK review, 2026-10-09)', () => {
       room.send(1);
       expect(messages.at(-1)).toContain(why);
     }
+  });
+
+  test('a room replaced by a new object stops without a closed event', () => {
+    const { room } = two('pa');
+    const closed: string[] = [];
+    room.on('closed', (reason) => closed.push(reason));
+    control(room).dispose();
+    control(room).close('lost'); // already stopped: nothing more
+    expect(closed).toEqual([]);
   });
 
   test('the SDK’s own sends after a close are dropped quietly: the warning is only for the game’s calls', () => {

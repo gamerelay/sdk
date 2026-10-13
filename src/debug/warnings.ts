@@ -20,10 +20,7 @@ export type WarningKind =
   /** Reliable messages dropped: too many waited to go out. */
   | 'queue_full';
 
-/**
- * Every warning the SDK can print, and the llms.txt section that explains its fix. Typed
- * explicitly (not `as const`) so JSR can document it without inferring.
- */
+/** Every warning the SDK can print, and the llms.txt section that explains its fix. */
 export const SECTIONS: Readonly<Record<WarningKind, string>> = {
   worker: 'relay.tick: the game loop',
   rate_limited: 'Rules and limits',

@@ -77,6 +77,8 @@ describe('Inputs', () => {
     s.stop('pb'); // its page froze
     s.run(600);
     expect(s.a.get('pb')).toEqual({ left: false, ax: 0, name: 'x' });
+    // The same object each call (a host loop reads every player every tick: #28).
+    expect(s.a.get('pb')).toBe(s.a.get('pb'));
   });
 
   test('an unchanged input repeats every 200 ms so it never goes stale', () => {

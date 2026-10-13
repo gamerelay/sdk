@@ -96,6 +96,40 @@ test('precision must be a finite number above 0', () => {
   }
 });
 
+test('roundTo without strings gives what toFixed gave, for any value and precision (#25)', () => {
+  // The rounding as it was (alpha.9): a string per number. Kept here as the reference.
+  const before = (value: number, precision: number, d = decimalsOf(precision)): number => {
+    const snapped = Math.round(value / precision) * precision;
+    const rounded = d < 0 ? snapped : Number(snapped.toFixed(d));
+    return Number.isFinite(rounded) ? rounded : value;
+  };
+  let seed = 7;
+  const random = () => ((seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) / 2 ** 32);
+  const precisions = [1, 0.5, 0.25, 0.125, 0.1, 0.05, 0.01, 0.001, 1e-4, 1e-7, 1e-12, 2, 5, 10, 100, 0.3, 0.7, 1 / 3, 1e-20, 1e-22];
+  const values = [0, -0, 0.5, -0.5, 1.5, -1.5, 2.5, 0.1 + 0.2, 1e15, -1e15, 2 ** 53, 9007199254740.991, 1e21, -1e21, 1e300, Number.MAX_VALUE, -Number.MAX_VALUE, 5e-324];
+  const bad: string[] = [];
+  const check = (v: number, p: number) => {
+    const [got, want] = [roundTo(v, p), before(v, p)];
+    if (!Object.is(got, want) && !(got === 0 && want === 0) && bad.length < 5) bad.push(`roundTo(${v}, ${p}) = ${got}, was ${want}`);
+  };
+  // Precisions only near a short decimal (computed ones, or a hair off), with values large enough
+  // for the difference to show (review of #25).
+  const near = [1.1 - 1, 2.3 - 2.2, 0.1 * (1 + 5e-10), 0.01 * (1 + 5e-10), 0.5 * (1 + 5e-10), 1 * (1 + 5e-10), 10 * (1 + 5e-10)];
+  for (const p of near) {
+    for (const v of [-65928886901906.5, 5e13, -5e13, 1.4e13, 1e8, -1e8, 123456789.25]) check(v, p);
+    for (let i = 0; i < 20_000; i++) check((random() * 2 - 1) * 10 ** Math.floor(random() * 15), p);
+  }
+  for (const p of precisions) {
+    for (const v of values) check(v, p);
+    for (let i = 0; i < 20_000; i++) {
+      const scale = 10 ** Math.floor(random() * 12 - 4);
+      check((random() * 2 - 1) * scale, p);
+      check(Math.round(random() * 1000) * p + p / 2, p); // exactly halfway between two steps
+    }
+  }
+  expect(bad).toEqual([]);
+});
+
 describe('encodeChanges / decodeChanges', () => {
   test('first time sends everything; then only what changed', () => {
     const s = ship();
@@ -112,8 +146,13 @@ describe('encodeChanges / decodeChanges', () => {
     values[4] = { k: 1 }; // equal JSON, new object
     expect(encodeChanges(s, values, sent, false).pairs).toEqual([]);
     values[2] = false;
-    expect(encodeChanges(s, values, sent, false)).toEqual({ pairs: [2, false], discrete: true });
-    expect(encodeChanges(s, values, sent, true).pairs.length).toBe(10);
+    expect(encodeChanges(s, values, sent, false)).toEqual({ pairs: [2, false], discrete: true, changed: true });
+    // A keyframe sends every field, and says whether any was news (one pass, #25).
+    expect(encodeChanges(s, values, sent, true)).toMatchObject({ changed: false });
+    values[2] = true;
+    const key = encodeChanges(s, values, sent, true);
+    expect(key).toMatchObject({ changed: true, discrete: true });
+    expect(key.pairs.length).toBe(10);
   });
 
   test('decode gives a sparse array, or null when malformed', () => {
