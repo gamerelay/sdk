@@ -19,6 +19,17 @@ export function chatLength(text: string): number {
   return n;
 }
 
+/**
+ * Characters that turn text into HTML: tags (`<`, `>`) and quoted or template attributes (`"`,
+ * `` ` ``). Taken out of names others see (player and room names) on every plan, so a name can't
+ * add a tag or break out of a double-quoted attribute in a game that renders it with `innerHTML`.
+ * Single-quoted and unquoted attributes, URLs and scripts still need escaping (`escapeHtml`).
+ * `'` and `&` stay: O'Brien is a name, and `&` is only text without `<`. Chat keeps them ("<3",
+ * "->"): games render chat as text.
+ */
+export const MARKUP = /[<>"`]/g;
+export const stripMarkup = (text: string): string => text.replace(MARKUP, '');
+
 export type ChatCheck = { ok: true; text: string } | { ok: false; reason: 'empty' | 'too_long' };
 
 /** Single line, whitespace collapsed, controls stripped, 1..maxChatLength characters. */

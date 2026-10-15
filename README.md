@@ -10,7 +10,7 @@ Multiplayer for browser games, without writing a server. You declare what exists
 and who owns it; the SDK sends it, smooths it for everyone else, gives it to players who join
 late, and hands the host's share to another player when the host leaves. Rooms, quick match,
 invite links, parties, chat, saved player data and leaderboards come with it. Zero dependencies,
-fully typed, about 31 KB gzipped.
+fully typed, about 32 KB gzipped.
 
 **Docs:** [gamerelay.io/docs](https://gamerelay.io/docs) · **Guide for AI tools:**
 [gamerelay.io/llms.txt](https://gamerelay.io/llms.txt) (also in this package as `llms.txt`) ·
@@ -96,7 +96,7 @@ it (`?join=`). `createRoom({ linkOnly: true })` makes a room that only its link 
 
 `https://gamerelay.io/sdk/v0/gamerelay.js` (and `.mjs`) is the `v0` line and updates in place;
 `/sdk/gamerelay.js` is the same line, forever. To pin one exact version, load it from npm through
-jsDelivr: `https://cdn.jsdelivr.net/npm/@gamerelay/sdk@0.1.0-alpha.11/gamerelay.js`. Until the SDK
+jsDelivr: `https://cdn.jsdelivr.net/npm/@gamerelay/sdk@0.1.0-alpha.12/gamerelay.js`. Until the SDK
 reaches 1.0, a pinned alpha may be asked to update: new server features can need the newest alpha,
 and old alphas stop being accepted sooner than they will after 1.0.
 `GameRelay.version` is the running version. The server may print a notice in the console

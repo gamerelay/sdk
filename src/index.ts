@@ -31,8 +31,11 @@ import {
   type RoomInfo,
   type ServerMessage,
   type BotSpec,
+  type ModerationCharset,
+  type ModerationReason,
+  type ModerationVerdict,
 } from '@gamerelay/protocol/types';
-import { GameRelayError, type GameRelayErrorCode } from './errors';
+import { GameRelayError, GameRelayModerationError, type GameRelayErrorCode } from './errors';
 import { CREATE, DEBUG, defaults, relays, rooms, type Outgoing, type RelayLink, type Request, type RoomControl, type RoomDebugInfo } from './internal';
 import { Ticker, pickScheduler } from './core/ticker';
 import { fitsUtf8, utf8Length } from '@gamerelay/protocol/bytes';
@@ -56,7 +59,7 @@ import { Lan, isSignal, isWrapped } from './sync/lan';
 import type { BotAdapter, Bots } from './sync/bots';
 import { loadBots } from './sync/loadBots';
 
-export { GameRelayError };
+export { GameRelayError, GameRelayModerationError };
 export type { GameRelayErrorCode };
 export type { Entity, EntityBase, RemoveReason, DefineOptions, SpawnOptions } from './sync/entities';
 export type { Kind, KindEntity, FieldValues } from './sync/kind';
@@ -80,6 +83,8 @@ export type {
   LeaderboardSubmitResult,
   LeaveReason,
   PartyMember,
+  ModerationCharset,
+  ModerationReason,
 };
 
 /** What `POST /v1/auth/token` (and `/v1/auth/anonymous`) answer with; `getToken` may return it whole. */
@@ -200,6 +205,31 @@ export interface RoomListingInfo {
   meta: Json | null;
 }
 
+/** `relay.moderate(text, options)`. All optional. */
+export interface ModerateOptions {
+  /** What the text is: a name (the default, and the only kind for now). */
+  type?: 'name';
+  /** Stricter than the game's own rules only, never looser: they come from the browser. */
+  minLength?: number;
+  maxLength?: number;
+  charset?: ModerationCharset;
+  /** Resolve with the text itself, and reject with the `GameRelayModerationError` instead of returning it. */
+  throwOnError?: boolean;
+}
+
+/** `GameRelay.moderate(text, options)`, before connecting: over HTTP, with your public key. */
+export interface StaticModerateOptions extends ModerateOptions {
+  publicKey: string;
+  /** Server origin. Defaults to the origin the SDK script was loaded from, else https://gamerelay.io */
+  url?: string;
+}
+
+/**
+ * What `relay.moderate()` resolves with: `value` is the text as the server would use it (trimmed,
+ * control and invisible characters out), or `error` says why it was refused.
+ */
+export type ModerationResult = { ok: true; value: string; error?: undefined } | { ok: false; value?: undefined; error: GameRelayModerationError };
+
 export interface SendOptions {
   /** Send to one player only. */
   to?: PlayerId;
@@ -225,6 +255,7 @@ const ROOM_EVENTS = new Set<string>([
   'released',
   'access',
   'listing',
+  'player_renamed',
 ]);
 /** Names models guess for built-in room events: listening to one is legal, but only room.emit fires it. */
 const EVENT_ALIASES: Record<string, string> = {
@@ -233,6 +264,7 @@ const EVENT_ALIASES: Record<string, string> = {
   hostChanged: 'host_changed', host_change: 'host_changed', newHost: 'host_changed',
   stateChanged: 'state', state_changed: 'state', stateChange: 'state',
   playerDisconnected: 'player_disconnected', playerReconnected: 'player_reconnected',
+  playerRenamed: 'player_renamed', player_rename: 'player_renamed', renamed: 'player_renamed', nameChanged: 'player_renamed',
   becameHost: 'host', onHost: 'host', host_gained: 'host',
 };
 const ALIAS_WHAT: Record<string, string> = {
@@ -242,6 +274,7 @@ const ALIAS_WHAT: Record<string, string> = {
   state: 'a state change',
   player_disconnected: 'a player dropping',
   player_reconnected: 'a player coming back',
+  player_renamed: 'a player renaming themselves',
   host: 'becoming the host',
 };
 type CustomHandler = (data: Json, from: PlayerId, meta: MessageMeta) => void;
@@ -325,6 +358,8 @@ export type RoomEvents = {
   access: (access: RoomAccess, from: PlayerId) => void;
   /** The host changed what room lists show (`room.setListing`): you included. */
   listing: (listing: RoomListingInfo, from: PlayerId) => void;
+  /** A player renamed themselves (`relay.setName`): you included. `room.players` has the new name. */
+  player_renamed: (playerId: PlayerId, name: string) => void;
 };
 
 interface Pending {
@@ -333,7 +368,12 @@ interface Pending {
   timer: ReturnType<typeof setTimeout>;
   /** A ping's `ts`: its pong carries that, not the rid. */
   ts?: number;
+  /** The request's type (`message.t`). */
+  t: string;
 }
+
+/** Requests with a small limit of their own: refused for it, the connection isn't sending too fast. */
+const OWN_LIMIT = new Set(['moderate', 'set_name']);
 
 
 /** Stay under the server's 16 KB message limit, with room for the batch wrapper and signature. */
@@ -366,6 +406,42 @@ function authCode(status: number, error: string | undefined): GameRelayErrorCode
   if (status === 400) return 'bad_request';
   return 'disconnected';
 }
+
+/** The error code for a failed `POST /v1/moderate`: the server's own where the SDK knows it, else as a token request's. */
+function moderateCode(status: number, error: string | undefined): GameRelayErrorCode {
+  if (error === 'plan_required' || error === 'bad_request') return error;
+  return authCode(status, error);
+}
+
+/** `POST /v1/moderate` with a public key: the verdict, or a `GameRelayError` for anything that isn't about the text. */
+async function moderateOverHttp(base: string, publicKey: string, text: string, options: ModerateOptions): Promise<ModerationVerdict> {
+  if (publicKey.startsWith('gr_sk_')) throw secretKey();
+  const { type, minLength, maxLength, charset } = options;
+  let res: Response;
+  try {
+    res = await fetch(`${base}/v1/moderate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ publicKey, text, type, minLength, maxLength, charset }),
+    });
+  } catch (err) {
+    throw new GameRelayError('disconnected', `Can't reach ${base}: are you online?`, { cause: err });
+  }
+  const parsed: unknown = await res.json().catch(() => null);
+  const body = (parsed && typeof parsed === 'object' ? parsed : {}) as Partial<ModerationVerdict> & { error?: unknown; message?: string };
+  if (res.ok && typeof body.ok === 'boolean') return body as ModerationVerdict;
+  throw new GameRelayError(moderateCode(res.status, typeof body.error === 'string' ? body.error : undefined), body.message ?? `Moderation failed (${res.status})`);
+}
+
+/** A verdict as `moderate()` hands it back: a result, or with `throwOnError` the text (or a rejection). */
+function moderationResult(verdict: ModerationVerdict, text: string, options: ModerateOptions): ModerationResult | string {
+  if (verdict.ok) return options.throwOnError ? verdict.value : { ok: true, value: verdict.value };
+  const error = new GameRelayModerationError(verdict.error.reason, verdict.error.message, text, options.type ?? 'name');
+  if (options.throwOnError) throw error;
+  return { ok: false, error };
+}
+
+const HTML_ESCAPES: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 
 /** How often the connection's upkeep runs (`#watch`). */
 const WATCH_MS = 1000;
@@ -442,6 +518,13 @@ export class GameRelay extends Emitter<RelayEvents> {
   #party: PartyInfo | null = null;
   #features = Object.fromEntries(PLAN_FEATURES.map((f) => [f, false])) as unknown as PlanFeatures;
   #serverInfo: ServerInfo = { version: null };
+  /** The name the server gave this connection (`welcome`), and why it swapped the one asked for, if it did. */
+  #givenName = '';
+  #givenRejected: ModerationReason | null = null;
+  /** The name `setName` set: asked for again on each reconnect, as the token still carries the old one. */
+  #renamed: string | null = null;
+  /** Why that name was refused when asked for again, until the next `setName`. */
+  #renameRefused: ModerationReason | null = null;
 
   /** This SDK's version, e.g. `0.1.0-alpha.6`. */
   static readonly version: string = SDK_VERSION;
@@ -451,6 +534,40 @@ export class GameRelay extends Emitter<RelayEvents> {
    * sequence. `const rand = GameRelay.seededRandom(room.seed)`; `rand()` is in [0, 1).
    */
   static readonly seededRandom: (seed: number) => () => number = seededRandom;
+
+  /**
+   * `relay.moderate()` before connecting (a name screen), over HTTP with your public key. Your page
+   * has to be in the game's allowed origins, and each network address gets 30 checks a minute.
+   */
+  static moderate(text: string, options: StaticModerateOptions & { throwOnError: true }): Promise<string>;
+  static moderate(text: string, options: StaticModerateOptions & { throwOnError?: false }): Promise<ModerationResult>;
+  static moderate(text: string, options: StaticModerateOptions): Promise<ModerationResult | string>;
+  static async moderate(text: string, options: StaticModerateOptions): Promise<ModerationResult | string> {
+    if (!options?.publicKey) throw new GameRelayError('bad_request', 'GameRelay.moderate needs { publicKey } (your gr_pub_ key)');
+    const base = (options.url ?? defaults.url).replace(/\/$/, '');
+    return moderationResult(await moderateOverHttp(base, options.publicKey, text, options), text, options);
+  }
+
+  /**
+   * `text` with `& < > " '` escaped, for putting a player's text into an HTML string:
+   * `` `<li>${GameRelay.escapeHtml(e.name)}</li>` ``. (`textContent` needs no escaping.)
+   */
+  static escapeHtml(text: string): string {
+    return String(text).replace(/[&<>"']/g, (c) => HTML_ESCAPES[c]!);
+  }
+
+  /** Your name, as other players see it: the one you connected with, the server's swap for it, or `setName`'s. */
+  get playerName(): string {
+    return this.#renamed ?? this.#givenName;
+  }
+
+  /**
+   * Why the server swapped your name when you connected (the game moderates names, and it failed:
+   * a `ModerationReason`), or null. `playerName` is the name it gave you.
+   */
+  get nameRejected(): ModerationReason | null {
+    return this.#renamed === null ? (this.#renameRefused ?? this.#givenRejected) : null;
+  }
 
   /** Your player id (stable across reloads of the same tab for anonymous players). */
   get playerId(): PlayerId {
@@ -482,6 +599,41 @@ export class GameRelay extends Emitter<RelayEvents> {
    */
   get serverInfo(): Readonly<ServerInfo> {
     return this.#serverInfo;
+  }
+
+  /**
+   * Check a text before your game uses it (a name field, a plate). A refused text isn't an error:
+   * it resolves `{ ok: false, error }`, where `error.message` is fine to show the player. With
+   * `throwOnError: true` it resolves with the text and rejects with the `GameRelayModerationError`.
+   * Anything that isn't about the text rejects either way (`plan_required`, `rate_limited`,
+   * `disconnected`). Over the socket; while it's down, over HTTP with your public key.
+   */
+  moderate(text: string, options: ModerateOptions & { throwOnError: true }): Promise<string>;
+  moderate(text: string, options?: ModerateOptions & { throwOnError?: false }): Promise<ModerationResult>;
+  moderate(text: string, options: ModerateOptions): Promise<ModerationResult | string>;
+  async moderate(text: string, options: ModerateOptions = {}): Promise<ModerationResult | string> {
+    const { type, minLength, maxLength, charset } = options;
+    const verdict =
+      !this.connected && this.#opts.publicKey
+        ? await moderateOverHttp(this.#base, this.#opts.publicKey, text, options)
+        : ((await this.#request({ t: 'moderate', text, type, minLength, maxLength, charset })) as ModerationVerdict);
+    return moderationResult(verdict, text, options);
+  }
+
+  /**
+   * Rename yourself, live: your room and party get `player_renamed` (a `party` update), and your
+   * next scores carry the new name. It's cleaned as a connect's `playerName` is (no `< > " \``, at
+   * most 24 characters). With the game's "Name moderation" on, a failing name rejects with a
+   * `GameRelayModerationError`. Resolves with the name as others see it. A few changes a minute.
+   */
+  async setName(name: string): Promise<string> {
+    const data = await this.#request({ t: 'set_name', name: String(name) }).catch((err: unknown) => {
+      throw err instanceof GameRelayModerationError ? new GameRelayModerationError(err.reason, err.message, String(name)) : err;
+    });
+    const given = (data as { name?: unknown } | undefined)?.name;
+    this.#renamed = typeof given === 'string' ? given : String(name);
+    this.#renameRefused = null;
+    return this.#renamed;
   }
 
   /** Per-player persisted key/value data. */
@@ -936,7 +1088,7 @@ export class GameRelay extends Emitter<RelayEvents> {
       }, REPLY_TIMEOUT_MS);
       // `ping` is answered by `ts` (a pong), everything else by `rid`; errors carry the rid for both.
       const ts = message.t === 'ping' ? Number(message.ts) : undefined;
-      this.#pending.set(rid, { resolve, reject, timer, ts });
+      this.#pending.set(rid, { resolve, reject, timer, ts, t: message.t });
       if (ts !== undefined) this.#pongs.set(ts, rid);
       this.#raw({ ...message, v: V, rid });
     });
@@ -1325,6 +1477,9 @@ export class GameRelay extends Emitter<RelayEvents> {
           // An older server sends no features: everything stays off.
           if (msg.features) this.#features = Object.freeze({ ...this.#features, ...msg.features });
           this.#serverInfo = Object.freeze({ version: msg.server ?? null });
+          // (An older server doesn't say: the name asked for, as it would have been.)
+          this.#givenName = msg.name ?? this.#opts.playerName ?? '';
+          this.#givenRejected = msg.nameRejected ?? null;
           if (Array.isArray(msg.notices)) for (const notice of msg.notices) this.#notice(notice);
           this.#frameKey = key;
           // A rough clock until the pings below (and any the game sends) refine it. The old samples
@@ -1416,6 +1571,21 @@ export class GameRelay extends Emitter<RelayEvents> {
       return err.code !== 'disconnected' && err.code !== 'timeout';
     };
     try {
+      // The token still carries the name from before `setName`: ask for that one again, first, so
+      // the party and room hear it as we get back in. Refused now (the owner's rules changed), the
+      // server's name stands.
+      const renamed = this.#renamed;
+      if (renamed !== null && renamed !== this.#givenName) {
+        await this.#request({ t: 'set_name', name: renamed }).then(
+          (data) => (this.#renamed = String((data as { name?: Json } | undefined)?.name ?? renamed)),
+          (err: GameRelayError) => {
+            if (err instanceof GameRelayModerationError) {
+              this.#renamed = null;
+              this.#renameRefused = err.reason;
+            } else gone(err); // (a timeout: the server never answered, so try again on a new socket)
+          },
+        );
+      }
       const party = this.#party;
       if (party) await this.#request({ t: 'party_join', code: party.code }).catch((err) => gone(err) && this.#setParty(null));
       const room = this.#room;
@@ -1509,6 +1679,13 @@ export class GameRelay extends Emitter<RelayEvents> {
         this.#seat(msg);
         this.#roomControl()?.handle(msg);
         return;
+      case 'player_renamed': {
+        // Before its Room exists, the Room is made from `#lastRoomInfo` (as `#seat`).
+        const info = this.#lastRoomInfo;
+        if (info && this.#room?.id !== info.id) info.players = info.players.map((p) => (p.id === msg.playerId ? { ...p, name: msg.name } : p));
+        this.#roomControl()?.handle(msg);
+        return;
+      }
       case 'welcome':
         return;
       case 'reply':
@@ -1518,8 +1695,8 @@ export class GameRelay extends Emitter<RelayEvents> {
         this.#settle(this.#pongs.get(msg.ts) ?? 0, (p) => p.resolve(msg.serverTime));
         return;
       case 'error': {
-        const err = new GameRelayError(msg.code, msg.message);
-        if (msg.code === 'rate_limited') {
+        const err = msg.code === 'moderated' ? new GameRelayModerationError(msg.reason ?? 'blocked', msg.message, '') : new GameRelayError(msg.code, msg.message);
+        if (msg.code === 'rate_limited' && !OWN_LIMIT.has(this.#pending.get(msg.rid ?? -1)?.t ?? '')) {
           this.#warn('rate_limited', 'rate_limited', 'the server dropped messages: this player sent more than 120 per second; send less often (check emit and setState rates)');
           this.#roomControl()?.lanPause();
         }
@@ -2649,6 +2826,8 @@ export class Room extends Emitter<RoomEvents> {
     for (const p of info.players) {
       const was = before.get(p.id)?.connected ?? true;
       if (was !== p.connected) this.fire(p.connected ? 'player_reconnected' : 'player_disconnected', p.id);
+      const name = before.get(p.id)?.name;
+      if (name !== undefined && name !== p.name) this.fire('player_renamed', p.id, p.name);
     }
     this.#health.resend();
     // Host controls that changed while we were away.
@@ -2712,6 +2891,9 @@ export class Room extends Emitter<RoomEvents> {
         this.#players = frozen(this.#players.map((p) => (p.id === msg.playerId ? { ...p, connected } : p)));
         return this.fire(msg.t, msg.playerId);
       }
+      case 'player_renamed':
+        this.#players = frozen(this.#players.map((p) => (p.id === msg.playerId ? { ...p, name: msg.name } : p)));
+        return this.fire('player_renamed', msg.playerId, msg.name);
       case 'host_changed':
         this.#explainHostMoved(msg.hostId);
         return this.#hostMoved(msg.hostId, msg.previousHostId);

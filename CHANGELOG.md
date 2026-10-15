@@ -4,6 +4,29 @@ Every release of `@gamerelay/sdk`, newest first. The notes under a version's hea
 GitHub release. Until 1.0, a minor version (0.x.0) may change the API; each break is listed
 here with what to change.
 
+## 0.1.0-alpha.12 (2026-10-15)
+
+- **Name moderation** (plans with `nameModeration`; guide: https://gamerelay.io/guides/moderation).
+  `relay.moderate(text, options?)` checks a text before your game uses it and resolves
+  `{ ok: true, value }` or `{ ok: false, error }`, where `error` is the new
+  `GameRelayModerationError` (a `GameRelayError` with code `moderated`, plus `reason`, `text` and
+  `type`). With `{ throwOnError: true }` it resolves with the text and rejects with that error.
+  What isn't about the text (`plan_required`, `rate_limited`, `disconnected`) rejects either way.
+  Options are optional and only tighten: `maxLength`, `minLength`, `charset`. It goes over the
+  socket, or over HTTP while that's down if you connected with a `publicKey` (with `getToken` it
+  rejects `disconnected` then); `GameRelay.moderate(text, { publicKey })` is the same check before
+  connecting.
+- **`relay.setName(name)`**, on every plan: rename yourself live. Your room hears the new room event
+  `player_renamed` (`room.players` has the name), your party gets a `party` update, your next
+  scores carry it, and the SDK asks for it again after a reconnect. With the game's "Name
+  moderation" on, a failing name rejects with a `GameRelayModerationError`.
+- **`relay.playerName`** (your name as others see it) and **`relay.nameRejected`** (why the server
+  swapped the name you connected with, or null).
+- **`GameRelay.escapeHtml(text)`**, for games that build HTML strings from what players type.
+- About 0.9 KB gzipped more (32.2 KB). Nothing to change in your code; `player_renamed` and the
+  name fields need a server from 2026-10-15 (an older one sends neither: `playerName` is then the
+  `playerName` you connected with, or `''` with `getToken`).
+
 ## 0.1.0-alpha.11 (2026-10-14)
 
 - **Bots: test players an AI assistant adds.** `room.bots({ join?, leave?, observe, drive })` tells
