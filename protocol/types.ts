@@ -263,7 +263,16 @@ export interface TransferHostMsg extends Base<'transfer_host'> {
   rid: number;
   playerId: PlayerId;
 }
-export type RoomRequestMessage = KickMsg | SetAccessMsg | SetListingMsg | TransferHostMsg;
+export interface BotLogLine {
+  level: 'info' | 'warn';
+  text: string;
+}
+/** A bot host's lines from a bot's brain (`log()`, errors): they go into the instance logs. Host only. */
+export interface BotLogMsg extends Base<'bot_log'> {
+  bot: string;
+  lines: BotLogLine[];
+}
+export type RoomRequestMessage = KickMsg | SetAccessMsg | SetListingMsg | TransferHostMsg | BotLogMsg;
 
 /** Messages handled by the server / lobby layer. `rid` correlates replies. */
 export interface CreateRoomMsg extends Base<'create_room'> {
@@ -542,6 +551,20 @@ export interface NoticeMsg extends Base<'notice'> {
   notice: Notice;
 }
 
+/** A bot in a room (BOTS.md): played by the room's host, its brain run by a bot host. */
+export interface BotSpec {
+  id: string;
+  name: string;
+  /** The brain's source: one function, `(view, memory) => action`. */
+  brain: string;
+  /** Bumped by each update_bot, even with the same brain: the bot host reloads it (memory starts over, a halted bot restarts). */
+  rev: number;
+}
+/** The room's bots, all of them, sent to the host when it has the `bots` cap: on any change and when it becomes host. */
+export interface BotsMsg extends Base<'bots'> {
+  bots: BotSpec[];
+}
+
 export type ServerMessage =
   | WelcomeMsg
   | ReplyMsg
@@ -564,6 +587,7 @@ export type ServerMessage =
   | PongMsg
   | ServerRestartingMsg
   | NoticeMsg
+  | BotsMsg
   | PartyMsg
   | PartyRoomMsg
   | RemovedMsg

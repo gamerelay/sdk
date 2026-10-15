@@ -41,7 +41,9 @@ creating an instance for your game. It's safe to ship in client code.
 import { GameRelay } from '@gamerelay/sdk';
 
 const relay = await GameRelay.connect({ publicKey: 'gr_pub_…', playerName: 'ada' });
-const room = await relay.quickMatch({ maxPlayers: 4 }); // or createRoom() / joinRoom('K7QM')
+// An invite link's room, else anyone's (or createRoom() / joinRoom('K7QM')).
+const room = (await relay.joinInvite().catch(() => null)) ?? (await relay.quickMatch({ maxPlayers: 4 }));
+history.replaceState(null, '', room.inviteUrl()); // the address bar invites, and a reload comes back
 
 // Anything that moves is an entity. You write yours; everyone sees everyone's, smoothed.
 const ships = room.define('ship', { x: 'number', y: 'number' });
@@ -94,7 +96,7 @@ it (`?join=`). `createRoom({ linkOnly: true })` makes a room that only its link 
 
 `https://gamerelay.io/sdk/v0/gamerelay.js` (and `.mjs`) is the `v0` line and updates in place;
 `/sdk/gamerelay.js` is the same line, forever. To pin one exact version, load it from npm through
-jsDelivr: `https://cdn.jsdelivr.net/npm/@gamerelay/sdk@0.1.0-alpha.10/gamerelay.js`. Until the SDK
+jsDelivr: `https://cdn.jsdelivr.net/npm/@gamerelay/sdk@0.1.0-alpha.11/gamerelay.js`. Until the SDK
 reaches 1.0, a pinned alpha may be asked to update: new server features can need the newest alpha,
 and old alphas stop being accepted sooner than they will after 1.0.
 `GameRelay.version` is the running version. The server may print a notice in the console

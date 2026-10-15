@@ -117,6 +117,7 @@ test('the Debugging section lists every warning in the catalog', () => {
     'claims; release',
     'sent more than 120 per second',
     'fell back to setInterval',
+    'the host role moved to',
     'names the llms.txt section',
   ]) {
     expect(debugging).toContain(phrase);

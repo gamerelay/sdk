@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import { chunkBases } from '../src/sync/chunkBase';
 
-const V = '0.1.0-alpha.10';
+const V = '0.1.0-alpha.11';
 const JSDELIVR = `https://cdn.jsdelivr.net/npm/@gamerelay/sdk@${V}/`;
 const NAME = 'gamerelay-p2p.0123456789ab.mjs';
 const at = (src: string | undefined) => chunkBases(src, V).map((base) => new URL(NAME, base).href);

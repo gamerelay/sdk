@@ -3,7 +3,7 @@
  * exported by the package (only `index.ts` is), so a page can't call it, and a model guessing names
  * can't find it. Tests import it directly.
  */
-import type { Json, PartyInfo, PlayerId, RoomClientMessage, RoomInfo, ServerMessage } from '@gamerelay/protocol/types';
+import type { BotLogMsg, Json, PartyInfo, PlayerId, RoomClientMessage, RoomInfo, ServerMessage } from '@gamerelay/protocol/types';
 import type { WarningKind } from './debug/warnings';
 import type { LanStats } from './sync/lan';
 
@@ -28,7 +28,13 @@ export interface RelayLink {
   readonly lanDirect: 'party' | null;
   /** `debug` was set: P2P status lines go to the console too (failures always do). */
   readonly debug: boolean;
+  /** `botHost`: this tab runs its room's bots while it hosts (and said so with the `bots` cap). */
+  readonly botHost: boolean;
   queue(message: Outgoing): void;
+  /** Sent on its own now (it can't be batched, and gets no reply). False if not: offline, or the send budget is spent. */
+  post(message: Omit<BotLogMsg, 'v'>): boolean;
+  /** For tests: how the bots' code is fetched. Default: `loadBots`. */
+  loadBots?(): Promise<typeof import('./sync/bots')>;
   request(message: Request): Promise<Json | undefined>;
   now(): number;
   /** The server-clock moment of the running `tick` step, else now. */

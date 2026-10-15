@@ -1,7 +1,9 @@
 /**
- * Build the SDK's browser files: the P2P chunk (`src/sync/peers.ts`, loaded on demand) first, named
- * by a hash of its contents, then the ESM build (`gamerelay.mjs`) and the script-tag build
- * (`gamerelay.js`), each with `src/sync/load.ts` swapped for a loader of that chunk:
+ * Build the SDK's browser files: the chunks loaded on demand first (`CHUNKS`: the P2P peer code,
+ * `src/sync/peers.ts`, and the bots' code, `src/sync/bots.ts`), each named by a hash of its
+ * contents, then the ESM build (`gamerelay.mjs`) and the script-tag build (`gamerelay.js`), each with
+ * every chunk's source loader (`src/sync/load.ts`, `src/sync/loadBots.ts`) swapped for a loader of
+ * that chunk:
  *
  * - ESM: `import('./gamerelay-p2p.<hash>.mjs')`, a literal path, so a game's bundler (Vite, webpack,
  *   esbuild, Rollup) copies the chunk and splits it as its own.
@@ -11,7 +13,7 @@
  *
  * Named by contents, not by version: `/sdk/v0/` gets fixes between releases, and a page holding a
  * cached main file must never get a newer chunk (their internal interface can change). An old one
- * asks for a chunk that's gone, and that page plays without P2P, as when the chunk is blocked.
+ * asks for a chunk that's gone, and that page plays without P2P (or bots), as when the chunk is blocked.
  *
  *   bun scripts/build.ts                 # into dist/ (what `bun run build` runs)
  *   bun scripts/build.ts --out DIR       # somewhere else
@@ -22,7 +24,7 @@
  */
 import type { BunPlugin } from 'bun';
 import { mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { CHUNK_NAME } from '../src/sync/chunkBase';
 
 const root = join(import.meta.dir, '..');
@@ -33,53 +35,58 @@ export interface SdkFiles {
   'gamerelay.mjs': string;
   /** The script-tag (IIFE) build. */
   'gamerelay.js': string;
-  /** The P2P chunk's file name (`gamerelay-p2p.<hash>.mjs`) and its code. */
-  chunk: { name: string; code: string };
+  /** Each chunk's file name (`gamerelay-<id>.<hash>.mjs`) and its code, in `CHUNKS`' order. */
+  chunks: { name: string; code: string }[];
 }
 
 export { CHUNK_NAME };
 
+/**
+ * The chunks loaded on demand: the source built into each, the source loader (in `src/sync/`) the
+ * main builds swap for one that fetches it, that loader's export, and a string only the chunk's code
+ * has (a main build that contains it bundled the chunk in).
+ */
+const CHUNKS = [
+  { id: 'p2p', entry: 'sync/peers.ts', loader: 'load.ts', fn: 'loadPeers', marker: 'createDataChannel' },
+  { id: 'bots', entry: 'sync/bots.ts', loader: 'loadBots.ts', fn: 'loadBots', marker: 'Fix it with update_bot' },
+] as const;
+
 /** Earlier builds' chunks kept in `dist/chunks/` for the server: a page holding a main file from before a deploy still finds its own. */
-const KEEP_CHUNKS = 20;
+const KEEP_CHUNKS = 40;
 
 export async function buildSdk({ minify = true } = {}): Promise<SdkFiles> {
-  const code = await build(join(src, 'sync/peers.ts'), 'esm', minify);
-  const hash = new Bun.CryptoHasher('sha256').update(code).digest('hex').slice(0, 12);
-  const name = `gamerelay-p2p.${hash}.mjs`;
   const { version } = await Bun.file(join(root, 'package.json')).json();
-  const esm = `export const loadPeers = () => import('./${name}');`;
-  // `currentScript` is only there while the script first runs: read once, at load. Each place in
-  // turn: a copy the game hosts may have come without its chunk, which jsDelivr then has.
-  const iife = `
-    import { chunkBases } from './chunkBase';
-    const script = typeof document === 'undefined' ? null : document.currentScript;
-    const bases = chunkBases(script ? script.src : undefined, '${version}');
-    export const loadPeers = async () => {
-      let failed;
-      for (const base of bases) {
-        try {
-          return await import(new URL('${name}', base).href);
-        } catch (err) {
-          failed = err;
-        }
-      }
-      throw failed;
-    };`;
+  const chunks: SdkFiles['chunks'] = [];
+  const esm = new Map<string, string>();
+  const iife = new Map<string, string>();
+  for (const c of CHUNKS) {
+    const code = await build(join(src, c.entry), 'esm', minify);
+    const hash = new Bun.CryptoHasher('sha256').update(code).digest('hex').slice(0, 12);
+    const name = `gamerelay-${c.id}.${hash}.mjs`;
+    chunks.push({ name, code });
+    esm.set(c.loader, `export const ${c.fn} = () => import('./${name}');`);
+    // The script tag: next to its script, else jsDelivr at this version (`chunkImporter`).
+    iife.set(c.loader, `
+      import { chunkImporter } from './chunkBase';
+      const load = chunkImporter('${version}');
+      export const ${c.fn} = () => load('${name}');`);
+  }
   return {
     'gamerelay.mjs': await build(join(src, 'index.ts'), 'esm', minify, esm),
     'gamerelay.js': await build(join(src, 'global.ts'), 'iife', minify, iife),
-    chunk: { name, code },
+    chunks,
   };
 }
 
-async function build(entry: string, format: 'esm' | 'iife', minify: boolean, loader?: string): Promise<string> {
+/** `loaders`: for a main build, each chunk's loader (by its source file's name in `src/sync/`). */
+async function build(entry: string, format: 'esm' | 'iife', minify: boolean, loaders?: Map<string, string>): Promise<string> {
   const plugins: BunPlugin[] = [];
-  if (loader) {
+  if (loaders) {
     plugins.push({
-      name: 'p2p-loader',
+      name: 'chunk-loaders',
       setup(b) {
-        b.onLoad({ filter: /[\\/]sync[\\/]load\.ts$/ }, () => ({ contents: loader, loader: 'js' }));
-        b.onResolve({ filter: /^\.\/gamerelay-p2p\./ }, (args) => ({ path: args.path, external: true }));
+        b.onLoad({ filter: /[\\/]sync[\\/]load(?:Bots)?\.ts$/ }, (args) => ({ contents: loaders.get(basename(args.path))!, loader: 'js' }));
+        b.onResolve({ filter: /^\.\/gamerelay-(?:p2p|bots)\./ }, (args) => ({ path: args.path, external: true }));
       },
     });
   }
@@ -87,9 +94,10 @@ async function build(entry: string, format: 'esm' | 'iife', minify: boolean, loa
   const output = result.outputs[0];
   if (!result.success || !output || result.outputs.length !== 1) throw new Error(`SDK build failed (${entry}): ${result.logs.join('\n')}`);
   const code = await output.text();
-  // The peer code must stay out of the main builds, and the chunk must stand alone.
-  if (loader && code.includes('createDataChannel')) throw new Error(`${entry}: the P2P code was bundled in`);
-  if (!loader && /\bimport\s*[({'"]|\bfrom\s*['"]/.test(code)) throw new Error('the P2P chunk imports something: it must stand alone');
+  // Each chunk's code must stay out of the main builds, and each chunk must stand alone.
+  if (loaders) for (const c of CHUNKS) if (code.includes(c.marker)) throw new Error(`${entry}: the ${c.id} chunk's code was bundled in`);
+  // (Parsed, not matched: the bots chunk's Worker source holds the word `import` in strings.)
+  if (!loaders && new Bun.Transpiler({ loader: 'js' }).scanImports(code).length > 0) throw new Error(`${entry}: a chunk imports something: it must stand alone`);
   return code;
 }
 
@@ -99,20 +107,20 @@ if (import.meta.main) {
   const out = at >= 0 ? args[at + 1]! : join(root, 'dist');
   const files = await buildSdk({ minify: !args.includes('--no-minify') });
   mkdirSync(out, { recursive: true });
-  // One chunk per build: an older one left in dist/ would ship in the npm package too.
+  // One of each chunk per build: an older one left in dist/ would ship in the npm package too.
   for (const f of readdirSync(out)) if (CHUNK_NAME.test(f)) rmSync(join(out, f));
   await Bun.write(join(out, 'gamerelay.mjs'), files['gamerelay.mjs']);
   await Bun.write(join(out, 'gamerelay.js'), files['gamerelay.js']);
-  await Bun.write(join(out, files.chunk.name), files.chunk.code);
+  for (const c of files.chunks) await Bun.write(join(out, c.name), c.code);
   if (at < 0) {
-    // dist/ only: every build's chunk in dist/chunks/ (not in the npm package), the newest kept.
+    // dist/ only: every build's chunks in dist/chunks/ (not in the npm package), the newest kept.
     const kept = join(out, 'chunks');
-    await Bun.write(join(kept, files.chunk.name), files.chunk.code);
+    for (const c of files.chunks) await Bun.write(join(kept, c.name), c.code);
     const old = readdirSync(kept)
       .filter((f) => CHUNK_NAME.test(f))
       .sort((a, b) => statSync(join(kept, b)).mtimeMs - statSync(join(kept, a)).mtimeMs)
       .slice(KEEP_CHUNKS);
     for (const f of old) rmSync(join(kept, f));
   }
-  console.log(`built gamerelay.mjs, gamerelay.js and ${files.chunk.name} into ${out}`);
+  console.log(`built gamerelay.mjs, gamerelay.js, ${files.chunks.map((c) => c.name).join(' and ')} into ${out}`);
 }
