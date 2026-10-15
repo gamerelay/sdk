@@ -4,6 +4,18 @@ Every release of `@gamerelay/sdk`, newest first. The notes under a version's hea
 GitHub release. Until 1.0, a minor version (0.x.0) may change the API; each break is listed
 here with what to change.
 
+## 0.1.0-alpha.11 (2026-10-14)
+
+- **Bots: test players an AI assistant adds.** `room.bots({ join?, leave?, observe, drive })` tells
+  the SDK what a bot sees and how it plays; the account MCP's `add_bot` puts one in a room, driven
+  by a small brain function, and the room's host plays it. It returns a function that stops it, and
+  does nothing unless this tab is a bot host: on localhost, or with the new `connect({ botHost: true })`
+  option (which sends the new `bots` cap to the server). A brain gets `{ game, now }`, runs in its own
+  locked-down Worker about 30 times a second, and its `log()` lines reach the instance logs. The
+  bots' code is a second on-demand chunk, `gamerelay-bots.<hash>.mjs` (about 4 KB gzipped), that only
+  a bot host loads; players don't download it, and the main file grows by about 0.5 KB gzipped. Nothing to change in
+  your code. See BOTS.md.
+
 ## 0.1.0-alpha.10 (2026-10-13)
 
 - **Smaller: about 31 KB gzipped, from 35.** The WebRTC peer code (P2P connections, signalling,

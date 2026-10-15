@@ -18,7 +18,9 @@ export type WarningKind =
   /** A Room the game left was still used. */
   | 'left_room'
   /** Reliable messages dropped: too many waited to go out. */
-  | 'queue_full';
+  | 'queue_full'
+  /** On localhost (or with `debug`): why this tab stopped being host. */
+  | 'host_moved';
 
 /** Every warning the SDK can print, and the llms.txt section that explains its fix. */
 export const SECTIONS: Readonly<Record<WarningKind, string>> = {
@@ -39,6 +41,7 @@ export const SECTIONS: Readonly<Record<WarningKind, string>> = {
   invite: 'Invite links',
   left_room: 'Room reference',
   queue_full: 'Connection events',
+  host_moved: 'Host changes',
 };
 
 /** Console warnings written for the LLM that will read them: each key prints once, then counts. */

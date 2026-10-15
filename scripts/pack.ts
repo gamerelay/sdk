@@ -43,10 +43,10 @@ const roomClass = /^(export declare class Room extends [^{]+\{)$/m;
 if (!roomClass.test(types)) throw new Error('gamerelay.d.ts: no Room class to make unconstructable');
 types = types.replace(roomClass, '$1\n\tprivate constructor();');
 await Bun.write(dts, types);
-// The P2P chunk the builds load on demand: the one this build made (scripts/build.ts keeps one).
-const chunk = readdirSync(join(root, 'dist')).find((f) => CHUNK_NAME.test(f));
-if (!chunk) throw new Error('dist/ has no P2P chunk: run `bun run build`');
-for (const f of ['gamerelay.mjs', 'gamerelay.js', chunk]) cpSync(join(root, 'dist', f), join(out, f));
+// The chunks the builds load on demand (P2P, bots): the ones this build made (scripts/build.ts keeps one of each).
+const chunks = readdirSync(join(root, 'dist')).filter((f) => CHUNK_NAME.test(f));
+for (const id of ['p2p', 'bots']) if (!chunks.some((f) => f.startsWith(`gamerelay-${id}.`))) throw new Error(`dist/ has no ${id} chunk: run \`bun run build\``);
+for (const f of ['gamerelay.mjs', 'gamerelay.js', ...chunks]) cpSync(join(root, 'dist', f), join(out, f));
 cpSync(join(root, 'llms.txt'), join(out, 'llms.txt'));
 cpSync(join(root, 'README.md'), join(out, 'README.md'));
 cpSync(join(root, 'CHANGELOG.md'), join(out, 'CHANGELOG.md'));
@@ -80,7 +80,7 @@ await Bun.write(
       unpkg: './gamerelay.js',
       jsdelivr: './gamerelay.js',
       sideEffects: false,
-      files: ['gamerelay.mjs', 'gamerelay.js', chunk, 'gamerelay.d.ts', 'llms.txt', 'CHANGELOG.md'],
+      files: ['gamerelay.mjs', 'gamerelay.js', ...chunks, 'gamerelay.d.ts', 'llms.txt', 'CHANGELOG.md'],
       publishConfig: { access: 'public' },
     },
     null,

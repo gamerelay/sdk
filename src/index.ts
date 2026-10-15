@@ -30,6 +30,7 @@ import {
   type PlayerInfo,
   type RoomInfo,
   type ServerMessage,
+  type BotSpec,
 } from '@gamerelay/protocol/types';
 import { GameRelayError, type GameRelayErrorCode } from './errors';
 import { CREATE, DEBUG, defaults, relays, rooms, type Outgoing, type RelayLink, type Request, type RoomControl, type RoomDebugInfo } from './internal';
@@ -52,6 +53,8 @@ import { TEAMS_KEY, TEAM_COUNT_KEY, balanceTeams } from './sync/teams';
 import { Timers } from './sync/timers';
 import type { SyncTransport } from './sync/transport';
 import { Lan, isSignal, isWrapped } from './sync/lan';
+import type { BotAdapter, Bots } from './sync/bots';
+import { loadBots } from './sync/loadBots';
 
 export { GameRelayError };
 export type { GameRelayErrorCode };
@@ -59,6 +62,7 @@ export type { Entity, EntityBase, RemoveReason, DefineOptions, SpawnOptions } fr
 export type { Kind, KindEntity, FieldValues } from './sync/kind';
 export type { FieldInput, FieldType } from './core/codec';
 export type { RequestRejection } from './sync/requests';
+export type { BotAdapter, BotInfo } from './sync/bots';
 
 export type {
   ChatMessage,
@@ -136,6 +140,8 @@ export interface ConnectOptions {
   p2p?: P2POptions;
   /** @deprecated The old name of `p2p` (it isn't LAN-only); still works. */
   lan?: P2POptions;
+  /** Run bots' brains in this tab when it hosts (BOTS.md; `room.bots()`). On by default on localhost. */
+  botHost?: boolean;
 }
 
 /** `connect({ p2p })`: on (the default), off, or how. Experimental. */
@@ -384,6 +390,10 @@ const CLOCK_SAMPLES = 8;
 const monotonic = () => performance.timeOrigin + performance.now();
 /** The LAN shortcut asks for fresh relay credentials this often (they last an hour on the server). */
 const ICE_REFRESH_MS = 20 * 60 * 1000;
+/** How often bots' brains run (`room.bots`): about 30 times a second. */
+const BOT_TICK_MS = 33;
+/** The bots' code didn't load: said once per page. */
+let botsCodeWarned = false;
 
 
 /**
@@ -410,6 +420,13 @@ function nextFrame(cb: () => void): void {
 const INVITE_PARAM = 'room';
 /** Short links (`room.shareLink()`) arrive with the link's id in this one: `?join=ZumXpZzDsgo`. */
 const LINK_PARAM = 'join';
+
+/** A page served from this machine, where a developer tests in tabs. */
+function onLocalhost(): boolean {
+  if (typeof location === 'undefined') return false;
+  const host = location.hostname ?? ''; // (a stand-in `location` may have no hostname)
+  return host === 'localhost' || host.endsWith('.localhost') || host === '[::1]' || /^127\.\d+\.\d+\.\d+$/.test(host);
+}
 
 function pageUrl(): string {
   if (typeof location === 'undefined') throw new Error('[gamerelay] No page URL here; pass one');
@@ -548,6 +565,8 @@ export class GameRelay extends Emitter<RelayEvents> {
   /** Between reconnecting and re-entering the room: room messages must wait. */
   #resuming = false;
   #lastRoomInfo: RoomInfo | null = null;
+  /** Bots the server sent between a room's snapshot and the join's reply: for the Room made then. */
+  #pendingBots: Extract<ServerMessage, { t: 'bots' }> | null = null;
   /**
    * Who holds each slot of the room the server has us in, from what it sent (`CompactMessageMsg`).
    * Kept here, not in the Room: a batch can carry a join and messages before the Room exists.
@@ -598,7 +617,14 @@ export class GameRelay extends Emitter<RelayEvents> {
         return typeof p2p === 'object' && p2p.direct === 'party' ? 'party' : null;
       },
       debug: !!opts.debug,
+      botHost: opts.botHost ?? onLocalhost(),
       queue: (m) => this.#queue(m),
+      post: (m) => {
+        // The server drops a frame the budget doesn't cover (and says "slow down"): the caller keeps it for later.
+        if (!this.connected || this.#resuming || this.#budget.left(performance.now()) < 1) return false;
+        this.#raw({ ...m, v: V });
+        return true;
+      },
       request: (m) => this.#request(m),
       now: () => this.now(),
       writeTime: () => this.#writeTime(),
@@ -1010,6 +1036,8 @@ export class GameRelay extends Emitter<RelayEvents> {
    */
   #adopt(info: RoomInfo, link?: string): Room {
     const room = (this.#room = new Room(CREATE, this.#link, info, this.#playerId, link));
+    if (this.#pendingBots) rooms.get(room)?.handle(this.#pendingBots);
+    this.#pendingBots = null;
     // A microtask later: this runs while a batch is handled, and asking flushes the outbox, which
     // should wait for the batch's own messages.
     if (typeof location !== 'undefined' || (room.linkOnly && !link)) queueMicrotask(() => void room.shareLink().catch(() => {}));
@@ -1229,8 +1257,9 @@ export class GameRelay extends Emitter<RelayEvents> {
     if (this.#stopped) throw new GameRelayError('disconnected', 'Closed');
     // Who we are (`sdk`) and what we understand (`caps`, @gamerelay/protocol/clients): `compact`,
     // relayed messages in their short form; `lan`, the shortcut's wire format (the server unwraps it
-    // for SDKs that don't know it); `moved`, a restart notice's `url`; `notices`, shown in the console.
-    const caps = ['compact', ...(this.#link.lanEnabled ? ['lan'] : []), 'moved', 'notices'].join(',');
+    // for SDKs that don't know it); `moved`, a restart notice's `url`; `notices`, shown in the console;
+    // `bots`, this tab runs the room's bots while it hosts (`botHost`).
+    const caps = ['compact', ...(this.#link.lanEnabled ? ['lan'] : []), 'moved', 'notices', ...(this.#link.botHost ? ['bots'] : [])].join(',');
     const base = `${this.#base.replace(/^http/, 'ws')}/ws`;
     const target = this.#fallBack ? base : (this.#movedTo ?? this.#wsUrl ?? base);
     this.#fallBack = false;
@@ -1510,11 +1539,17 @@ export class GameRelay extends Emitter<RelayEvents> {
         return;
       case 'room':
         this.#lastRoomInfo = msg.room;
+        this.#pendingBots = null;
         this.#slots = new Map(msg.room.players.map((p) => [p.slot, p.id]));
         if (this.#room?.id === msg.room.id) this.#roomControl()?.sync(msg.room);
         return;
       case 'party':
         return this.#setParty(msg.party);
+      case 'bots':
+        // Right after the snapshot, so on joining there's no Room for it yet.
+        if (this.#lastRoomInfo && this.#room?.id !== this.#lastRoomInfo.id) this.#pendingBots = msg;
+        else this.#roomControl()?.handle(msg);
+        return;
       case 'removed': {
         // Kicked or closed by the owner: forget the room so a reconnect doesn't try to rejoin it.
         const room = this.#room;
@@ -1564,6 +1599,9 @@ export class Room extends Emitter<RoomEvents> {
   readonly #removeHandlers = new Map<string, Set<EntityHandler>>();
   readonly #timerHandlers = new Map<string, Set<() => void>>();
   readonly #health: HostHealth;
+  /** When this tab last stepped down as host (HostHealth), and who it's handing the role to (transferHost). */
+  #steppedDownAt = Number.NEGATIVE_INFINITY;
+  #handingTo: PlayerId | null = null;
   readonly #timers: Timers;
   readonly #claims: Claims;
   readonly #requests: Requests;
@@ -1595,6 +1633,15 @@ export class Room extends Emitter<RoomEvents> {
   #linkId: string | null = null;
   #name: string | null;
   #meta: Json | null;
+  /**
+   * The room's bots, run here while this tab hosts, in a bot host only (`botHost`). Their code is a
+   * chunk of its own, loaded by the first `bots()`: until it's here, the server's list waits in `#botList`.
+   */
+  #bots: Bots | null = null;
+  #botsLoading = false;
+  #botList: BotSpec[] = [];
+  #botAdapter: BotAdapter | null = null;
+  #botTimer: ReturnType<typeof setInterval> | null = null;
 
   /** @internal Rooms come from the relay (`createRoom`, `joinRoom`, …). */
   constructor(token: typeof CREATE, relay: RelayLink, info: RoomInfo, me: PlayerId, link?: string) {
@@ -1647,7 +1694,10 @@ export class Room extends Emitter<RoomEvents> {
       now: () => performance.now(),
       isHost: () => this.isHost,
       ready: () => relay.serverReady,
-      send: (m) => this.#queue(m),
+      send: (m) => {
+        if (m.t === 'step_down') this.#steppedDownAt = performance.now();
+        this.#queue(m);
+      },
     });
     this.#timers = new Timers({
       ready: () => relay.connected,
@@ -1792,6 +1842,70 @@ export class Room extends Emitter<RoomEvents> {
     this.#relay.warn('set_state', 'state_write', 'room.state.x = … changes only your copy: the host changes state for everyone with room.setState({ x: … }); others ask it (room.request)');
   }
 
+  /**
+   * Play the room's bots (BOTS.md) while this tab is the host: each one's brain runs about 30 times
+   * a second, seeing what `observe` returns and playing through `drive`. Only in a bot host
+   * (`connect({ botHost })`, on by default on localhost); elsewhere it does nothing, so call it
+   * either way. Returns a function that stops (each bot gets `leave`).
+   */
+  bots(adapter: BotAdapter): () => void {
+    if (!this.#relay.botHost || !this.#live) return () => {};
+    this.#botAdapter = adapter;
+    if (this.#bots) this.#runBots(this.#bots);
+    else if (!this.#botsLoading) this.#loadBots();
+    return () => {
+      if (this.#botAdapter === adapter) this.#stopBots();
+    };
+  }
+
+  /** Fetch the bots' code once; if it can't be had, bots don't run (said once) and the game goes on. */
+  #loadBots(): void {
+    this.#botsLoading = true;
+    const relay = this.#relay;
+    (relay.loadBots ?? loadBots)().then(
+      (code) => {
+        if (!this.#live) return;
+        const bots = (this.#bots = new code.Bots({
+          now: () => relay.now(),
+          sendLog: (bot, lines) => this.#live && relay.post({ t: 'bot_log', bot, lines }),
+          brain: () => code.workerBrain(),
+        }));
+        bots.setList(this.#botList);
+        if (this.#botAdapter) this.#runBots(bots);
+      },
+      (err: unknown) => {
+        if (botsCodeWarned) return;
+        botsCodeWarned = true;
+        console.warn(`[gamerelay] bots are off: their code didn't load (${err instanceof Error ? err.message : String(err)})`);
+      },
+    );
+  }
+
+  #runBots(bots: Bots): void {
+    bots.setAdapter(this.#botAdapter);
+    bots.setHost(this.isHost);
+    this.#syncBotTimer();
+  }
+
+  #stopBots(): void {
+    this.#botAdapter = null;
+    this.#syncBotTimer();
+    this.#bots?.close();
+  }
+
+  /** The bots' rounds run only while this tab plays them: loaded, given an adapter, and host. */
+  #syncBotTimer(): void {
+    const bots = this.#bots;
+    if (bots && this.#botAdapter && this.isHost) {
+      if (this.#botTimer !== null) return;
+      this.#botTimer = setInterval(() => void bots.tick(), BOT_TICK_MS);
+      (this.#botTimer as { unref?: () => void }).unref?.();
+    } else if (this.#botTimer !== null) {
+      clearInterval(this.#botTimer);
+      this.#botTimer = null;
+    }
+  }
+
   /** True if you run the simulation. Re-check on `host_changed`. */
   get isHost(): boolean {
     return this.#hostId === this.#me;
@@ -1872,7 +1986,12 @@ export class Room extends Emitter<RoomEvents> {
   async transferHost(playerId: PlayerId): Promise<void> {
     this.#hostOnly('room.transferHost');
     if (playerId === this.me) throw new GameRelayError('bad_request', 'room.transferHost: you are the host already');
-    await this.#hostRequest({ t: 'transfer_host', playerId });
+    this.#handingTo = playerId;
+    try {
+      await this.#hostRequest({ t: 'transfer_host', playerId });
+    } finally {
+      this.#handingTo = null; // the server sends host_changed before it answers
+    }
   }
 
   /**
@@ -2424,10 +2543,29 @@ export class Room extends Emitter<RoomEvents> {
     }
   }
 
+  /**
+   * On localhost (or with `debug`), say why this tab just stopped being host, once per reason: a
+   * developer testing in tabs sees host_changed and wonders if the game broke. A transferHost of
+   * ours needs no note, nor does a move while we were away (that arrives as a fresh room, not here).
+   */
+  #explainHostMoved(hostId: PlayerId): void {
+    if (this.#hostId !== this.me || hostId === this.me || hostId === this.#handingTo) return;
+    if (!onLocalhost() && !this.#relay.debug) return;
+    const name = this.#players.find((p) => p.id === hostId)?.name ?? hostId;
+    if (performance.now() - this.#steppedDownAt < 3_000) {
+      this.#relay.warn('host_moved', 'host_moved:step_down', `this tab handed the host role to ${name}: its game loop fell well below its tick rate (a hidden or busy tab). Normal while testing in tabs; host entities, timers and state carry over`);
+    } else {
+      this.#relay.warn('host_moved', 'host_moved:quiet', `the host role moved to ${name}: this tab sent nothing for over a second (paused in the debugger, a busy main thread, or a frozen background tab), so the server handed it on. Normal while testing in tabs; host entities, timers and state carry over`);
+    }
+  }
+
   /** The host role moved: hand entities over first, then tell the game. */
   #hostMoved(hostId: PlayerId, previous: PlayerId): void {
     const was = this.#hostId; // our own view decides whether we just gained or lost the role
     this.#hostId = hostId;
+    if (!this.isHost) this.#botList = []; // as host again, only the server's next `bots` message counts
+    this.#bots?.setHost(this.isHost);
+    this.#syncBotTimer();
     this.#entities.hostChanged(hostId, was);
     this.#requests.hostChanged();
     this.#inputs.hostChanged();
@@ -2449,6 +2587,9 @@ export class Room extends Emitter<RoomEvents> {
   /** Leave the room (you get `closed` with `'left'`). */
   async leave(): Promise<void> {
     if (!this.#live) return;
+    // Still in the room: what the bots logged since the last flush goes out first. Not on a kick or
+    // a close, where the server has already dropped the seat (it would answer not_in_room).
+    this.#bots?.flushLogs();
     this.#relay.left(this);
     this.#closeLocal('left');
     await this.#relay.request({ t: 'leave_room' }).catch(() => undefined);
@@ -2463,6 +2604,7 @@ export class Room extends Emitter<RoomEvents> {
     this.#requests.close();
     this.#lan.close();
     this.#stopLoop();
+    this.#stopBots();
     this.#unwatchVisibility();
     if (reason === 'replaced') return;
     // Closed now (nothing more goes out), but a handler that enters another room waits for the batch.
@@ -2571,6 +2713,7 @@ export class Room extends Emitter<RoomEvents> {
         return this.fire(msg.t, msg.playerId);
       }
       case 'host_changed':
+        this.#explainHostMoved(msg.hostId);
         return this.#hostMoved(msg.hostId, msg.previousHostId);
       case 'claimed':
       case 'released':
@@ -2580,6 +2723,9 @@ export class Room extends Emitter<RoomEvents> {
         return this.#setAccess(msg, msg.from);
       case 'listing':
         return this.#setListing(msg, msg.from);
+      case 'bots':
+        this.#botList = msg.bots;
+        return this.#bots?.setList(msg.bots);
     }
   }
 

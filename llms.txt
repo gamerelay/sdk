@@ -27,8 +27,8 @@ MCP servers (Streamable HTTP):
   `claude mcp add --transport http gamerelay https://gamerelay.io/mcp`
 - `https://gamerelay.io/mcp/admin`: everything in the dashboard, as you. The first call opens
   your browser to sign in and approve the agent (OAuth). Tools: the three docs tools above, `whoami`, `list_instances`,
-  `get_instance`, `create_instance`, `update_instance` (chat, parties, saves, logs, room size, allowed origins, short links: slug, play URL, cover image, X embed URL),
-  `delete_instance`, `rotate_key`, `list_rooms`, `get_room`, `kick_player`, `close_room`,
+  `get_instance`, `create_game` (the instance and a starter with its key in, in one call), `create_instance`, `update_instance` (chat, parties, saves, logs, room size, allowed origins, short links: slug, play URL, cover image, X embed URL),
+  `delete_instance`, `rotate_key`, `list_rooms`, `get_room`, `kick_player`, `close_room`, `add_bot`, `update_bot`, `remove_bot`, `list_bots`,
   `search_logs`, `get_usage`,
   `list_leaderboards`, `get_leaderboard`, `set_leaderboard_rules`, `list_webhooks`, `create_webhook`, `update_webhook`,
   `delete_webhook`, `rotate_webhook_secret`, `test_webhook`, `list_webhook_deliveries`.
@@ -57,7 +57,7 @@ import { GameRelay } from 'https://gamerelay.io/sdk/v0/gamerelay.mjs';
 Or npm: `npm i @gamerelay/sdk`, then `import { GameRelay } from '@gamerelay/sdk'`.
 
 You need a public key (`gr_pub_…`): sign in at https://gamerelay.io/app and create an instance
-for your game (or ask an agent with the account MCP to `create_instance`). It is safe to ship in
+for your game (or ask an agent with the account MCP to `create_game`). It is safe to ship in
 the page. Until it's filled in, `connect()` rejects with `unauthorized`.
 
 ## Versions
@@ -66,7 +66,7 @@ the page. Until it's filled in, `connect()` rejects with `unauthorized`.
 updates in place, and within `v0` nothing is removed or renamed without a deprecation first (the
 old name keeps working and warns in the console for at least 30 days). `/sdk/gamerelay.js` is the
 same `v0` line, forever. To pin one exact version instead, load it from npm through jsDelivr:
-`https://cdn.jsdelivr.net/npm/@gamerelay/sdk@0.1.0-alpha.10/gamerelay.js` (any published
+`https://cdn.jsdelivr.net/npm/@gamerelay/sdk@0.1.0-alpha.11/gamerelay.js` (any published
 version: `npm view @gamerelay/sdk versions`). Until the SDK reaches 1.0, a pinned alpha may be
 asked to update: new server features can need the newest alpha, and old alphas stop being
 accepted sooner than they will after 1.0.
@@ -86,7 +86,11 @@ field's `smooth` option. Everything else in this guide is the `v0` promise.
 ```js
 const relay = await GameRelay.connect({ publicKey: 'gr_pub_…', playerName: 'ada', playerAvatar: 'fox' });
 
-const room = await relay.quickMatch({ maxPlayers: 2 }); // join any open public room, or make one
+// The usual start: an invite link's room, else any open public room (or a new one). Then put the
+// invite in the address bar, so copying it invites and a reload comes back to the same room.
+const room = (await relay.joinInvite().catch(() => null)) ?? (await relay.quickMatch({ maxPlayers: 4 }));
+history.replaceState(null, '', room.inviteUrl());
+// or: const room = await relay.quickMatch({ maxPlayers: 2 });  join any open public room, or make one
 // or: const room = await relay.createRoom({ maxPlayers: 4 });  share room.code with friends
 // or: const room = await relay.joinRoom('K7QM');
 // or: const room = await relay.joinInvite();  the room in this page's ?join= or ?room=CODE link, or null (see Invite links)
@@ -568,6 +572,10 @@ by themselves. For anything else, `room.on('host', () => …)` runs on the playe
 host (not for the room's first host: check `room.isHost` at start). `room.on('host_changed',
 (hostId, previousHostId) => …)` runs on everyone.
 
+Testing in two tabs moves the host often: a background or busy tab, or one paused in the debugger,
+goes quiet and the server hands the role on. On localhost (or with `debug: true`) the tab that lost
+it says why in the console, once.
+
 ## relay.tick: the game loop
 
 ```js
@@ -603,9 +611,32 @@ each, and each one says the fix and names the llms.txt section to read. The full
 - `room.state.x = … changes only your copy`: the host changes state with `room.setState` (see State and timers)
 - `relay.on('player_joined') never fires: …; it's a room event`: room events go on the room
 - `room.inviteUrl(): this room is link-only and its link hasn't arrived yet`: `await room.shareLink()` first (see Invite links)
+- `the host role moved to bob: this tab sent nothing for over a second (paused in the debugger, …)` and `this tab handed the host role to bob: its game loop fell well below its tick rate`: on localhost or with `debug` only; normal while testing in tabs (see Host changes)
 
 Test on a bad network before shipping: `connect({ …, simulate: { latency: 150, jitter: 30, loss: 0.05 } })`
 (development only).
+
+## Bots
+
+Test players your AI assistant can add through the account MCP (`add_bot`): each is played by the
+room's host, driven by a small brain function the assistant writes. Your game says what a bot sees
+and how it plays:
+
+```js
+const stop = room.bots({
+  join(bot) { /* give it a car, an avatar…; return false if there's no room for it */ },
+  leave(bot) { /* take it back */ },
+  observe(bot) { return { speed: 12, angleToNext: 0.3 }; }, // the brain's view.game
+  drive(bot, action) { /* apply { steer, throttle } or whatever your brain returns */ },
+});
+```
+
+`room.bots()` returns a function that stops it, and does nothing unless this tab is a bot host: your
+game on localhost, or `connect({ botHost: true })`. A brain gets `{ game, now }` and returns an
+action, about 30 times a second; what it `log()`s shows in the instance logs (`search_logs`, as
+`[<name>] <text>`). `join` comes once its brain has loaded, and the bot logs `started`; if `join`
+returns `false` it logs `no room for this bot in the game` and sits out until `update_bot`. The brains' code is a second chunk, fetched only by a bot host: players never
+download it. See BOTS.md in the repo for the design.
 
 ## Invite links
 

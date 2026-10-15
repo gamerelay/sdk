@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import type { JsonObject, PlayerInfo, RoomInfo } from '@gamerelay/protocol/types';
 import { looksPositional } from '../src/debug/rate';
 import { GameRelayError, Room, type GameRelay } from '../src/index';
@@ -7,7 +7,7 @@ import { CREATE, control } from '../src/internal';
 const player = (id: string, slot: number): PlayerInfo => ({ id, name: id, avatar: null, joinedAt: slot, connected: true, slot });
 
 /** A Room on a stand-in relay that records what it would send and warn. */
-function makeRoom(me: string, info: Partial<RoomInfo>) {
+function makeRoom(me: string, info: Partial<RoomInfo>, link: Record<string, unknown> = {}) {
   const queued: { t: string; patch?: JsonObject }[] = [];
   const warned: string[] = [];
   const messages: string[] = [];
@@ -24,6 +24,7 @@ function makeRoom(me: string, info: Partial<RoomInfo>) {
     newEntityId: (kind: string) => `${kind}:t:1`,
     request: async (m: Record<string, unknown>) => void requests.push(m),
     left: () => {},
+    ...link,
   } as unknown as GameRelay;
   const full: RoomInfo = { id: 'r', code: 'ABCD', mode: 'relay', maxPlayers: 8, hostId: 'pa', players: [], state: {}, stateSeq: 0, chat: [], seed: 1, claims: {}, ...info };
   return { room: new Room(CREATE, relay as never, full, me), queued, requests, warned, messages, clock, step: () => loops.forEach((fn) => fn()) };
@@ -483,4 +484,69 @@ test("setState refuses a key the server refuses, before the local write: the hos
   }
   expect(room.state).toEqual({});
   expect(queued.filter((m) => m.t === 'set_state')).toEqual([]);
+});
+
+describe('why this tab stopped being host (localhost or debug)', () => {
+  const players = [player('pa', 0), player('pb', 1)];
+  const moved = { v: 1, t: 'host_changed', hostId: 'pb', previousHostId: 'pa' } as const;
+
+  test('with debug on, losing the role for silence says so once, naming the new host', () => {
+    const { room, warned, messages } = makeRoom('pa', { hostId: 'pa', players }, { debug: true });
+    control(room).handle(moved);
+    control(room).handle({ v: 1, t: 'host_changed', hostId: 'pa', previousHostId: 'pb' });
+    control(room).handle(moved);
+    expect(warned).toEqual(['host_moved:quiet', 'host_moved:quiet']); // the relay's Warnings prints a key once
+    expect(messages[0]).toContain('the host role moved to pb');
+    expect(messages[0]).toContain('paused in the debugger');
+  });
+
+  test('on localhost it says so without debug; elsewhere, without debug, it stays quiet', () => {
+    const away = makeRoom('pa', { hostId: 'pa', players });
+    control(away.room).handle(moved);
+    expect(away.warned).toEqual([]);
+    const g = globalThis as { location?: unknown };
+    const before = g.location;
+    try {
+      for (const hostname of ['localhost', 'game.localhost', '127.0.0.1', '[::1]']) {
+        g.location = { hostname };
+        const local = makeRoom('pa', { hostId: 'pa', players });
+        control(local.room).handle(moved);
+        expect({ hostname, warned: local.warned }).toEqual({ hostname, warned: ['host_moved:quiet'] });
+      }
+      g.location = { hostname: 'mygame.itch.io' };
+      const hosted = makeRoom('pa', { hostId: 'pa', players });
+      control(hosted.room).handle(moved);
+      expect(hosted.warned).toEqual([]);
+    } finally {
+      g.location = before;
+    }
+  });
+
+  test('after this tab stepped down for a slow loop, it says that instead', () => {
+    let t = 10_000;
+    const clock = spyOn(performance, 'now').mockImplementation(() => t);
+    try {
+      const { room, warned, queued, step, messages } = makeRoom('pa', { hostId: 'pa', players }, { debug: true, serverReady: true });
+      step(); // host health starts measuring
+      t += 1_600; // one tick in 1.6 s: far below the tick rate
+      step();
+      expect(queued.map((m) => m.t)).toContain('step_down');
+      control(room).handle(moved);
+      expect(warned).toEqual(['host_moved:step_down']);
+      expect(messages[0]).toContain('this tab handed the host role to pb');
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  test('no note for our own transferHost, or for a move between other players', async () => {
+    const mine = makeRoom('pa', { hostId: 'pa', players }, { debug: true });
+    const handing = mine.room.transferHost('pb');
+    control(mine.room).handle(moved); // the server sends host_changed before it answers
+    await handing;
+    expect(mine.warned).toEqual([]);
+    const watching = makeRoom('pc', { hostId: 'pa', players: [...players, player('pc', 2)] }, { debug: true });
+    control(watching.room).handle(moved);
+    expect(watching.warned).toEqual([]);
+  });
 });

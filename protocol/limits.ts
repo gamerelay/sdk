@@ -45,6 +45,14 @@ export const LIMITS = {
   rateBurst: 240,
   /** How long a disconnected player keeps their seat. */
   resumeGraceMs: 30_000,
+  /** Bots (BOTS.md): per room, a brain's source, and what a bot host may log. */
+  maxBotsPerRoom: 4,
+  maxBrainBytes: 8_192,
+  maxBotLogLines: 20,
+  maxBotLogLineLength: 200,
+  /** `bot_log` messages per room: `botLogBurst` at once, refilling at `botLogPerSecond`. */
+  botLogPerSecond: 10,
+  botLogBurst: 20,
 } as const;
 
 /**

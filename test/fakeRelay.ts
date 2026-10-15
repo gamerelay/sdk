@@ -127,9 +127,9 @@ function fakePage() {
 /**
  * A connected GameRelay on fake timers and a fake socket and auth endpoint. Call `done()` at the end
  * of the test to close it and put the real globals back. `page`: a fake `document` and `window` too
- * (no rooms then: a room's tick loop would try a Worker).
+ * (no rooms then: a room's tick loop would try a Worker). `botHost`: passed to `connect`.
  */
-export async function connectFake(playerId = 'pa', { page = false } = {}) {
+export async function connectFake(playerId = 'pa', { page = false, botHost }: { page?: boolean; botHost?: boolean } = {}) {
   jest.useFakeTimers();
   FakeSocket.all = [];
   const g = globalThis as unknown as { WebSocket: unknown; fetch: unknown; document?: unknown; window?: unknown };
@@ -141,7 +141,7 @@ export async function connectFake(playerId = 'pa', { page = false } = {}) {
   }
   g.WebSocket = FakeSocket;
   g.fetch = async () => ({ ok: true, status: 200, json: async () => ({ token: 'tok', expiresAt: Date.now() + 3_600_000 }) });
-  const connecting = GameRelay.connect({ publicKey: 'gr_pub_test', url: 'http://test.local', lan: false });
+  const connecting = GameRelay.connect({ publicKey: 'gr_pub_test', url: 'http://test.local', lan: false, botHost });
   await settle();
   FakeSocket.last.welcome(playerId);
   const relay = await connecting;

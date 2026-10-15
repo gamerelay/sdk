@@ -17,8 +17,9 @@
  * - `lan`: knows the LAN shortcut's wire format. Also `lan=1`.
  * - `moved`: follows `server_restarting.url` to another host.
  * - `notices`: shows `welcome.notices` and `notice` messages to the developer.
+ * - `bots`: may run bots' brains (a bot host: on localhost, or `botHost: true`); gets `bots` messages while it's host.
  */
-export const CAPS = ['compact', 'lan', 'moved', 'notices'] as const;
+export const CAPS = ['compact', 'lan', 'moved', 'notices', 'bots'] as const;
 export type Cap = (typeof CAPS)[number];
 
 /** WebSocket close codes the server uses, and what a client should do about each. */
