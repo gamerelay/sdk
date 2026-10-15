@@ -502,6 +502,15 @@ export interface PlayerRenamedMsg extends Base<'player_renamed'> {
   playerId: PlayerId;
   name: string;
 }
+/**
+ * Your own name changed without your asking: the game's name policy changed since it was checked,
+ * and the server checked it again (MODERATION.md, "Timing"). Sent to you only, before your room
+ * hears `player_renamed`. `nameRejected` is why it was swapped, or null when it came back.
+ */
+export interface NameChangedMsg extends Base<'name_changed'> {
+  name: string;
+  nameRejected: ModerationReason | null;
+}
 export interface HostChangedMsg extends Base<'host_changed'> {
   hostId: PlayerId;
   previousHostId: PlayerId;
@@ -623,6 +632,7 @@ export type ServerMessage =
   | PlayerDisconnectedMsg
   | PlayerReconnectedMsg
   | PlayerRenamedMsg
+  | NameChangedMsg
   | HostChangedMsg
   | MessageMsg
   | ChatReceivedMsg
