@@ -66,7 +66,7 @@ the page. Until it's filled in, `connect()` rejects with `unauthorized`.
 updates in place, and within `v0` nothing is removed or renamed without a deprecation first (the
 old name keeps working and warns in the console for at least 30 days). `/sdk/gamerelay.js` is the
 same `v0` line, forever. To pin one exact version instead, load it from npm through jsDelivr:
-`https://cdn.jsdelivr.net/npm/@gamerelay/sdk@0.1.0-alpha.11/gamerelay.js` (any published
+`https://cdn.jsdelivr.net/npm/@gamerelay/sdk@0.1.0-alpha.12/gamerelay.js` (any published
 version: `npm view @gamerelay/sdk versions`). Until the SDK reaches 1.0, a pinned alpha may be
 asked to update: new server features can need the newest alpha, and old alphas stop being
 accepted sooner than they will after 1.0.
@@ -106,10 +106,11 @@ Add `debug: true` while developing (see Debugging).
 
 ```js
 relay.playerId   // your id
+relay.playerName // your name as others see it (see Player names)
 relay.room       // the Room you're in, or null
 relay.party      // your party, or null
 relay.connected  // false while reconnecting
-relay.features   // what this game's plan includes: { voice, unreliable }. Reserved flags for plan features; nothing uses them yet.
+relay.features   // what this game's plan includes: { voice, unreliable, nameModeration }. nameModeration: relay.moderate() works (see Player names); the others are reserved.
 relay.close()    // disconnect for good: your room gets 'closed' ('left'), waiting calls reject 'disconnected'
 ```
 
@@ -789,6 +790,7 @@ room.on('player_joined', (player) => {})
 room.on('player_left', (playerId, reason) => {})       // 'left' | 'timeout' | 'kicked'
 room.on('player_disconnected', (playerId) => {})       // seat kept 30s for reconnect
 room.on('player_reconnected', (playerId) => {})
+room.on('player_renamed', (playerId, name) => {})      // relay.setName; room.players has the new name
 room.on('host', () => {})                               // you just became host
 room.on('host_changed', (hostId, previousHostId) => {})
 room.on('state', (state, patch, fromPlayerId) => {})
@@ -933,6 +935,86 @@ room.on('closed', (reason, message) => {
 - Messages are optional, up to 120 characters. Webhooks get `player.left` (reason `kicked`, and
   `kickedBy`, the host's player id, when the host kicked them) and
   `room.closed` (reason `closed`).
+
+### Player names
+
+**On every plan**, player names and room names lose `<`, `>`, `"` and `` ` ``, so a name can't
+add a tag to a game that renders it with `innerHTML` (or break out of a double-quoted attribute).
+Single-quoted and unquoted attributes, URLs and scripts aren't covered: escape those. Chat keeps them ("<3"): render chat,
+and anything players type, with `textContent`, or escape it first with `GameRelay.escapeHtml(text)`.
+
+```js
+await relay.setName('Ada Lovelace'); // rename yourself live, any plan: resolves with the name others see
+room.on('player_renamed', (playerId, name) => {}); // everyone in the room hears it, you included
+list.innerHTML = entries.map((e) => `<li>${GameRelay.escapeHtml(e.name)}</li>`).join('');
+```
+
+`setName` cleans a name as `connect({ playerName })` does (no markup, at most 24 characters). Your
+party gets a `party` update, your next scores carry the new name, and the SDK keeps it through
+reconnects. A few changes a minute (`rate_limited` after that).
+
+**On paid plans**, two tools keep slurs, profanity, links and staff impersonation ("admin",
+"moderator") out of names (guide: https://gamerelay.io/guides/moderation):
+
+- **`relay.moderate(text)`**, to ask before using a name (a name field, a lobby name), whether
+  the setting below is on or off. A refused name is an answer, not an error:
+
+```js
+const result = await relay.moderate(nameInput.value); // { ok: true, value } or { ok: false, error }
+if (!result.ok) return showError(result.error.message); // "Invalid name: offensive language"
+await relay.setName(result.value);
+
+// Prefer exceptions? throwOnError resolves with the text and rejects with the error:
+const name = await relay.moderate(nameInput.value, { throwOnError: true }); // GameRelayModerationError
+
+// Before connecting (a name screen first), the same check over HTTP:
+const checked = await GameRelay.moderate(nameInput.value, { publicKey: 'gr_pub_…' });
+```
+
+- `result.error` is a `GameRelayModerationError` (a `GameRelayError` with code `moderated`):
+  `reason` is one of `offensive`, `reserved`, `link`, `blocked`, `unsafe` (HTML or a
+  `javascript:` link), `charset`, `too_short`, `too_long`, `empty`; `text` is what was checked;
+  `message` is fine to show a player. Games that translate use `reason`.
+- Anything that isn't about the text rejects, with or without `throwOnError`: `plan_required` (a
+  plan without name moderation), `rate_limited` (30 checks a minute per player: check on save,
+  not per keystroke), `disconnected`.
+- Options, all optional and only ever stricter: `maxLength`, `minLength` (names are 1 to 24
+  characters, an emoji counting as one), `charset` (`'any'`, `'latin'`, `'alnum'`). `type` is
+  `'name'`, the default. e.g. `relay.moderate(plate, { maxLength: 7, charset: 'alnum' })`.
+- It's a word filter (with leetspeak, lookalike letters, accents, spacing and repeated letters
+  undone), not a classifier: it keeps the obvious out, not every clever spelling.
+
+- **The "Name moderation" setting** (dashboard: instance → Name moderation). When it's on, a name
+  that fails is swapped for `player-1234` wherever other players see it: in the player's token,
+  in rooms, and on leaderboards (checked as they're read, so older entries are covered too), and
+  `setName` rejects it with a `GameRelayModerationError`. There the owner can also add:
+  - **Blocked** terms (3+ letters), matched anywhere in a name, past spacing and leetspeak.
+  - **Allowed** words: whole words the built-in lists get wrong for your players (a surname, a
+    word in their language). They only lift the built-in word lists: blocked terms, phrases
+    ("kill yourself"), links and markup still count.
+
+```js
+const relay = await GameRelay.connect({ publicKey, playerName: savedName });
+if (relay.nameRejected) toast(`That name isn't allowed: you're ${relay.playerName} for now`);
+```
+
+`relay.nameRejected` is the reason the server swapped your name when you connected, or null.
+`POST /v1/auth/anonymous` and `/v1/auth/token` also answer with the name used and `nameRejected`
+when it was swapped.
+
+**Over HTTP** (backends, other engines, tools), `POST /v1/moderate` answers the same shape:
+
+```js
+// In the browser with your public key (allowed origins apply), or from your backend with
+// `authorization: Bearer <secret key>` and up to 100 at once as `texts: [...]` ({ results: [...] }).
+const res = await fetch('https://gamerelay.io/v1/moderate', {
+  method: 'POST',
+  body: JSON.stringify({ publicKey: 'gr_pub_…', text: input.value }),
+});
+const result = await res.json(); // { ok: true, value } or { ok: false, error: { code: 'moderated', reason, message } }
+```
+
+A plan without name moderation gets 403 `plan_required`.
 
 ## Webhooks (your backend)
 

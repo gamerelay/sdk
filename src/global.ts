@@ -1,5 +1,5 @@
 /** `<script src=".../sdk/gamerelay.js">` entry: exposes `window.GameRelay`. */
-import { GameRelay, GameRelayError } from './index';
+import { GameRelay, GameRelayError, GameRelayModerationError } from './index';
 import { defaults } from './internal';
 
 // Loaded from a GameRelay server (`/sdk/gamerelay.js`, `/sdk/v0/gamerelay.js`): talk to that
@@ -10,4 +10,4 @@ if (script instanceof HTMLScriptElement && script.src) {
   if (/^\/sdk\/(v\d+\/)?gamerelay\.js$/.test(src.pathname)) defaults.url = src.origin;
 }
 
-Object.assign(globalThis, { GameRelay, GameRelayError });
+Object.assign(globalThis, { GameRelay, GameRelayError, GameRelayModerationError });

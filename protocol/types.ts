@@ -163,7 +163,20 @@ export type ErrorCode =
    * made several that nobody joined (they expire after two idle minutes).
    */
   | 'too_many_rooms'
+  /** The game's plan doesn't include this (name moderation needs Basic or up). */
+  | 'plan_required'
+  /** A text failed moderation (`relay.setName`): the error's `reason` says why. */
+  | 'moderated'
   | 'internal';
+
+/** Why moderation refused a text (`relay.moderate`, `POST /v1/moderate`). */
+export type ModerationReason = 'empty' | 'too_short' | 'too_long' | 'charset' | 'unsafe' | 'offensive' | 'reserved' | 'link' | 'blocked';
+/** Which characters a name may use: `latin` letters (with accents), digits, spaces and `_.'-`; `alnum` A–Z, 0–9 and spaces. */
+export type ModerationCharset = 'any' | 'latin' | 'alnum';
+/** What a moderation check answers, over the socket and `POST /v1/moderate`. (A type alias so it is assignable to `Json`.) */
+export type ModerationVerdict =
+  | { ok: true; value: string }
+  | { ok: false; error: { code: 'moderated'; reason: ModerationReason; message: string } };
 
 export type LeaveReason = 'left' | 'timeout' | 'kicked';
 
@@ -356,6 +369,26 @@ export interface LeaderboardTopMsg extends Base<'lb_top'> {
   board: string;
   limit?: number;
 }
+/** Check a text against the game's moderation (plans with `nameModeration`). Reply: a `ModerationVerdict`. */
+export interface ModerateMsg extends Base<'moderate'> {
+  rid: number;
+  text: string;
+  /** What the text is; names only, for now. */
+  type?: 'name';
+  /** Stricter than the game's own limits only, never looser. */
+  minLength?: number;
+  maxLength?: number;
+  charset?: ModerationCharset;
+}
+/**
+ * Rename yourself: your room and party hear `player_renamed`, and later scores carry the new name.
+ * Reply: `{ name }`, as others see it. With the game's "Name moderation" on, a failing name is
+ * refused (`moderated`, with a `reason`).
+ */
+export interface SetNameMsg extends Base<'set_name'> {
+  rid: number;
+  name: string;
+}
 export interface PingMsg extends Base<'ping'> {
   ts: number;
 }
@@ -385,7 +418,9 @@ export type LobbyClientMessage =
   | OnlineMsg
   | PartyCreateMsg
   | PartyJoinMsg
-  | PartyLeaveMsg;
+  | PartyLeaveMsg
+  | ModerateMsg
+  | SetNameMsg;
 
 export type ClientMessage = LobbyClientMessage | RoomClientMessage | RoomRequestMessage | BatchMsg;
 export type ClientMessageType = ClientMessage['t'];
@@ -404,8 +439,10 @@ export interface PlanFeatures {
   voice: boolean;
   /** Unreliable, unordered delivery for `reliable: false` sends. Reserved: not built yet. */
   unreliable: boolean;
+  /** Name moderation: `relay.moderate()`, `POST /v1/moderate`, and the game's "Name moderation" setting. */
+  nameModeration: boolean;
 }
-export const PLAN_FEATURES = ['voice', 'unreliable'] as const satisfies readonly (keyof PlanFeatures)[];
+export const PLAN_FEATURES = ['voice', 'unreliable', 'nameModeration'] as const satisfies readonly (keyof PlanFeatures)[];
 
 export interface WelcomeMsg extends Base<'welcome'> {
   playerId: PlayerId;
@@ -420,6 +457,10 @@ export interface WelcomeMsg extends Base<'welcome'> {
   server?: string;
   /** Things the developer should know (an SDK below the recommended version, …): shown in the console. */
   notices?: Notice[];
+  /** Your name, as other players see it. Absent from older servers. */
+  name?: string;
+  /** Why the server swapped the name you asked for (the game moderates names), when it did. */
+  nameRejected?: ModerationReason;
 }
 /** An `RTCIceServer`, as JSON. */
 export interface IceServer {
@@ -435,6 +476,8 @@ export interface ErrorMsg extends Base<'error'> {
   rid?: number;
   code: ErrorCode;
   message: string;
+  /** With `moderated`: why. */
+  reason?: ModerationReason;
 }
 /** Full room snapshot, sent on join and on resume. */
 export interface RoomMsg extends Base<'room'> {
@@ -453,6 +496,11 @@ export interface PlayerDisconnectedMsg extends Base<'player_disconnected'> {
 }
 export interface PlayerReconnectedMsg extends Base<'player_reconnected'> {
   playerId: PlayerId;
+}
+/** A player in the room renamed themselves (`relay.setName`): sent to everyone, them included. */
+export interface PlayerRenamedMsg extends Base<'player_renamed'> {
+  playerId: PlayerId;
+  name: string;
 }
 export interface HostChangedMsg extends Base<'host_changed'> {
   hostId: PlayerId;
@@ -574,6 +622,7 @@ export type ServerMessage =
   | PlayerLeftMsg
   | PlayerDisconnectedMsg
   | PlayerReconnectedMsg
+  | PlayerRenamedMsg
   | HostChangedMsg
   | MessageMsg
   | ChatReceivedMsg

@@ -31,6 +31,13 @@ export const LIMITS = {
   maxPlayersPerRoom: 64,
   /** A room's name in room lists (`room.setListing`), in characters (graphemes). */
   maxRoomNameLength: 48,
+  /** A player's name, in characters (graphemes): what a token carries and `setName` takes. */
+  maxPlayerNameLength: 24,
+  /** Text one `moderate` call checks, before tidying (UTF-16 units). */
+  maxModerateTextLength: 256,
+  /** `setName` changes per connection: `renameBurst` at once, then `renamesPerMinute` a minute. */
+  renamesPerMinute: 5,
+  renameBurst: 3,
   /** A room's listing `meta`, as UTF-8 JSON. */
   maxRoomMetaBytes: 512,
   /** `setAccess` and `setListing` changes per room: `roomSettingsBurst` at once, refilling at `roomSettingsPerSecond`. */
