@@ -319,11 +319,16 @@ export type RelayEvents = {
   party: (party: PartyInfo | null) => void;
   /** Your party leader moved you into a room. */
   party_room: (room: Room) => void;
+  /**
+   * The server changed your name without your asking: the game's name rules changed since it was
+   * checked. `relay.playerName` and `relay.nameRejected` already have the new values.
+   */
+  name_changed: (name: string, rejected: ModerationReason | null) => void;
   /** @deprecated The old name of `party_room`; still fires. */
   room: (room: Room) => void;
 };
 
-const RELAY_EVENTS = new Set<string>(['disconnected', 'reconnected', 'server_restarting', 'replaced', 'error', 'party', 'party_room', 'room']);
+const RELAY_EVENTS = new Set<string>(['disconnected', 'reconnected', 'server_restarting', 'replaced', 'error', 'party', 'party_room', 'room', 'name_changed']);
 
 export type CloseReason = 'left' | 'lost' | 'kicked' | 'closed';
 
@@ -521,9 +526,14 @@ export class GameRelay extends Emitter<RelayEvents> {
   /** The name the server gave this connection (`welcome`), and why it swapped the one asked for, if it did. */
   #givenName = '';
   #givenRejected: ModerationReason | null = null;
-  /** The name `setName` set: asked for again on each reconnect, as the token still carries the old one. */
+  /** The name `setName` set, as others see it, until the server changes it (`name_changed`). */
   #renamed: string | null = null;
-  /** Why that name was refused when asked for again, until the next `setName`. */
+  /**
+   * The name `setName` asked for: asked for again on each reconnect, as the token still carries
+   * the old one. Apart from `#renamed`: a name the rules swap and later allow back is still yours.
+   */
+  #renameAsk: string | null = null;
+  /** Why that name was refused when asked for again, until the next `setName` or `name_changed`. */
   #renameRefused: ModerationReason | null = null;
 
   /** This SDK's version, e.g. `0.1.0-alpha.6`. */
@@ -556,14 +566,15 @@ export class GameRelay extends Emitter<RelayEvents> {
     return String(text).replace(/[&<>"']/g, (c) => HTML_ESCAPES[c]!);
   }
 
-  /** Your name, as other players see it: the one you connected with, the server's swap for it, or `setName`'s. */
+  /** Your name, as other players see it: the one you connected with, the server's swap for it (`name_changed`), or `setName`'s. */
   get playerName(): string {
     return this.#renamed ?? this.#givenName;
   }
 
   /**
-   * Why the server swapped your name when you connected (the game moderates names, and it failed:
-   * a `ModerationReason`), or null. `playerName` is the name it gave you.
+   * Why the server swapped your name (the game moderates names, and it failed: a
+   * `ModerationReason`), or null. Set when you connect, and again on `name_changed` if the game's
+   * rules change while you play. `playerName` is the name it gave you.
    */
   get nameRejected(): ModerationReason | null {
     return this.#renamed === null ? (this.#renameRefused ?? this.#givenRejected) : null;
@@ -632,6 +643,7 @@ export class GameRelay extends Emitter<RelayEvents> {
     });
     const given = (data as { name?: unknown } | undefined)?.name;
     this.#renamed = typeof given === 'string' ? given : String(name);
+    this.#renameAsk = this.#renamed;
     this.#renameRefused = null;
     return this.#renamed;
   }
@@ -1574,13 +1586,14 @@ export class GameRelay extends Emitter<RelayEvents> {
       // The token still carries the name from before `setName`: ask for that one again, first, so
       // the party and room hear it as we get back in. Refused now (the owner's rules changed), the
       // server's name stands.
-      const renamed = this.#renamed;
-      if (renamed !== null && renamed !== this.#givenName) {
-        await this.#request({ t: 'set_name', name: renamed }).then(
-          (data) => (this.#renamed = String((data as { name?: Json } | undefined)?.name ?? renamed)),
+      const asked = this.#renameAsk;
+      if (asked !== null && asked !== this.#givenName) {
+        await this.#request({ t: 'set_name', name: asked }).then(
+          (data) => (this.#renamed = String((data as { name?: Json } | undefined)?.name ?? asked)),
           (err: GameRelayError) => {
             if (err instanceof GameRelayModerationError) {
               this.#renamed = null;
+              this.#renameAsk = null;
               this.#renameRefused = err.reason;
             } else gone(err); // (a timeout: the server never answered, so try again on a new socket)
           },
@@ -1686,6 +1699,14 @@ export class GameRelay extends Emitter<RelayEvents> {
         this.#roomControl()?.handle(msg);
         return;
       }
+      case 'name_changed':
+        // The server's name for you now, as at connect. A `setName` name stays the one asked for
+        // after a reconnect, where the rules decide again.
+        this.#givenName = msg.name;
+        this.#givenRejected = msg.nameRejected ?? null;
+        this.#renamed = null;
+        this.#renameRefused = null;
+        return this.fire('name_changed', msg.name, this.#givenRejected);
       case 'welcome':
         return;
       case 'reply':
@@ -2665,6 +2686,8 @@ export class Room extends Emitter<RoomEvents> {
     const real = Object.hasOwn(EVENT_ALIASES, event) ? EVENT_ALIASES[event] : undefined;
     if (real) {
       this.#relay.warn('event_name', `event_name:${event}`, `room.on('${event}') is a custom event (only room.emit('${event}') fires it); the built-in for ${ALIAS_WHAT[real]} is room.on('${real}')`);
+    } else if (event === 'name_changed') {
+      this.#relay.warn('event_name', `event_name:${event}`, `room.on('name_changed') never fires: it's relay.on('name_changed')`);
     }
     const set = this.#custom.get(event) ?? new Set<CustomHandler>();
     this.#custom.set(event, set);

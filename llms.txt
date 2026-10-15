@@ -66,7 +66,7 @@ the page. Until it's filled in, `connect()` rejects with `unauthorized`.
 updates in place, and within `v0` nothing is removed or renamed without a deprecation first (the
 old name keeps working and warns in the console for at least 30 days). `/sdk/gamerelay.js` is the
 same `v0` line, forever. To pin one exact version instead, load it from npm through jsDelivr:
-`https://cdn.jsdelivr.net/npm/@gamerelay/sdk@0.1.0-alpha.12/gamerelay.js` (any published
+`https://cdn.jsdelivr.net/npm/@gamerelay/sdk@0.1.0-alpha.13/gamerelay.js` (any published
 version: `npm view @gamerelay/sdk versions`). Until the SDK reaches 1.0, a pinned alpha may be
 asked to update: new server features can need the newest alpha, and old alphas stop being
 accepted sooner than they will after 1.0.
@@ -977,7 +977,8 @@ const checked = await GameRelay.moderate(nameInput.value, { publicKey: 'gr_pub_â
   `message` is fine to show a player. Games that translate use `reason`.
 - Anything that isn't about the text rejects, with or without `throwOnError`: `plan_required` (a
   plan without name moderation), `rate_limited` (30 checks a minute per player: check on save,
-  not per keystroke), `disconnected`.
+  not per keystroke; over HTTP, 30 new names a minute per address, and 300 for a name that address
+  already checked in the last hour), `disconnected`.
 - Options, all optional and only ever stricter: `maxLength`, `minLength` (names are 1 to 24
   characters, an emoji counting as one), `charset` (`'any'`, `'latin'`, `'alnum'`). `type` is
   `'name'`, the default. e.g. `relay.moderate(plate, { maxLength: 7, charset: 'alnum' })`.
@@ -998,7 +999,15 @@ const relay = await GameRelay.connect({ publicKey, playerName: savedName });
 if (relay.nameRejected) toast(`That name isn't allowed: you're ${relay.playerName} for now`);
 ```
 
-`relay.nameRejected` is the reason the server swapped your name when you connected, or null.
+`relay.nameRejected` is the reason the server swapped your name, or null. If the owner changes
+the rules while you play, your name is checked again before you next enter a room or party or
+submit a score; when that changes it, `playerName` and `nameRejected` update and the relay fires
+`name_changed` (your room then hears `player_renamed`, as for `setName`):
+
+```js
+relay.on('name_changed', (name, rejected) => (nameLabel.textContent = name)); // rejected: a reason, or null
+```
+
 `POST /v1/auth/anonymous` and `/v1/auth/token` also answer with the name used and `nameRejected`
 when it was swapped.
 

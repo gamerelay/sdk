@@ -4,6 +4,17 @@ Every release of `@gamerelay/sdk`, newest first. The notes under a version's hea
 GitHub release. Until 1.0, a minor version (0.x.0) may change the API; each break is listed
 here with what to change.
 
+## 0.1.0-alpha.13 (2026-10-15)
+
+- **Your own name, when the rules change mid-session**: if the game's owner changes its name rules
+  while you play, the server checks your name again before you next enter a room or party or
+  submit a score. When that changes it, `relay.playerName` and `relay.nameRejected` now update,
+  and the new relay event `name_changed` (`(name, rejected)`) fires before your room's
+  `player_renamed`. A name you set with `setName` is still asked for after a reconnect, where the
+  rules decide again (so a name they swap and later allow comes back).
+- Nothing to change in your code. It needs a server from 2026-10-15 (an older one never sends
+  it, and alpha.12 and older ignore it).
+
 ## 0.1.0-alpha.12 (2026-10-15)
 
 - **Name moderation** (plans with `nameModeration`; guide: https://gamerelay.io/guides/moderation).
