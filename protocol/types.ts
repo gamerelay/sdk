@@ -170,7 +170,7 @@ export type ErrorCode =
   | 'internal';
 
 /** Why moderation refused a text (`relay.moderate`, `POST /v1/moderate`). */
-export type ModerationReason = 'empty' | 'too_short' | 'too_long' | 'charset' | 'unsafe' | 'offensive' | 'reserved' | 'link' | 'blocked';
+export type ModerationReason = 'empty' | 'too_short' | 'too_long' | 'charset' | 'unsafe' | 'offensive' | 'reserved' | 'link' | 'blocked' | 'unchecked';
 /** Which characters a name may use: `latin` letters (with accents), digits, spaces and `_.'-`; `alnum` A–Z, 0–9 and spaces. */
 export type ModerationCharset = 'any' | 'latin' | 'alnum';
 /** What the server does with a name that fails when a player asks for it: swap it for `player-1234`, or refuse it. */
