@@ -33,8 +33,10 @@ import {
   type BotSpec,
   type ModerationCharset,
   type ModerationReason,
+  type ModerationRules,
   type ModerationVerdict,
 } from '@gamerelay/protocol/types';
+import { CHARSET_ORDER, NAME_MESSAGES, precheckName } from '@gamerelay/protocol/names';
 import { GameRelayError, GameRelayModerationError, type GameRelayErrorCode } from './errors';
 import { CREATE, DEBUG, defaults, relays, rooms, type Outgoing, type RelayLink, type Request, type RoomControl, type RoomDebugInfo } from './internal';
 import { Ticker, pickScheduler } from './core/ticker';
@@ -85,6 +87,7 @@ export type {
   PartyMember,
   ModerationCharset,
   ModerationReason,
+  ModerationRules,
 };
 
 /** What `POST /v1/auth/token` (and `/v1/auth/anonymous`) answer with; `getToken` may return it whole. */
@@ -394,8 +397,11 @@ const REPLY_TIMEOUT_MS = 10_000;
 const MAX_EXPIRED = 64;
 /** A connect (the token, then the socket's welcome) that takes longer than this fails with `timeout`. */
 const CONNECT_TIMEOUT_MS = 15_000;
-/** Reconnect failures that retrying can't fix: the relay stops (and says why, through `error`). */
-const FINAL_CODES = new Set<string>(['unauthorized', 'upgrade_required']);
+/**
+ * Reconnect failures that retrying can't fix: the relay stops (and says why, through `error`). A
+ * name the game refuses (`moderated`) is refused again on every try.
+ */
+const FINAL_CODES = new Set<string>(['unauthorized', 'upgrade_required', 'moderated']);
 
 /** A secret key (`gr_sk_`) where a page would hold it. */
 const secretKey = () => new GameRelayError('unauthorized', "That's your SECRET key (gr_sk_): never put it in a page. Rotate it now in the dashboard; pages use the public key (gr_pub_)");
@@ -436,6 +442,20 @@ async function moderateOverHttp(base: string, publicKey: string, text: string, o
   const body = (parsed && typeof parsed === 'object' ? parsed : {}) as Partial<ModerationVerdict> & { error?: unknown; message?: string };
   if (res.ok && typeof body.ok === 'boolean') return body as ModerationVerdict;
   throw new GameRelayError(moderateCode(res.status, typeof body.error === 'string' ? body.error : undefined), body.message ?? `Moderation failed (${res.status})`);
+}
+
+/** `GET /v1/moderate/rules` with a public key: the game's name rules, or a `GameRelayError`. */
+async function rulesOverHttp(base: string, publicKey: string): Promise<ModerationRules> {
+  if (publicKey.startsWith('gr_sk_')) throw secretKey();
+  let res: Response;
+  try {
+    res = await fetch(`${base}/v1/moderate/rules?publicKey=${encodeURIComponent(publicKey)}`);
+  } catch (err) {
+    throw new GameRelayError('disconnected', `Can't reach ${base}: are you online?`, { cause: err });
+  }
+  const body = ((await res.json().catch(() => null)) ?? {}) as Partial<ModerationRules> & { error?: unknown; message?: string };
+  if (res.ok && typeof body.moderated === 'boolean') return body as ModerationRules;
+  throw new GameRelayError(authCode(res.status, typeof body.error === 'string' ? body.error : undefined), body.message ?? `Rules request failed (${res.status})`);
 }
 
 /** A verdict as `moderate()` hands it back: a result, or with `throwOnError` the text (or a rejection). */
@@ -535,6 +555,8 @@ export class GameRelay extends Emitter<RelayEvents> {
   #renameAsk: string | null = null;
   /** Why that name was refused when asked for again, until the next `setName` or `name_changed`. */
   #renameRefused: ModerationReason | null = null;
+  /** The game's name rules, asked for once (`moderationRules()`). */
+  #rules: Promise<ModerationRules> | null = null;
 
   /** This SDK's version, e.g. `0.1.0-alpha.6`. */
   static readonly version: string = SDK_VERSION;
@@ -556,6 +578,31 @@ export class GameRelay extends Emitter<RelayEvents> {
     if (!options?.publicKey) throw new GameRelayError('bad_request', 'GameRelay.moderate needs { publicKey } (your gr_pub_ key)');
     const base = (options.url ?? defaults.url).replace(/\/$/, '');
     return moderationResult(await moderateOverHttp(base, options.publicKey, text, options), text, options);
+  }
+
+  /**
+   * The game's name rules a client may know, before connecting (`ModerationRules`: charset,
+   * lengths, links, and whether the server checks names). Never the game's terms. For `precheck`.
+   */
+  static moderationRules(options: { publicKey: string; url?: string }): Promise<ModerationRules> {
+    if (!options?.publicKey) return Promise.reject(new GameRelayError('bad_request', 'GameRelay.moderationRules needs { publicKey } (your gr_pub_ key)'));
+    return rulesOverHttp((options.url ?? defaults.url).replace(/\/$/, ''), options.publicKey);
+  }
+
+  /**
+   * The name checks that need no server, for a name field as the player types: empty, markup,
+   * length, charset and links, under the game's `rules` (`moderationRules()`) made stricter by
+   * your `options`. Answers as `moderate()` does. A name that passes still needs `moderate()` (or
+   * `setName`) for the word lists, which never leave the server.
+   */
+  static precheck(text: string, rules?: Partial<ModerationRules> | null, options: ModerateOptions = {}): ModerationResult {
+    const rank = (c: ModerationCharset | undefined) => CHARSET_ORDER.indexOf(c ?? 'any');
+    const charset = rank(options.charset) > rank(rules?.charset) ? options.charset : rules?.charset;
+    const minLength = Math.max(rules?.minLength ?? 1, options.minLength ?? 1);
+    const maxLength = Math.min(rules?.maxLength ?? Infinity, options.maxLength ?? Infinity);
+    const pre = precheckName(text, { charset, minLength, maxLength, links: rules?.links ?? true });
+    if (pre.ok) return { ok: true, value: pre.name };
+    return { ok: false, error: new GameRelayModerationError(pre.reason, NAME_MESSAGES[pre.reason], String(text), options.type ?? 'name') };
   }
 
   /**
@@ -629,6 +676,20 @@ export class GameRelay extends Emitter<RelayEvents> {
         ? await moderateOverHttp(this.#base, this.#opts.publicKey, text, options)
         : ((await this.#request({ t: 'moderate', text, type, minLength, maxLength, charset })) as ModerationVerdict);
     return moderationResult(verdict, text, options);
+  }
+
+  /**
+   * The game's name rules (`ModerationRules`), for `GameRelay.precheck` as a player types: asked
+   * for once and kept for the session. Over the socket, or over HTTP before connecting.
+   */
+  moderationRules(): Promise<ModerationRules> {
+    this.#rules ??= (
+      this.connected || !this.#opts.publicKey ? this.#request({ t: 'moderation_rules' }).then((d) => d as unknown as ModerationRules) : rulesOverHttp(this.#base, this.#opts.publicKey)
+    ).catch((err: unknown) => {
+      this.#rules = null; // asked again next time
+      throw err;
+    });
+    return this.#rules;
   }
 
   /**
@@ -1349,7 +1410,7 @@ export class GameRelay extends Emitter<RelayEvents> {
         });
         // A proxy error page isn't JSON: treat it like any other failed response.
         const parsed: unknown = await res.json().catch(() => null);
-        const body: { token?: string; expiresAt?: number; wsUrl?: string; error?: string; message?: string } = parsed && typeof parsed === 'object' ? parsed : {};
+        const body: { token?: string; expiresAt?: number; wsUrl?: string; error?: string; message?: string; reason?: ModerationReason } = parsed && typeof parsed === 'object' ? parsed : {};
         return { res, body };
       } catch (err) {
         // Offline, DNS or CORS: not the key's fault, so a reconnect tries again.
@@ -1357,6 +1418,8 @@ export class GameRelay extends Emitter<RelayEvents> {
       }
     }, true);
     if (!res.ok || !body.token || !body.expiresAt) {
+      // The game refuses names that fail (`onNameReject: 'refuse'`): connect rejects, as setName does.
+      if (body.error === 'moderated') throw new GameRelayModerationError(body.reason ?? 'blocked', body.message ?? 'Invalid name', String(this.#opts.playerName ?? ''));
       throw new GameRelayError(authCode(res.status, body.error), body.message ?? `Auth failed (${res.status})`);
     }
     this.#token = { value: body.token, expiresAt: body.expiresAt };

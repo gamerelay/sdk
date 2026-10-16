@@ -173,6 +173,23 @@ export type ErrorCode =
 export type ModerationReason = 'empty' | 'too_short' | 'too_long' | 'charset' | 'unsafe' | 'offensive' | 'reserved' | 'link' | 'blocked';
 /** Which characters a name may use: `latin` letters (with accents), digits, spaces and `_.'-`; `alnum` A–Z, 0–9 and spaces. */
 export type ModerationCharset = 'any' | 'latin' | 'alnum';
+/** What the server does with a name that fails when a player asks for it: swap it for `player-1234`, or refuse it. */
+export type NameReject = 'swap' | 'refuse';
+/**
+ * A game's name rules a client may know (`relay.moderationRules()`, `GET /v1/moderate/rules`): the
+ * ones `GameRelay.precheck` runs as a player types. The word lists stay on the server.
+ */
+export interface ModerationRules {
+  /** Whether the server checks the names players show (the game's "Name moderation" on, on a plan with it). */
+  moderated: boolean;
+  charset: ModerationCharset;
+  minLength: number;
+  maxLength: number;
+  /** Whether links count against a name. */
+  links: boolean;
+  /** What happens to a failing name a player asks for (connect, `setName`); `setName` always refuses. */
+  onReject: NameReject;
+}
 /** What a moderation check answers, over the socket and `POST /v1/moderate`. (A type alias so it is assignable to `Json`.) */
 export type ModerationVerdict =
   | { ok: true; value: string }
@@ -380,6 +397,10 @@ export interface ModerateMsg extends Base<'moderate'> {
   maxLength?: number;
   charset?: ModerationCharset;
 }
+/** The game's name rules (`ModerationRules`). Reply: the rules. */
+export interface ModerationRulesMsg extends Base<'moderation_rules'> {
+  rid: number;
+}
 /**
  * Rename yourself: your room and party hear `player_renamed`, and later scores carry the new name.
  * Reply: `{ name }`, as others see it. With the game's "Name moderation" on, a failing name is
@@ -420,6 +441,7 @@ export type LobbyClientMessage =
   | PartyJoinMsg
   | PartyLeaveMsg
   | ModerateMsg
+  | ModerationRulesMsg
   | SetNameMsg;
 
 export type ClientMessage = LobbyClientMessage | RoomClientMessage | RoomRequestMessage | BatchMsg;

@@ -4,6 +4,21 @@ Every release of `@gamerelay/sdk`, newest first. The notes under a version's hea
 GitHub release. Until 1.0, a minor version (0.x.0) may change the API; each break is listed
 here with what to change.
 
+## 0.1.0-alpha.14 (2026-10-15)
+
+- **The game's name rules, as the player types**: `relay.moderationRules()` (asked once a
+  session), or `GameRelay.moderationRules({ publicKey })` before connecting, returns the rules a
+  client may know: `{ moderated, charset, minLength, maxLength, links, onReject }`, never the
+  game's terms. `GameRelay.precheck(text, rules, options?)` runs the checks that need no server
+  (empty, markup, length, charset, links) and answers as `moderate()` does, so a name field can
+  say "too long" before anything is sent. Check again with `moderate()` or `setName` on submit.
+- **A refused name at connect**: when the game refuses failing names (its new "When a name fails"
+  rule), `GameRelay.connect({ playerName })` rejects with a `GameRelayModerationError` for a name
+  that fails. A name your token already carried is still swapped, as before. On a reconnect, a
+  refused name stops the relay (`error`) instead of retrying.
+- About 1.1 KB gzipped more (33.6 KB): the checks are the server's own, shared. Nothing to change
+  in your code; the new calls need a server from 2026-10-15.
+
 ## 0.1.0-alpha.13 (2026-10-15)
 
 - **Your own name, when the rules change mid-session**: if the game's owner changes its name rules
