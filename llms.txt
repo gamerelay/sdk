@@ -66,7 +66,7 @@ the page. Until it's filled in, `connect()` rejects with `unauthorized`.
 updates in place, and within `v0` nothing is removed or renamed without a deprecation first (the
 old name keeps working and warns in the console for at least 30 days). `/sdk/gamerelay.js` is the
 same `v0` line, forever. To pin one exact version instead, load it from npm through jsDelivr:
-`https://cdn.jsdelivr.net/npm/@gamerelay/sdk@0.1.0-alpha.14/gamerelay.js` (any published
+`https://cdn.jsdelivr.net/npm/@gamerelay/sdk@0.1.0-alpha.15/gamerelay.js` (any published
 version: `npm view @gamerelay/sdk versions`). Until the SDK reaches 1.0, a pinned alpha may be
 asked to update: new server features can need the newest alpha, and old alphas stop being
 accepted sooner than they will after 1.0.
@@ -973,7 +973,8 @@ const checked = await GameRelay.moderate(nameInput.value, { publicKey: 'gr_pub_�
 
 - `result.error` is a `GameRelayModerationError` (a `GameRelayError` with code `moderated`):
   `reason` is one of `offensive`, `reserved`, `link`, `blocked`, `unsafe` (HTML or a
-  `javascript:` link), `charset`, `too_short`, `too_long`, `empty`; `text` is what was checked;
+  `javascript:` link), `charset`, `too_short`, `too_long`, `empty`, or `unchecked` (the game's
+  own server didn't answer in time; see "Your own server" below); `text` is what was checked;
   `message` is fine to show a player. Games that translate use `reason`.
 - Anything that isn't about the text rejects, with or without `throwOnError`: `plan_required` (a
   plan without name moderation), `rate_limited` (30 checks a minute per player: check on save,
@@ -999,7 +1000,10 @@ nameInput.oninput = () => (hint.textContent = GameRelay.precheck(nameInput.value
   that fails is swapped for `player-1234` wherever other players see it: in the player's token,
   in rooms, and on leaderboards (checked as they're read, so older entries are covered too), and
   `setName` rejects it with a `GameRelayModerationError`. There the owner can also add:
-  - **Blocked** terms (3+ letters), matched anywhere in a name, past spacing and leetspeak.
+  - **Blocked** terms (3+ letters), matched past spacing, leetspeak and lookalike letters, each
+    with a match mode: a whole `word`, `anywhere` (inside or across words), the `exact` name, or a
+    `prefix` (`rival*`). Typed, pasted or uploaded as a text file; 200 per list on Basic, 10,000 on
+    Pro.
   - **Allowed** words: whole words the built-in lists get wrong for your players (a surname, a
     word in their language). They only lift the built-in word lists: blocked terms, phrases
     ("kill yourself"), links and markup still count.
@@ -1012,10 +1016,29 @@ nameInput.oninput = () => (hint.textContent = GameRelay.precheck(nameInput.value
     makes `GameRelay.connect({ playerName })` reject with a `GameRelayModerationError`, as
     `setName` does, so a name screen can ask again. A name the player's token already carried is
     swapped either way, so a renewed token never locks a player out mid-game.
+  - A rule change reaches each connected player on their next room, party or score (dashboard:
+    "Re-check connected players" checks everyone at once). Each name swapped, refused or brought
+    back is in the game's logs (types `name_swapped`, `name_refused`, `name_restored`; the account
+    MCP's `search_logs`).
   - **Trust your backend's names**: names a token minted with your secret key carries
     (`POST /v1/auth/token`) are shown as typed; the player's own `setName` is still checked.
     Untrusted, a backend's failing name is swapped, never refused (the answer has
     `nameRejected`): check names first with `POST /v1/moderate` to refuse them yourself.
+  - **Your own server** (Settings → Name moderation → Your server): each new name that passes
+    the filter and the game's terms is POSTed to the owner's URL, signed as webhooks are
+    (`gamerelay-signature`, its own `whsec_` secret, verified the same way as in Webhooks below),
+    with `{ id, type: 'name', text, playerId, instanceId, policyVersion, source }` (`source`:
+    `token`, `setName`, `moderate`, `recheck` or `test`). The answer is kept per name, for every
+    player who picks it, so it should judge the name alone (not the player). It answers `{ ok: true }` or
+    `{ ok: false, reason?, text? }`: a no is reason `blocked` with its `reason` (up to 100
+    characters) as the message, and `text` is shown instead when the filter passes it (otherwise
+    `player-1234`). Waited for (timeout 0.5 to 3 s, 1.5 by default) where a player waits anyway:
+    anonymous tokens, `setName`, `moderate()`. Secret-key tokens (unless the backend's names are
+    trusted), connections and leaderboards use its kept answer, or ask in the background and swap
+    the name after (`name_changed`, `player_renamed`). A backend's own `POST /v1/moderate` (secret
+    key) never asks it. No answer in time: the name stands (the
+    default), or shows as `player-1234` with reason `unchecked` until it answers. Each name is
+    asked once until the owner presses Forget answers, changes the URL, or turns it off and on.
 
 ```js
 const relay = await GameRelay.connect({ publicKey, playerName: savedName });
@@ -1081,9 +1104,10 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 
 function verifyGamerelay(rawBody, header, secret) {
   const { t, v1 } = Object.fromEntries(header.split(',').map((kv) => kv.split('=')));
-  if (Math.abs(Date.now() / 1000 - Number(t)) > 300) return false; // replay window
+  if (!v1 || !Number.isInteger(Number(t)) || Math.abs(Date.now() / 1000 - Number(t)) > 300) return false; // replay window
   const expected = createHmac('sha256', secret).update(`${t}.${rawBody}`).digest('hex');
-  return v1?.length === expected.length && timingSafeEqual(Buffer.from(v1), Buffer.from(expected));
+  const got = Buffer.from(v1 ?? '');
+  return got.length === expected.length && timingSafeEqual(got, Buffer.from(expected)); // byte lengths, or it throws
 }
 
 // e.g. with Hono / Bun: const raw = await req.text(); verify, then JSON.parse(raw)

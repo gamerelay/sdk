@@ -4,6 +4,16 @@ Every release of `@gamerelay/sdk`, newest first. The notes under a version's hea
 GitHub release. Until 1.0, a minor version (0.x.0) may change the API; each break is listed
 here with what to change.
 
+## 0.1.0-alpha.15 (2026-10-15)
+
+- **A new moderation reason, `unchecked`**: a game can now have its own server judge names (its
+  owner's "Your server" setting). When that server doesn't answer in time and the game swaps
+  names it can't check, `relay.nameRejected`, `GameRelayModerationError.reason` and
+  `moderate()`'s `error.reason` say `unchecked`. A refusal from the game's server is `blocked`,
+  with its own reason as `message`.
+- Types only: nothing to change in your code, and older SDKs pass the new reason through as a
+  string.
+
 ## 0.1.0-alpha.14 (2026-10-15)
 
 - **The game's name rules, as the player types**: `relay.moderationRules()` (asked once a

@@ -22,7 +22,11 @@ export class GameRelayError extends Error {
 export class GameRelayModerationError extends GameRelayError {
   declare readonly code: 'moderated';
   constructor(
-    /** Why: `offensive`, `reserved`, `link`, `blocked`, `unsafe`, `charset`, `too_short`, `too_long` or `empty`. */
+    /**
+     * Why: `offensive`, `reserved`, `link`, `blocked`, `unsafe`, `charset`, `too_short`,
+     * `too_long`, `empty`, or `unchecked` (the game's own server didn't answer in time, and the
+     * game refuses names it can't check).
+     */
     readonly reason: ModerationReason,
     message: string,
     /** The text that was checked. */

@@ -19,6 +19,7 @@ export const NAME_MESSAGES: Record<ModerationReason, string> = {
   reserved: 'Invalid name: kept for the game',
   link: 'Invalid name: no links',
   blocked: 'Invalid name: not allowed in this game',
+  unchecked: "Invalid name: couldn't be checked right now",
 };
 
 /** The rules a precheck applies, all optional: a name's own limits (1 to 24 characters, any charset, no links) otherwise. */
