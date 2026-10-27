@@ -150,7 +150,51 @@ export interface ConnectOptions {
   lan?: P2POptions;
   /** Run bots' brains in this tab when it hosts (BOTS.md; `room.bots()`). On by default on localhost. */
   botHost?: boolean;
+  /**
+   * Where the SDK's traffic goes instead of the network: a socket in place of the browser's
+   * WebSocket, and optionally its own `fetch`. For pages that can't reach GameRelay directly (a
+   * sandboxed preview, a chat's artifact, a Discord Activity), through an adapter such as
+   * `@gamerelay/sandbox`, and for tests and local relays. Leave it out to use the network.
+   * Experimental: outside the API promise, it may change in a minor release.
+   * @experimental
+   */
+  transport?: Transport;
 }
+
+/**
+ * One socket as the SDK uses it: the part of the browser's `WebSocket` it touches. `readyState`
+ * is 1 while open (0 connecting, 2 closing, 3 closed); `onmessage` gets each server frame as
+ * text in `data`, and `onclose` fires once with a close code. Experimental.
+ */
+export interface TransportSocket {
+  readonly readyState: number;
+  send(data: string): void;
+  close(code?: number, reason?: string): void;
+  // Declared as methods' types, so the browser's own WebSocket (handlers taking a MessageEvent or a CloseEvent) fits.
+  onmessage: { handler(ev: { data: unknown }): void }['handler'] | null;
+  onclose: { handler(ev: { code: number }): void }['handler'] | null;
+}
+
+/** `connect({ transport })`. Experimental. */
+export interface Transport {
+  /**
+   * Open a socket in place of `new WebSocket(url, protocol)`. `url` is the server's `wss://…/ws`
+   * address with the token, SDK version and capabilities in its query, so a proxy can rewrite it
+   * and an in-page relay can read the token. The SDK sets `onmessage` and `onclose` after this
+   * returns, so the socket mustn't call them before then (open it later, as a WebSocket does).
+   */
+  open(url: string, protocol: string): TransportSocket;
+  /** In place of the global `fetch` for the SDK's own requests (the player token, moderation over HTTP). */
+  fetch?: (url: string, init?: RequestInit) => Promise<Response>;
+  /** `false`: players can't reach each other from here (a sandbox), so the SDK never tries P2P, whatever `p2p` says. `true` changes nothing. */
+  p2p?: boolean;
+}
+
+/** The default transport: the network. (Looked up when used, so a page's own WebSocket and fetch are the ones in place then.) */
+const network = {
+  open: (url: string, protocol: string): TransportSocket => new WebSocket(url, protocol),
+  fetch: (url: string, init?: RequestInit): Promise<Response> => fetch(url, init),
+};
 
 /** `connect({ p2p })`: on (the default), off, or how. Experimental. */
 export type P2POptions = boolean | { forceRelay?: boolean; direct?: 'party' };
@@ -425,12 +469,12 @@ function moderateCode(status: number, error: string | undefined): GameRelayError
 }
 
 /** `POST /v1/moderate` with a public key: the verdict, or a `GameRelayError` for anything that isn't about the text. */
-async function moderateOverHttp(base: string, publicKey: string, text: string, options: ModerateOptions): Promise<ModerationVerdict> {
+async function moderateOverHttp(base: string, publicKey: string, text: string, options: ModerateOptions, request = network.fetch): Promise<ModerationVerdict> {
   if (publicKey.startsWith('gr_sk_')) throw secretKey();
   const { type, minLength, maxLength, charset } = options;
   let res: Response;
   try {
-    res = await fetch(`${base}/v1/moderate`, {
+    res = await request(`${base}/v1/moderate`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ publicKey, text, type, minLength, maxLength, charset }),
@@ -445,11 +489,11 @@ async function moderateOverHttp(base: string, publicKey: string, text: string, o
 }
 
 /** `GET /v1/moderate/rules` with a public key: the game's name rules, or a `GameRelayError`. */
-async function rulesOverHttp(base: string, publicKey: string): Promise<ModerationRules> {
+async function rulesOverHttp(base: string, publicKey: string, request = network.fetch): Promise<ModerationRules> {
   if (publicKey.startsWith('gr_sk_')) throw secretKey();
   let res: Response;
   try {
-    res = await fetch(`${base}/v1/moderate/rules?publicKey=${encodeURIComponent(publicKey)}`);
+    res = await request(`${base}/v1/moderate/rules?publicKey=${encodeURIComponent(publicKey)}`);
   } catch (err) {
     throw new GameRelayError('disconnected', `Can't reach ${base}: are you online?`, { cause: err });
   }
@@ -673,7 +717,7 @@ export class GameRelay extends Emitter<RelayEvents> {
     const { type, minLength, maxLength, charset } = options;
     const verdict =
       !this.connected && this.#opts.publicKey
-        ? await moderateOverHttp(this.#base, this.#opts.publicKey, text, options)
+        ? await moderateOverHttp(this.#base, this.#opts.publicKey, text, options, this.#fetch)
         : ((await this.#request({ t: 'moderate', text, type, minLength, maxLength, charset })) as ModerationVerdict);
     return moderationResult(verdict, text, options);
   }
@@ -684,7 +728,7 @@ export class GameRelay extends Emitter<RelayEvents> {
    */
   moderationRules(): Promise<ModerationRules> {
     this.#rules ??= (
-      this.connected || !this.#opts.publicKey ? this.#request({ t: 'moderation_rules' }).then((d) => d as unknown as ModerationRules) : rulesOverHttp(this.#base, this.#opts.publicKey)
+      this.connected || !this.#opts.publicKey ? this.#request({ t: 'moderation_rules' }).then((d) => d as unknown as ModerationRules) : rulesOverHttp(this.#base, this.#opts.publicKey, this.#fetch)
     ).catch((err: unknown) => {
       this.#rules = null; // asked again next time
       throw err;
@@ -725,7 +769,7 @@ export class GameRelay extends Emitter<RelayEvents> {
       this.#request({ t: 'lb_top', board, limit: options.limit }).then((d) => d as LeaderboardPage),
   });
 
-  #ws: WebSocket | null = null;
+  #ws: TransportSocket | null = null;
   /** This connection's frame key and sequence (signed frames); private so the console can't read it. */
   #frameKey: FrameKey | null = null;
   #frameSeq = 0;
@@ -746,6 +790,8 @@ export class GameRelay extends Emitter<RelayEvents> {
   #unwatchPage: () => void = () => {};
   readonly #opts: ConnectOptions;
   readonly #base: string;
+  /** `connect({ transport })`, or the network. */
+  readonly #transport: Transport;
   #token: { value: string; expiresAt: number } | null = null;
   /** Where the token response said to connect (`wsUrl`), if it said and it's `followable`. */
   #wsUrl: string | null = null;
@@ -817,6 +863,7 @@ export class GameRelay extends Emitter<RelayEvents> {
     const opts = (options ?? {}) as ConnectOptions;
     this.#opts = opts;
     this.#base = (opts.url ?? defaults.url).replace(/\/$/, '');
+    this.#transport = opts.transport ?? network;
     if (!opts.publicKey && !opts.getToken) throw new GameRelayError('bad_request', 'GameRelay.connect needs publicKey (your gr_pub_ key) or getToken');
     if (typeof opts.publicKey === 'string' && opts.publicKey.startsWith('gr_sk_')) throw secretKey();
     const relay = this;
@@ -900,7 +947,15 @@ export class GameRelay extends Emitter<RelayEvents> {
 
   /** Player to player (`p2p`, or its old name `lan`). */
   get #p2p(): P2POptions | undefined {
+    if (this.#transport.p2p === false) return false;
     return this.#opts.p2p ?? this.#opts.lan;
+  }
+
+  /** The SDK's own HTTP requests: the transport's `fetch`, or the network's. */
+  get #fetch(): (url: string, init?: RequestInit) => Promise<Response> {
+    // Called on the transport, so `fetch: window.fetch` and an adapter's own method both work.
+    const transport = this.#transport;
+    return transport.fetch ? (url, init) => transport.fetch!(url, init) : network.fetch;
   }
 
   get connected(): boolean {
@@ -1397,7 +1452,7 @@ export class GameRelay extends Emitter<RelayEvents> {
     const storeKey = `gamerelay:${this.#opts.publicKey}`;
     const { res, body } = await this.#tokenStage(this.#base, async (signal) => {
       try {
-        const res = await fetch(`${this.#base}/v1/auth/anonymous`, {
+        const res = await this.#fetch(`${this.#base}/v1/auth/anonymous`, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
@@ -1504,7 +1559,14 @@ export class GameRelay extends Emitter<RelayEvents> {
         rejectOpen(err);
       };
       this.#abortOpen = reject;
-      const ws = new WebSocket(url, 'gamerelay.v1.json');
+      let ws: TransportSocket;
+      try {
+        ws = this.#transport.open(url, 'gamerelay.v1.json');
+      } catch (err) {
+        // (A WebSocket throws for a URL it can't open; an adapter may throw for anything.)
+        reject(new GameRelayError('disconnected', `Can't open a connection to ${target}: ${err instanceof Error ? err.message : String(err)}`, { cause: err }));
+        return;
+      }
       this.#ws = ws;
       this.#frameKey = null;
       this.#frameSeq = 0;
@@ -1529,7 +1591,7 @@ export class GameRelay extends Emitter<RelayEvents> {
         if (welcomed || this.#ws !== ws) return;
         giveUp(new GameRelayError('timeout', `No answer from ${target} in ${CONNECT_TIMEOUT_MS / 1000} s`));
       }, CONNECT_TIMEOUT_MS);
-      const receive = (ev: MessageEvent) => {
+      const receive = (ev: { data: unknown }) => {
         // (A delayed message can arrive after its socket was replaced.)
         if (this.#ws !== ws) return;
         this.#heardAt = performance.now();

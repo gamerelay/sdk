@@ -7,18 +7,14 @@ import { afterEach, expect, jest, spyOn, test } from 'bun:test';
 import { GameRelay, type ConnectOptions } from '../src/index';
 import { followable } from '../src/core/hosts';
 import { SDK_VERSION } from '../src/version';
-import { advance, FakeSocket, settle } from './fakeRelay';
+import { advance, FakeSocket, FakeTransport, settle, tokenAnswer } from './fakeRelay';
 import pkg from '../package.json';
 
-const g = globalThis as unknown as { WebSocket: unknown; fetch: unknown };
-const saved = { WebSocket: g.WebSocket, fetch: g.fetch };
 let relay: GameRelay | null = null;
 
 afterEach(() => {
   relay?.close();
   relay = null;
-  g.WebSocket = saved.WebSocket;
-  g.fetch = saved.fetch;
   jest.useRealTimers();
 });
 
@@ -26,9 +22,9 @@ afterEach(() => {
 async function connect(options: Partial<ConnectOptions>, tokenBody: Record<string, unknown> = {}, welcome: Record<string, unknown> = {}) {
   jest.useFakeTimers();
   FakeSocket.all = [];
-  g.WebSocket = FakeSocket;
-  g.fetch = async () => ({ ok: true, status: 200, json: async () => ({ token: 'tok', expiresAt: Date.now() + 3_600_000, ...tokenBody }) });
-  const connecting = GameRelay.connect({ publicKey: 'gr_pub_test', url: 'https://gamerelay.io', lan: false, ...options });
+  const transport = new FakeTransport();
+  transport.auth = tokenAnswer(tokenBody);
+  const connecting = GameRelay.connect({ publicKey: 'gr_pub_test', url: 'https://gamerelay.io', lan: false, transport, ...options });
   await settle();
   const socket = FakeSocket.last;
   socket.welcome('pa', Date.now(), welcome);
