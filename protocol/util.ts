@@ -69,3 +69,17 @@ export function safeStorage(kind: 'local' | 'session' = 'local'): SafeStorage {
     setJSON: (key, value) => void attempt(() => store()?.setItem(key, JSON.stringify(value))),
   };
 }
+
+const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+
+/** `length` random letters and digits, uniformly (for keys, ids and links). */
+export function randomBase62(length: number): string {
+  // Rejection sampling keeps the distribution uniform (248 = 4 * 62).
+  let out = '';
+  while (out.length < length) {
+    for (const b of crypto.getRandomValues(new Uint8Array(length * 2))) {
+      if (b < 248 && out.length < length) out += BASE62[b % 62];
+    }
+  }
+  return out;
+}

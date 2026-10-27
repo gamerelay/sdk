@@ -4,6 +4,19 @@ Every release of `@gamerelay/sdk`, newest first. The notes under a version's hea
 GitHub release. Until 1.0, a minor version (0.x.0) may change the API; each break is listed
 here with what to change.
 
+## 0.1.0-alpha.16 (2026-10-26)
+
+- **`connect({ transport })`, experimental**: the SDK's socket and its own requests (the player
+  token, moderation over HTTP) can go through a transport you pass instead of the network: an
+  object with `open(url, protocol)` returning a socket-like `TransportSocket`, an optional
+  `fetch`, and `p2p: false` for places players can't reach each other (P2P stays off there,
+  whatever `p2p` says). It's the seam for running games where no WebSocket to GameRelay can be
+  opened (a chat's artifact, a Discord Activity: TRANSPORT.md), and for tests and local relays.
+  Leave it out and nothing changes.
+- **Docs** (llms.txt): AI checks of player names (paid plans, `swap` or `hold`); the name
+  filter's built-in lists on every plan, on by default for new games; a stricter webhook
+  signature check in the verifier sample. Nothing to change in your code.
+
 ## 0.1.0-alpha.15 (2026-10-15)
 
 - **A new moderation reason, `unchecked`**: a game can now have its own server judge names (its

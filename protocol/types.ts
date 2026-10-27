@@ -180,7 +180,7 @@ export type NameReject = 'swap' | 'refuse';
  * ones `GameRelay.precheck` runs as a player types. The word lists stay on the server.
  */
 export interface ModerationRules {
-  /** Whether the server checks the names players show (the game's "Name moderation" on, on a plan with it). */
+  /** Whether the server checks the names players show (the game's "Name moderation" setting, on every plan). */
   moderated: boolean;
   charset: ModerationCharset;
   minLength: number;

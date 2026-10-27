@@ -6,18 +6,18 @@
 import { afterEach, describe, expect, jest, spyOn, test } from 'bun:test';
 import { GameRelay, GameRelayError, Room, seededRandom } from '../src/index';
 import { RequestRejection, Requests } from '../src/sync/requests';
-import { answerRoom, connectFake, FakeSocket, advance, settle } from './fakeRelay';
+import { answerRoom, connectFake, FakeSocket, FakeTransport, advance, settle } from './fakeRelay';
 import { FakeNet } from './fakeNet';
 
-const g = globalThis as unknown as { WebSocket: unknown; fetch: unknown; location?: unknown; history?: unknown };
-const saved = { WebSocket: g.WebSocket, fetch: g.fetch };
+const g = globalThis as unknown as { location?: unknown; history?: unknown };
 let cleanup: (() => void) | null = null;
+/** The fake server the tests below connect to (`connect({ transport: net })`). */
+let net = new FakeTransport();
 
 afterEach(() => {
   cleanup?.();
   cleanup = null;
-  g.WebSocket = saved.WebSocket;
-  g.fetch = saved.fetch;
+  net = new FakeTransport();
   delete g.location;
   delete g.history;
   jest.useRealTimers();
@@ -32,17 +32,16 @@ async function inRoom(playerId = 'pa') {
   return { ...f, room: await entering };
 }
 
-/** Connect with `fetch` answering `answer`, catching what `connect` rejects with. */
+/** Connect with the token request answering `answer`, catching what `connect` rejects with. */
 async function failConnect(answer: () => Promise<unknown>, options: Record<string, unknown> = {}) {
   jest.useFakeTimers();
   FakeSocket.all = [];
-  g.WebSocket = FakeSocket;
   let fetched = 0;
-  g.fetch = () => {
+  net.auth = () => {
     fetched++;
     return answer();
   };
-  const err = await GameRelay.connect({ publicKey: 'gr_pub_test', url: 'http://test.local', lan: false, ...options }).then(
+  const err = await GameRelay.connect({ transport: net, publicKey: 'gr_pub_test', url: 'http://test.local', lan: false, ...options }).then(
     () => null,
     (e: unknown) => e,
   );
@@ -75,10 +74,8 @@ describe('every rejection is a GameRelayError with a code', () => {
   test('a socket that never says welcome: `timeout` after 15 s', async () => {
     jest.useFakeTimers();
     FakeSocket.all = [];
-    g.WebSocket = FakeSocket;
-    g.fetch = async () => ({ ok: true, status: 200, json: async () => ({ token: 'tok', expiresAt: Date.now() + 3_600_000 }) });
     let err: GameRelayError | null = null;
-    void GameRelay.connect({ publicKey: 'gr_pub_test', url: 'http://test.local', lan: false }).catch((e) => (err = e));
+    void GameRelay.connect({ transport: net, publicKey: 'gr_pub_test', url: 'http://test.local', lan: false }).catch((e) => (err = e));
     await advance(14_000, 500);
     expect(err).toBeNull();
     await advance(1_500, 500);
@@ -90,10 +87,8 @@ describe('every rejection is a GameRelayError with a code', () => {
     for (const bad of [{ playerId: undefined }, { k: 'not-a-key' }]) {
       jest.useFakeTimers();
       FakeSocket.all = [];
-      g.WebSocket = FakeSocket;
-      g.fetch = async () => ({ ok: true, status: 200, json: async () => ({ token: 'tok', expiresAt: Date.now() + 3_600_000 }) });
       let err: GameRelayError | null = null;
-      void GameRelay.connect({ publicKey: 'gr_pub_test', url: 'http://test.local', lan: false }).then(
+      void GameRelay.connect({ transport: net, publicKey: 'gr_pub_test', url: 'http://test.local', lan: false }).then(
         (relay) => {
           relay.close();
           err = { code: 'connected' } as unknown as GameRelayError;
@@ -232,13 +227,13 @@ describe('one way everything stops', () => {
   });
 
   test('a reconnect the server refuses (rotated key): `error` says why, and it stops', async () => {
-    const { relay, room, socket } = await inRoom();
+    const { relay, room, socket, transport } = await inRoom();
     const errors: string[] = [];
     const closed: string[] = [];
     relay.on('error', (e) => errors.push(e.code));
     room.on('closed', (reason) => closed.push(reason));
     let asked = 0;
-    g.fetch = async () => {
+    transport.auth = async () => {
       asked++;
       return { ok: false, status: 401, json: async () => ({ error: 'unauthorized', message: 'Unknown public key' }) };
     };
@@ -250,11 +245,11 @@ describe('one way everything stops', () => {
   });
 
   test('a reconnect that fails for a moment (a 502 mid-deploy) keeps trying, quietly', async () => {
-    const { relay, socket } = await inRoom();
+    const { relay, socket, transport } = await inRoom();
     const errors: string[] = [];
     relay.on('error', (e) => errors.push(e.code));
     let asked = 0;
-    g.fetch = async () => {
+    transport.auth = async () => {
       asked++;
       return { ok: false, status: 502, json: async () => ({}) };
     };
@@ -265,11 +260,11 @@ describe('one way everything stops', () => {
   });
 
   test('at capacity on reconnect: `error` once, and it keeps trying', async () => {
-    const { relay, socket } = await inRoom();
+    const { relay, socket, transport } = await inRoom();
     const errors: string[] = [];
     relay.on('error', (e) => errors.push(e.code));
     let asked = 0;
-    g.fetch = async () => {
+    transport.auth = async () => {
       asked++;
       return { ok: false, status: 429, json: async () => ({ error: 'at_capacity', message: 'full' }) };
     };
@@ -509,9 +504,7 @@ describe('p2p (the new name of lan)', () => {
   async function capsWith(options: Record<string, unknown>) {
     jest.useFakeTimers();
     FakeSocket.all = [];
-    g.WebSocket = FakeSocket;
-    g.fetch = async () => ({ ok: true, status: 200, json: async () => ({ token: 'tok', expiresAt: Date.now() + 3_600_000 }) });
-    const connecting = GameRelay.connect({ publicKey: 'gr_pub_test', url: 'http://test.local', ...options });
+    const connecting = GameRelay.connect({ transport: net, publicKey: 'gr_pub_test', url: 'http://test.local', ...options });
     await settle();
     const caps = new URL(FakeSocket.last.url).searchParams.get('caps')!.split(',');
     FakeSocket.last.welcome('pa');
@@ -533,7 +526,6 @@ describe('a getToken that never answers (SDK review #10)', () => {
   test("connect waits for it as long as it takes (a sign-in may come first): no 15 s limit there", async () => {
     jest.useFakeTimers();
     FakeSocket.all = [];
-    g.WebSocket = FakeSocket;
     let signIn!: (token: string) => void;
     let signal!: AbortSignal;
     let result: unknown = 'pending';
@@ -541,7 +533,7 @@ describe('a getToken that never answers (SDK review #10)', () => {
       signal = s;
       return new Promise<string>((resolve) => (signIn = resolve));
     };
-    void GameRelay.connect({ url: 'http://test.local', lan: false, getToken }).then(
+    void GameRelay.connect({ transport: net, url: 'http://test.local', lan: false, getToken }).then(
       (r) => (result = r),
       (e: GameRelayError) => (result = e.code),
     );
@@ -560,14 +552,13 @@ describe('a getToken that never answers (SDK review #10)', () => {
   test('a reconnect whose getToken hangs gives up on it and tries again; close() stops it at once', async () => {
     jest.useFakeTimers();
     FakeSocket.all = [];
-    g.WebSocket = FakeSocket;
     let calls = 0;
     const signals: AbortSignal[] = [];
     const getToken = (signal: AbortSignal) => {
       signals.push(signal);
       return ++calls === 1 ? Promise.resolve('tok') : never();
     };
-    const connecting = GameRelay.connect({ url: 'http://test.local', lan: false, getToken });
+    const connecting = GameRelay.connect({ transport: net, url: 'http://test.local', lan: false, getToken });
     await settle();
     FakeSocket.last.welcome('pa');
     const relay = await connecting;
@@ -591,8 +582,8 @@ describe('the token stage (review of #10)', () => {
   test('getToken written as a method still gets its options as `this`', async () => {
     jest.useFakeTimers();
     FakeSocket.all = [];
-    g.WebSocket = FakeSocket;
     const options = {
+      transport: net,
       url: 'http://test.local',
       lan: false,
       backendToken: 'tok-from-this',
@@ -611,15 +602,14 @@ describe('the token stage (review of #10)', () => {
   test('a token answer whose body never finishes fails with timeout, not "Auth failed"', async () => {
     jest.useFakeTimers();
     FakeSocket.all = [];
-    g.WebSocket = FakeSocket;
-    g.fetch = (_url: string, init: { signal: AbortSignal }) =>
+    net.auth = (_url, init) =>
       Promise.resolve({
         ok: true,
         status: 200,
-        json: () => new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(new Error('AbortError')))),
+        json: () => new Promise((_, reject) => init.signal!.addEventListener('abort', () => reject(new Error('AbortError')))),
       });
     let err: GameRelayError | null = null;
-    void GameRelay.connect({ publicKey: 'gr_pub_test', url: 'http://test.local', lan: false }).catch((e: GameRelayError) => (err = e));
+    void GameRelay.connect({ transport: net, publicKey: 'gr_pub_test', url: 'http://test.local', lan: false }).catch((e: GameRelayError) => (err = e));
     await advance(16_000);
     expect(err).not.toBeNull();
     expect(err!.code).toBe('timeout');
@@ -629,15 +619,14 @@ describe('the token stage (review of #10)', () => {
   test('close() during a reconnect’s token request aborts the request itself (one token step for both paths)', async () => {
     jest.useFakeTimers();
     FakeSocket.all = [];
-    g.WebSocket = FakeSocket;
     const signals: AbortSignal[] = [];
-    g.fetch = (_url: string, init: { signal: AbortSignal }) => {
-      signals.push(init.signal);
+    net.auth = (_url, init) => {
+      signals.push(init.signal!);
       // The first answer expires within the minute, so the reconnect asks again; that one hangs.
       if (signals.length > 1) return new Promise(() => {});
       return Promise.resolve({ ok: true, status: 200, json: async () => ({ token: 'tok', expiresAt: Date.now() + 30_000 }) });
     };
-    const connecting = GameRelay.connect({ publicKey: 'gr_pub_test', url: 'http://test.local', lan: false });
+    const connecting = GameRelay.connect({ transport: net, publicKey: 'gr_pub_test', url: 'http://test.local', lan: false });
     await settle();
     FakeSocket.last.welcome('pa');
     const relay = await connecting;

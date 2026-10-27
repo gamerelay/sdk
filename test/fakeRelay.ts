@@ -2,7 +2,7 @@ import { jest } from 'bun:test';
 import { LIMITS, TokenBucket } from '@gamerelay/protocol/limits';
 import { maskKey, openFrame } from '@gamerelay/protocol/sign';
 import type { RoomInfo } from '@gamerelay/protocol/types';
-import { GameRelay } from '../src/index';
+import { GameRelay, type Transport } from '../src/index';
 
 type Msg = { t: string; [key: string]: unknown };
 
@@ -83,6 +83,28 @@ export class FakeSocket {
   }
 }
 
+/** A fake auth endpoint's answer: a token good for an hour, with `extra` fields. */
+export const tokenAnswer =
+  (extra: Record<string, unknown> = {}) =>
+  async (): Promise<unknown> => ({ ok: true, status: 200, json: async () => ({ token: 'tok', expiresAt: Date.now() + 3_600_000, ...extra }) });
+
+/**
+ * `connect({ transport })` onto a `FakeSocket` per connection, and `auth` as the server's HTTP
+ * side (the token request; an hour's token unless a test sets its own). No globals are touched.
+ */
+export class FakeTransport implements Transport {
+  auth: (url: string, init: { signal?: AbortSignal }) => Promise<unknown> = tokenAnswer();
+  /** Every URL the SDK fetched, in order. */
+  readonly fetched: string[] = [];
+  open(url: string): FakeSocket {
+    return new FakeSocket(url);
+  }
+  readonly fetch = ((url: string, init?: RequestInit) => {
+    this.fetched.push(url);
+    return this.auth(url, init ?? {});
+  }) as NonNullable<Transport['fetch']>;
+}
+
 export function roomInfo(me: string): RoomInfo {
   return {
     id: 'r1', code: 'ABCD', mode: 'relay', maxPlayers: 8, hostId: me, stateSeq: 0, chat: [], seed: 1, claims: {}, state: {},
@@ -125,23 +147,22 @@ function fakePage() {
 }
 
 /**
- * A connected GameRelay on fake timers and a fake socket and auth endpoint. Call `done()` at the end
- * of the test to close it and put the real globals back. `page`: a fake `document` and `window` too
- * (no rooms then: a room's tick loop would try a Worker). `botHost`: passed to `connect`.
+ * A connected GameRelay on fake timers and a fake socket and auth endpoint (a `FakeTransport`, also
+ * returned, so a test can change the auth answer). Call `done()` at the end of the test to close it.
+ * `page`: a fake `document` and `window` too, put back by `done()` (no rooms then: a room's tick
+ * loop would try a Worker). `botHost`: passed to `connect`.
  */
 export async function connectFake(playerId = 'pa', { page = false, botHost }: { page?: boolean; botHost?: boolean } = {}) {
   jest.useFakeTimers();
   FakeSocket.all = [];
-  const g = globalThis as unknown as { WebSocket: unknown; fetch: unknown; document?: unknown; window?: unknown };
-  const saved = { WebSocket: g.WebSocket, fetch: g.fetch };
+  const g = globalThis as unknown as { document?: unknown; window?: unknown };
   const fake = page ? fakePage() : null;
   if (fake) {
     g.document = fake.document;
     g.window = fake.window;
   }
-  g.WebSocket = FakeSocket;
-  g.fetch = async () => ({ ok: true, status: 200, json: async () => ({ token: 'tok', expiresAt: Date.now() + 3_600_000 }) });
-  const connecting = GameRelay.connect({ publicKey: 'gr_pub_test', url: 'http://test.local', lan: false, botHost });
+  const transport = new FakeTransport();
+  const connecting = GameRelay.connect({ publicKey: 'gr_pub_test', url: 'http://test.local', lan: false, botHost, transport });
   await settle();
   FakeSocket.last.welcome(playerId);
   const relay = await connecting;
@@ -160,9 +181,7 @@ export async function connectFake(playerId = 'pa', { page = false, botHost }: { 
       delete g.document;
       delete g.window;
     }
-    g.WebSocket = saved.WebSocket;
-    g.fetch = saved.fetch;
     jest.useRealTimers();
   };
-  return { relay, socket: () => FakeSocket.last, reopen, done, page: fake };
+  return { relay, socket: () => FakeSocket.last, reopen, done, page: fake, transport };
 }
