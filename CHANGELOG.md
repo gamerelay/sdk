@@ -4,6 +4,25 @@ Every release of `@gamerelay/sdk`, newest first. The notes under a version's hea
 GitHub release. Until 1.0, a minor version (0.x.0) may change the API; each break is listed
 here with what to change.
 
+## 0.1.0-alpha.17 (2026-11-05)
+
+- **`connect({ idToken })`: sign players in with your game's sign-in provider**, with no server
+  of yours. Return the ID token your sign-in has (Firebase `auth.currentUser?.getIdToken()`,
+  Supabase's session `access_token`, Clerk's `session.getToken()`, an OIDC ID token such as
+  Auth0's), and the player is the same player on every device: `relay.playerId` is their user id
+  at the provider (with OIDC, a hash of it). Called before every connect and reconnect; `null` or
+  `undefined` means nobody is signed in, and the player connects anonymously. Needs `publicKey`
+  and the game's provider set (dashboard: Settings → Player sign-in); not with `getToken`. With
+  sign-in turned off, a game that passes `idToken` keeps working and everyone connects
+  anonymously. A reconnect reuses the last exchange while `idToken` returns the same ID token.
+- **`relay.signedIn`**: whether this connection is a signed-in player (`idToken`).
+- **Error code `sign_in_expired`**: `idToken` returned an expired token. Unlike `unauthorized`,
+  reconnects don't stop: they keep asking `idToken` for a fresh one.
+- **Error code `sign_in_required`**: the game only lets signed-in players join, and nobody is
+  signed in (or it's a provider's guest account). Reconnects stop; show your sign-in, then
+  connect again.
+- **Docs** (llms.txt): "Signed-in players" covers both ways, your sign-in provider first.
+
 ## 0.1.0-alpha.16 (2026-10-26)
 
 - **`connect({ transport })`, experimental**: the SDK's socket and its own requests (the player

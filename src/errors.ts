@@ -1,7 +1,13 @@
 import type { ErrorCode, ModerationReason } from '@gamerelay/protocol/types';
 
-/** Every `code` a `GameRelayError` can have: the server's codes, plus the SDK's own three. */
-export type GameRelayErrorCode = ErrorCode | 'disconnected' | 'host_changed' | 'timeout';
+/**
+ * Every `code` a `GameRelayError` can have: the server's codes, plus the SDK's own.
+ * - `sign_in_expired`: your `idToken` returned an expired token (a cached one, or a device clock
+ *   far off); reconnects keep asking it for a fresh one.
+ * - `sign_in_required`: the game only lets signed-in players join, and nobody is signed in (or it's
+ *   the provider's guest account). Show your sign-in, then connect again; reconnects stop.
+ */
+export type GameRelayErrorCode = ErrorCode | 'disconnected' | 'host_changed' | 'timeout' | 'sign_in_expired' | 'sign_in_required';
 
 /** What every SDK call rejects or throws with: check `err.code`. */
 export class GameRelayError extends Error {
