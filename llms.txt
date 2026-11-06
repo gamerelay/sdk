@@ -66,7 +66,7 @@ the page. Until it's filled in, `connect()` rejects with `unauthorized`.
 updates in place, and within `v0` nothing is removed or renamed without a deprecation first (the
 old name keeps working and warns in the console for at least 30 days). `/sdk/gamerelay.js` is the
 same `v0` line, forever. To pin one exact version instead, load it from npm through jsDelivr:
-`https://cdn.jsdelivr.net/npm/@gamerelay/sdk@0.1.0-alpha.16/gamerelay.js` (any published
+`https://cdn.jsdelivr.net/npm/@gamerelay/sdk@0.1.0-alpha.17/gamerelay.js` (any published
 version: `npm view @gamerelay/sdk versions`). Until the SDK reaches 1.0, a pinned alpha may be
 asked to update: new server features can need the newest alpha, and old alphas stop being
 accepted sooner than they will after 1.0.
@@ -810,8 +810,74 @@ use the room the relay gives you next.
 
 ## Signed-in players (optional)
 
-By default players are anonymous. If your game has its own accounts, mint player tokens on
-your backend with the instance's **secret key**. Never ship the secret key to the browser.
+By default players are anonymous: a new player per browser tab, nothing kept across devices.
+To give players one identity everywhere (saves, leaderboards and bans follow them), sign them in
+one of two ways:
+
+- **Your sign-in provider, no server** (Firebase, Supabase, Clerk, or any OIDC provider such as
+  Auth0): pick it in the dashboard (Settings → Player sign-in, or `update_instance` with
+  `signIn`), then pass the ID token your sign-in already has as `idToken`.
+- **Your own backend**: mint tokens with the secret key (below). For games with their own
+  accounts and a server.
+
+### With your sign-in provider
+
+```js
+// Firebase (Settings → Player sign-in: Firebase, your project id)
+const relay = await GameRelay.connect({
+  publicKey: 'gr_pub_…',
+  idToken: () => auth.currentUser?.getIdToken(),   // null when signed out: the player is anonymous
+});
+relay.signedIn; // true: relay.playerId is the Firebase uid, the same on every device
+// Supabase (project URL; the project must use asymmetric JWT signing keys):
+//   idToken: async () => (await supabase.auth.getSession()).data.session?.access_token
+// Clerk (Frontend API URL):  idToken: () => window.Clerk.session?.getToken()
+// Auth0 and other OIDC (issuer, e.g. https://tenant.auth0.com/, and the client id as audience):
+//   idToken: freshIdToken  (below: auth0-spa-js hands back its ID token even after it expires)
+async function freshIdToken() {
+  if (!(await auth0.isAuthenticated())) return null;
+  let claims = await auth0.getIdTokenClaims();
+  if (!claims || claims.exp * 1000 < Date.now() + 60_000) {
+    await auth0.getTokenSilently({ cacheMode: 'off' }); // renews the ID token too
+    claims = await auth0.getIdTokenClaims();
+  }
+  return claims?.__raw ?? null;
+}
+```
+
+`idToken` is called before every connect and reconnect, so return a fresh token (the providers'
+calls above refresh on their own). Return `null` or `undefined` when nobody is signed in and the
+player connects anonymously, unless the game turns off anonymous players (then `connect()`
+rejects with `sign_in_required`, which ends reconnects: show your sign-in, then connect again).
+A provider's own guest accounts (Firebase or Supabase anonymous sign-in) connect with
+`relay.signedIn` false, and are refused when anonymous players are off. Players already
+connected when anonymous players are turned off stay until they leave. With sign-in turned off in
+the dashboard, a game that passes `idToken` still works: everyone connects anonymously. If
+the provider's keys can't be fetched for a moment, `connect()` rejects with `disconnected` and a
+reconnect tries again. An expired token (one you saved instead of asking your sign-in each time,
+or a device clock far off) rejects with `sign_in_expired`; reconnects keep asking `idToken` for a
+fresh one, and the relay's `error` event says why once. With Firebase, Supabase and Clerk,
+`playerId` is the provider's user id when it is 1–64 letters, digits and `_ . : -` (Firebase
+uids, Supabase UUIDs, Clerk ids), else `h_` and a hash of it. With OIDC it is always `h_` and a
+hash (an OIDC user id, like Google's, can be the same in every app, and players see each other's
+ids); add `sub` to the copied claims to get the id itself in webhook events.
+
+The name shown is, in order: the claim set as the game's name claim (e.g. `username`), the
+provider's username claim (`preferred_username`; Supabase's `user_metadata.preferred_username` or
+`user_name`; never an email address, which Microsoft Entra puts there), then the `playerName`
+you pass. The full `name` claim (often a person's real name) is used only if the game sets the
+name claim to `name`. Names are moderated like anyone's, and players can still rename themselves
+with `relay.setName()` for the session.
+Claims listed under "Copied claims" (e.g. a Firebase custom claim `role`) become this player's
+custom claims, sent with their webhook events like a backend's `claims`. Copy only claims players
+can't set themselves: Supabase's `user_metadata` is refused (players change it with
+`supabase.auth.updateUser`), so put roles in `app_metadata`. `POST /v1/auth/exchange
+{ publicKey, idToken, playerName? }` is the same thing over HTTP.
+
+### With your own backend
+
+If your game has its own accounts, mint player tokens on your backend with the instance's
+**secret key**. Never ship the secret key to the browser.
 
 ```js
 // your server

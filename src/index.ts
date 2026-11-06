@@ -125,6 +125,19 @@ export interface ConnectOptions {
    */
   getToken?: (signal: AbortSignal) => Promise<string | TokenResponse>;
   /**
+   * Sign players in with your game's own sign-in (Firebase, Supabase, Clerk or any OIDC provider,
+   * set under Settings → Player sign-in): return the ID token it has, and the player is the same
+   * player on every device. `playerId` is their Firebase, Supabase or Clerk user id; with OIDC, a
+   * hash of it (`h_…`), since an OIDC user id can be the same in every app. Called before every
+   * connect and reconnect, so return a fresh one (Firebase: `() => auth.currentUser?.getIdToken()`),
+   * not one you saved: an expired token fails with `sign_in_expired`, and reconnects keep asking for
+   * a new one. Return `null` or `undefined` when nobody is signed in: the player connects
+   * anonymously, or, if the game only lets signed-in players join, connect rejects with
+   * `sign_in_required`. With sign-in turned off in the dashboard, everyone connects anonymously.
+   * Needs `publicKey`; not with `getToken`.
+   */
+  idToken?: (signal: AbortSignal) => Promise<string | null | undefined> | string | null | undefined;
+  /**
    * Development only: simulate a bad network. `latency` is extra round-trip ms (half each way),
    * `jitter` ± ms per message (order is kept, as on a real socket), `loss` the share (0–1) of
    * `reliable: false` sends dropped. Remove it before you ship.
@@ -441,11 +454,15 @@ const REPLY_TIMEOUT_MS = 10_000;
 const MAX_EXPIRED = 64;
 /** A connect (the token, then the socket's welcome) that takes longer than this fails with `timeout`. */
 const CONNECT_TIMEOUT_MS = 15_000;
+/** What `/v1/auth/anonymous` and `/v1/auth/exchange` answer (as far as the SDK reads it). */
+type AuthResponse = { token?: string; expiresAt?: number; wsUrl?: string; signedIn?: boolean; error?: string; message?: string; reason?: ModerationReason };
+
 /**
  * Reconnect failures that retrying can't fix: the relay stops (and says why, through `error`). A
- * name the game refuses (`moderated`) is refused again on every try.
+ * name the game refuses (`moderated`) is refused again on every try, and so is a player who isn't
+ * signed in to a game that only lets signed-in players join (`sign_in_required`).
  */
-const FINAL_CODES = new Set<string>(['unauthorized', 'upgrade_required', 'moderated']);
+const FINAL_CODES = new Set<string>(['unauthorized', 'upgrade_required', 'moderated', 'sign_in_required']);
 
 /** A secret key (`gr_sk_`) where a page would hold it. */
 const secretKey = () => new GameRelayError('unauthorized', "That's your SECRET key (gr_sk_): never put it in a page. Rotate it now in the dashboard; pages use the public key (gr_pub_)");
@@ -455,7 +472,7 @@ const secretKey = () => new GameRelayError('unauthorized', "That's your SECRET k
  * a key it refuses, and `disconnected` (try again) for anything else (a proxy's 502 mid-deploy).
  */
 function authCode(status: number, error: string | undefined): GameRelayErrorCode {
-  if (error === 'at_capacity' || error === 'quota_exceeded' || error === 'rate_limited') return error;
+  if (error === 'at_capacity' || error === 'quota_exceeded' || error === 'rate_limited' || error === 'sign_in_required') return error;
   if (status === 429) return 'rate_limited';
   if (status === 401 || status === 403 || error === 'unauthorized' || error === 'origin_not_allowed') return 'unauthorized';
   if (status === 400) return 'bad_request';
@@ -583,6 +600,8 @@ const session = safeStorage('session');
 
 export class GameRelay extends Emitter<RelayEvents> {
   #playerId = '';
+  /** The last token came from `/v1/auth/exchange` (`idToken`). */
+  #signedIn = false;
   #room: Room | null = null;
   #party: PartyInfo | null = null;
   #features = Object.fromEntries(PLAN_FEATURES.map((f) => [f, false])) as unknown as PlanFeatures;
@@ -674,6 +693,15 @@ export class GameRelay extends Emitter<RelayEvents> {
   /** Your player id (stable across reloads of the same tab for anonymous players). */
   get playerId(): PlayerId {
     return this.#playerId;
+  }
+
+  /**
+   * Whether you're signed in with the game's sign-in provider (`idToken`): `playerId` is then your
+   * user id there, the same on every device. False for anonymous players, `getToken` ones, and the
+   * provider's own guest accounts (Firebase or Supabase anonymous sign-in).
+   */
+  get signedIn(): boolean {
+    return this.#signedIn;
   }
 
   /** The room you are in, if any. */
@@ -793,6 +821,8 @@ export class GameRelay extends Emitter<RelayEvents> {
   /** `connect({ transport })`, or the network. */
   readonly #transport: Transport;
   #token: { value: string; expiresAt: number } | null = null;
+  /** The last `/v1/auth/exchange` answer and the ID token it was for, reused while `idToken` returns that one. */
+  #exchanged: { idToken: string; token: string; expiresAt: number; signedIn: boolean } | null = null;
   /** Where the token response said to connect (`wsUrl`), if it said and it's `followable`. */
   #wsUrl: string | null = null;
   /**
@@ -865,6 +895,8 @@ export class GameRelay extends Emitter<RelayEvents> {
     this.#base = (opts.url ?? defaults.url).replace(/\/$/, '');
     this.#transport = opts.transport ?? network;
     if (!opts.publicKey && !opts.getToken) throw new GameRelayError('bad_request', 'GameRelay.connect needs publicKey (your gr_pub_ key) or getToken');
+    if (opts.idToken && opts.getToken) throw new GameRelayError('bad_request', 'Pass idToken or getToken, not both: idToken signs players in with your sign-in provider, getToken with your own backend');
+    if (opts.idToken && !opts.publicKey) throw new GameRelayError('bad_request', "idToken needs publicKey too (the game's gr_pub_ key)");
     if (typeof opts.publicKey === 'string' && opts.publicKey.startsWith('gr_sk_')) throw secretKey();
     const relay = this;
     this.#link = {
@@ -1448,30 +1480,19 @@ export class GameRelay extends Emitter<RelayEvents> {
       if (typeof got === 'object') this.#wsUrl = this.#checked(got.wsUrl);
       return token;
     }
+    if (this.#opts.idToken) {
+      const signedIn = await this.#exchange(reconnecting);
+      if (signedIn !== null) return signedIn;
+    }
+    this.#signedIn = false;
     if (this.#token && this.#token.expiresAt - Date.now() > 60_000) return this.#token.value;
     const storeKey = `gamerelay:${this.#opts.publicKey}`;
-    const { res, body } = await this.#tokenStage(this.#base, async (signal) => {
-      try {
-        const res = await this.#fetch(`${this.#base}/v1/auth/anonymous`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            publicKey: this.#opts.publicKey,
-            playerName: this.#opts.playerName,
-            playerAvatar: this.#opts.playerAvatar,
-            previousToken: this.#token?.value ?? session.get(storeKey) ?? undefined,
-          }),
-          signal,
-        });
-        // A proxy error page isn't JSON: treat it like any other failed response.
-        const parsed: unknown = await res.json().catch(() => null);
-        const body: { token?: string; expiresAt?: number; wsUrl?: string; error?: string; message?: string; reason?: ModerationReason } = parsed && typeof parsed === 'object' ? parsed : {};
-        return { res, body };
-      } catch (err) {
-        // Offline, DNS or CORS: not the key's fault, so a reconnect tries again.
-        throw new GameRelayError('disconnected', `Can't reach ${this.#base}: are you online?`, { cause: err });
-      }
-    }, true);
+    const { res, body } = await this.#postAuth('anonymous', {
+      publicKey: this.#opts.publicKey,
+      playerName: this.#opts.playerName,
+      playerAvatar: this.#opts.playerAvatar,
+      previousToken: this.#token?.value ?? session.get(storeKey) ?? undefined,
+    });
     if (!res.ok || !body.token || !body.expiresAt) {
       // The game refuses names that fail (`onNameReject: 'refuse'`): connect rejects, as setName does.
       if (body.error === 'moderated') throw new GameRelayModerationError(body.reason ?? 'blocked', body.message ?? 'Invalid name', String(this.#opts.playerName ?? ''));
@@ -1480,6 +1501,66 @@ export class GameRelay extends Emitter<RelayEvents> {
     this.#token = { value: body.token, expiresAt: body.expiresAt };
     session.set(storeKey, body.token);
     this.#wsUrl = this.#checked(body.wsUrl);
+    return body.token;
+  }
+
+  /** `POST /v1/auth/<route>` (bounded): the response, and its JSON body (empty when it isn't JSON). */
+  #postAuth(route: 'anonymous' | 'exchange', payload: Record<string, unknown>): Promise<{ res: Response; body: AuthResponse }> {
+    return this.#tokenStage(this.#base, async (signal) => {
+      try {
+        const res = await this.#fetch(`${this.#base}/v1/auth/${route}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(payload),
+          signal,
+        });
+        // A proxy error page isn't JSON: treat it like any other failed response.
+        const parsed: unknown = await res.json().catch(() => null);
+        return { res, body: parsed && typeof parsed === 'object' ? (parsed as AuthResponse) : {} };
+      } catch (err) {
+        // Offline, DNS or CORS: not the key's fault, so a reconnect tries again.
+        throw new GameRelayError('disconnected', `Can't reach ${this.#base}: are you online?`, { cause: err });
+      }
+    }, true);
+  }
+
+  /**
+   * A token for the player your `idToken` says is signed in, or null when it says nobody is, or the
+   * game has no sign-in set up (the caller connects them anonymously). Your sign-in is asked first
+   * (bounded on a reconnect, as `getToken` is), then `/v1/auth/exchange`, unless the last exchange
+   * was for this same ID token and its answer has more than a minute left.
+   */
+  async #exchange(reconnecting: boolean): Promise<string | null> {
+    // Not signed in until this exchange says so (a failed one leaves no stale `true`).
+    this.#signedIn = false;
+    let idToken: string | null | undefined;
+    try {
+      idToken = await this.#tokenStage('idToken', async (signal) => this.#opts.idToken!(signal), reconnecting);
+    } catch (err) {
+      if (err instanceof GameRelayError) throw err;
+      throw new GameRelayError('disconnected', `idToken failed: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
+    }
+    if (idToken === null || idToken === undefined || idToken === '') return null;
+    if (typeof idToken !== 'string') throw new GameRelayError('bad_request', 'idToken must return the ID token (a string), or null when nobody is signed in');
+    // Firebase's getIdToken() returns the same token until it's nearly expired: a reconnect (or a
+    // whole class reconnecting after a server restart) needn't exchange it again.
+    const kept = this.#exchanged;
+    if (kept && kept.idToken === idToken && kept.expiresAt - Date.now() > 60_000) {
+      this.#signedIn = kept.signedIn;
+      return kept.token;
+    }
+    this.#exchanged = null;
+    const { res, body } = await this.#postAuth('exchange', { publicKey: this.#opts.publicKey, idToken, playerName: this.#opts.playerName, playerAvatar: this.#opts.playerAvatar });
+    // The game turned sign-in off: everyone plays anonymously, as with no idToken.
+    if (body.error === 'sign_in_off') return null;
+    // An expired ID token isn't a refusal of the player: not `unauthorized` (which ends reconnects),
+    // so the next attempt asks `idToken` again, and the game hears why once through 'error'.
+    if (body.error === 'id_token_expired') throw new GameRelayError('sign_in_expired', body.message ?? 'The sign-in token has expired');
+    if (!res.ok || !body.token) throw new GameRelayError(authCode(res.status, body.error), body.message ?? `Sign-in failed (${res.status})`);
+    // False for a provider's guest account (Firebase or Supabase anonymous sign-in).
+    this.#signedIn = body.signedIn !== false;
+    this.#wsUrl = this.#checked(body.wsUrl);
+    if (typeof body.expiresAt === 'number') this.#exchanged = { idToken, token: body.token, expiresAt: body.expiresAt, signedIn: this.#signedIn };
     return body.token;
   }
 
@@ -1580,6 +1661,7 @@ export class GameRelay extends Emitter<RelayEvents> {
         this.#ws = null;
         attempt(() => ws.close());
         this.#token = null;
+        this.#exchanged = null;
         if (target !== base) {
           this.#fallBack = true;
           this.#movedTo = null;
